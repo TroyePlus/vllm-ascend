@@ -1069,7 +1069,16 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
         if compilation_config.splitting_ops is None:
             compilation_config.splitting_ops = []
 
-    if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
+    dump_inductor_fx = (
+        compilation_config.mode in (
+            CompilationMode.STOCK_TORCH_COMPILE,
+            CompilationMode.DYNAMO_TRACE_ONCE,
+        )
+        and compilation_config.backend == "inductor"
+        and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        and compilation_config.debug_dump_path is not None
+    )
+    if not dump_inductor_fx and compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
         logger.warning(
             "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
             compilation_config.mode,
@@ -1169,7 +1178,15 @@ def _setup_compile_backend(
     compilation_config.oot_compiler = compile_backend
     compilation_config.use_inductor = False
     if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-        compilation_config.mode = CompilationMode.NONE
+        dump_inductor_fx = (
+            compilation_config.mode in (
+                CompilationMode.STOCK_TORCH_COMPILE, CompilationMode.DYNAMO_TRACE_ONCE
+            )
+            and compilation_config.backend == "inductor"
+            and compilation_config.debug_dump_path is not None
+        )
+        if not dump_inductor_fx:
+            compilation_config.mode = CompilationMode.NONE
         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
         additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
     elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
