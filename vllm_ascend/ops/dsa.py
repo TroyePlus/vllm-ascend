@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.layer.attention.layer import DSAAttention
+from vllm_ascend.utils import fxrt_prefill_decompose_enabled
 
 
 @dataclass
@@ -77,6 +78,7 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        self._fxrt_prefill_decompose = fxrt_prefill_decompose_enabled()
         self.dim = dim
         self.n_heads = n_heads
         self.scale = scale
@@ -157,10 +159,11 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
 
         output = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
-        # All DSA forward paths (attention + o_proj, including OTP HCCL
-        # collectives) run inside the dsa_forward custom op, which is required
-        # for ACL graph capture (registered with dispatch_key="PrivateUse1").
-        torch.ops.vllm.dsa_forward(hidden_states, output, self.prefix)
+        if self._fxrt_prefill_decompose:
+            _dsa_forward_impl(self, hidden_states, output)
+        else:
+            # Preserve the opaque entry for ACL graph capture.
+            torch.ops.vllm.dsa_forward(hidden_states, output, self.prefix)
 
         output = output.view(-1, output_shape[-1])
         return output
@@ -174,6 +177,16 @@ def dsa_forward(
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+    _dsa_forward_impl(self, hidden_states, output)
+
+
+def _dsa_forward_impl(
+    self: AscendDeepseekSparseAttention,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    # v0.27 resolves per-layer metadata inside the attention implementation.
+    forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
 
     if attn_metadata is None:

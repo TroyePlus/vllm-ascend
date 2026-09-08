@@ -59,6 +59,13 @@ def test_get_dsa_attn_kv_plan_requires_vllm_config():
         get_dsa_attn_kv_plan()
 
 
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "bf16", "float8_e4m3fn"])
+def test_explicit_cache_dtype_preserves_engine_plan(device_type, cache_dtype):
+    with _on(device_type):
+        assert get_dsa_attn_kv_plan(cache_dtype=cache_dtype) == get_dsa_attn_kv_plan(_cache_config(cache_dtype))
+
+
 def test_a5_fp8_plan_uses_flat_shared_kv():
     with _on(AscendDeviceType.A5):
         plan = get_dsa_attn_kv_plan(_config(False))

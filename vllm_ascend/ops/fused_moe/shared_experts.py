@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import wraps
@@ -33,6 +34,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     AscendDeviceType,
+    fxrt_prefill_decompose_enabled,
     get_ascend_device_type,
     npu_stream_switch,
     shared_experts_calculation_stream,
@@ -44,7 +46,7 @@ SITU_MX_DST_TYPE_E4M3FN = 36
 
 @dataclass
 class FusedMoEEvents:
-    before_routed_experts: torch.npu.Event
+    before_routed_experts: torch.npu.Event | None
     after_routed_experts: torch.npu.Event | None = field(default=None)
     before_dispatch: torch.npu.Event | None = field(default=None)
     before_gmm2: torch.npu.Event | None = field(default=None)
@@ -94,7 +96,9 @@ class AscendSharedExperts:
         self.quant_type = quant_type
         self.lora_context = None
         ascend_config = get_ascend_config()
-        self.multistream_overlap = ascend_config.multistream_overlap_shared_expert
+        self.multistream_overlap = (
+            ascend_config.multistream_overlap_shared_expert and not fxrt_prefill_decompose_enabled()
+        )
         self.weights_replicated = ascend_config.enable_shared_expert_dp
         self._mega_moe_weights: MoEWeights | None = None
 
@@ -366,7 +370,10 @@ class AscendSharedExperts:
             if evt is not None:
                 torch.npu.current_stream().wait_event(evt)
 
-        with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap):
+        stream_context = (
+            npu_stream_switch(shared_experts_calculation_stream()) if self.multistream_overlap else nullcontext()
+        )
+        with stream_context:
             if mode is SharedExpertParallelMode.SHARED_EXPERT_DATA_PARALLEL_ONLY:
                 # Full activations + replicated weights: shard tokens locally,
                 # run the MLP, then gather its complete output.
@@ -388,7 +395,7 @@ class AscendSharedExperts:
             if has_quantized_shared_without_lora and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
                 original_dtype = hidden_states.dtype
                 # Execute dynamic quant concurrently with MoE gate.
-                torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+                maybe_wait_event(fused_moe_evts.before_routed_experts)
                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
@@ -449,7 +456,7 @@ class AscendSharedExperts:
             elif has_quantized_shared_without_lora and self.quant_type == QuantType.W4A8MXFP:
                 original_dtype = hidden_states.dtype
                 # Execute dynamic quant concurrently with MoE gate.
-                torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+                maybe_wait_event(fused_moe_evts.before_routed_experts)
                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
                     hidden_states, dst_type=torch.float8_e4m3fn
                 )
@@ -495,7 +502,7 @@ class AscendSharedExperts:
                 shared_out = self.layer.down_proj((quantized_x, swiglu_out_scale))[0]
             else:
                 # Ensure the shared experts wait for hidden_states to be ready.
-                torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+                maybe_wait_event(fused_moe_evts.before_routed_experts)
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)

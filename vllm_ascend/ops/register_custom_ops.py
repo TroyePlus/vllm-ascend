@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch_npu
 from vllm.distributed import (
@@ -101,6 +103,11 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     dp_size = get_dp_group().world_size
     num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
     padded_x = x.new_zeros((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]))
+    if os.getenv("VLLM_ASCEND_FXRT_DUMMY_QUANT") == "1" and x.shape[0] != int(num_tokens_across_dp_cpu.sum()):
+        # Preserve the reduced-dummy local-output compatibility path. The
+        # sequence-parallel layout above takes precedence when available.
+        padded_x[get_dp_group().rank_in_group, : x.shape[0]] = x
+        return ep_group.reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
     offset = 0
     for idx in range(dp_size):
         num_tokens_dp = int(num_tokens_across_dp_cpu[idx])

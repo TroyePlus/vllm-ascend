@@ -1076,7 +1076,7 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
         )
         and compilation_config.backend == "inductor"
         and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-        and compilation_config.debug_dump_path is not None
+        and (compilation_config.debug_dump_path is not None or bool(os.getenv("VLLM_DEBUG_DUMP_PATH")))
     )
     if not dump_external_fx and compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
         logger.warning(
@@ -1183,7 +1183,7 @@ def _setup_compile_backend(
                 CompilationMode.STOCK_TORCH_COMPILE, CompilationMode.DYNAMO_TRACE_ONCE
             )
             and compilation_config.backend == "inductor"
-            and compilation_config.debug_dump_path is not None
+            and (compilation_config.debug_dump_path is not None or bool(os.getenv("VLLM_DEBUG_DUMP_PATH")))
         )
         if not dump_external_fx:
             compilation_config.mode = CompilationMode.NONE

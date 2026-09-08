@@ -191,6 +191,7 @@ from vllm_ascend.spec_decode.utils import (
 from vllm_ascend.utils import (
     calc_split_factor,
     check_gdn_layer,
+    configure_fxrt_prefill_decompose,
     embedding_tp_enable,
     enable_dsa_cp,
     enable_sfa,
@@ -320,6 +321,8 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # Resolve the prefill decomposition policy before model construction.
+        configure_fxrt_prefill_decompose(vllm_config)
         hf_model_type = getattr(
             getattr(vllm_config.model_config, "hf_config", None), "model_type", None
         )
@@ -3418,7 +3421,15 @@ class NPUModelRunner(GPUModelRunner):
                     **engram_kwargs,
                 )
             )
-        run_model = partial(self.model, **model_inputs)
+        model_forward = self.model
+        if (
+            self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+            and getattr(self, "with_prefill", False)
+        ):
+            stock_compiled_call = getattr(self, "_stock_compiled_call", None)
+            if stock_compiled_call is not None:
+                model_forward = stock_compiled_call
+        run_model = partial(model_forward, **model_inputs)
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
@@ -4613,7 +4624,16 @@ class NPUModelRunner(GPUModelRunner):
                     backend, debug_dump_path / "fx_graphs", "model"
                 )
             compilation_counter.stock_torch_compile_count += 1
-            self.model.compile(fullgraph=True, backend=backend)
+            # Keep an explicit compiled prefill entry point instead of
+            # replacing Module.__call__ globally. Decode-only/spec-decode
+            # batches must stay eager; their request metadata is intentionally
+            # different from the decomposed prefill graph.
+            self._stock_compiled_call = torch.compile(
+                self.model._call_impl,
+                fullgraph=True,
+                dynamic=True,
+                backend=backend,
+            )
 
         # wrap the model with full graph wrapper if needed.
         cudagraph_mode = self.compilation_config.cudagraph_mode

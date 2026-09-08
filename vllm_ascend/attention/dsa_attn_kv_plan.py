@@ -135,8 +135,14 @@ class DsaAttnKvPlan:
         )
 
 
-def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
-    """Return the explicit A5 BF16 or upstream-compatible FP8 DSA plan."""
+def get_dsa_attn_kv_plan(vllm_config=None, *, cache_dtype: str | None = None) -> DsaAttnKvPlan:
+    """Resolve the plan from engine config or an explicitly captured cache dtype.
+
+    Custom-call execution passes the dtype captured from the engine at tracing
+    time; it must not depend on the load_model-only current-config context.
+    """
+    if vllm_config is None and cache_dtype is None:
+        raise TypeError("DSA KV plan requires engine config or an explicit cache_dtype")
     if not _supports_dsv4_compressed_cache():
         return DsaAttnKvPlan(
             uses_sparse_flash_mla=False,
@@ -152,7 +158,11 @@ def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
             applies_sparse_attn_runtime_kwargs=True,
         )
 
-    use_bf16 = is_a5_bf16_kv_enabled(vllm_config)
+    use_bf16 = (
+        is_a5_bf16_kv_enabled(vllm_config)
+        if cache_dtype is None
+        else str(cache_dtype).lower() in _BF16_KV_CACHE_DTYPES
+    )
     if use_bf16:
         return DsaAttnKvPlan(
             uses_sparse_flash_mla=True,

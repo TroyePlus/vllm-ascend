@@ -41,10 +41,25 @@ from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
 from vllm_ascend.models.deepseek_v4.indexer import AscendIndexerMetadata, IndexerOverlapPlan
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
+from vllm_ascend.ops.fxrt_side_effects import (
+    fxrt_dsa_indexer_scatter_if_nonempty,
+    fxrt_dsa_scatter_if_nonempty,
+    fxrt_notify_kv_cache_written,
+    fxrt_record_attention_compute_start,
+    fxrt_record_event,
+    fxrt_save_kv_layer,
+    fxrt_wait_event,
+    fxrt_wait_for_kv_layer,
+    fxrt_wait_stream,
+    get_attention_event_index,
+    get_fxrt_event_index,
+    get_npu_stream_index,
+)
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
+    fxrt_prefill_decompose_enabled,
     get_potential_max_tokens,
     npu_stream_switch,
     olora_tp_enable,
@@ -109,6 +124,22 @@ def build_compressor_metadata_out(
     )
 
 
+def _notify_kv_cache_written(layer_name: str, use_fxrt: bool) -> None:
+    if use_fxrt:
+        fxrt_notify_kv_cache_written(layer_name)
+    else:
+        notify_kv_cache_written(layer_name)
+
+
+def _record_attention_compute_start(
+    use_fxrt: bool, event_index: int
+) -> None:
+    if use_fxrt:
+        fxrt_record_attention_compute_start(event_index)
+    else:
+        record_attention_compute_start()
+
+
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
     if _DSV4_DSA_OVERLAP_STREAM is None:
@@ -116,6 +147,33 @@ def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     return _DSV4_DSA_OVERLAP_STREAM
 
 
+def _record_dsa_event(
+    name: str, use_fxrt: bool, stream: torch.npu.Stream
+) -> int | torch.npu.Event:
+    if use_fxrt:
+        event_index = get_fxrt_event_index(name)
+        fxrt_record_event(event_index, get_npu_stream_index(stream))
+        return event_index
+    return stream.record_event()
+
+
+def _wait_dsa_event(
+    event: int | torch.npu.Event, use_fxrt: bool, stream: torch.npu.Stream
+) -> None:
+    if use_fxrt:
+        assert isinstance(event, int)
+        fxrt_wait_event(event, get_npu_stream_index(stream))
+    else:
+        stream.wait_event(event)
+
+
+def _wait_dsa_stream(
+    stream: torch.npu.Stream, wait_for: torch.npu.Stream, use_fxrt: bool
+) -> None:
+    if use_fxrt:
+        fxrt_wait_stream(get_npu_stream_index(stream), get_npu_stream_index(wait_for))
+    else:
+        stream.wait_stream(wait_for)
 def _is_w8a8_dynamic(linear) -> bool:
     """True iff ``linear`` is wired up with ``AscendW8A8DynamicLinearMethod``."""
     quant_method = getattr(linear, "quant_method", None)
@@ -1406,7 +1464,34 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         self.attn_sink = kwargs["attn_sink"]
 
         ascend_config = get_ascend_config()
-        self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
+        self._fxrt_prefill_decompose = fxrt_prefill_decompose_enabled()
+        # Python Stream objects and context managers are not valid fullgraph
+        # FX inputs. Use the equivalent serial DSA path for decomposed FXRT
+        # prefill; eager/opaque execution keeps the configured overlap path.
+        self.multistream_dsv4_dsa_overlap = (
+            ascend_config.multistream_dsv4_dsa_overlap
+            and not self._fxrt_prefill_decompose
+        )
+        self._fxrt_attention_event_index = (
+            get_attention_event_index()
+            if self._fxrt_prefill_decompose
+            else -1
+        )
+        if self._fxrt_prefill_decompose:
+            # Allocate event and stream handles during model construction, not
+            # from the fullgraph Dynamo trace.
+            for event_name in (
+                "dsa.q_quant_done",
+                "dsa.part2_start",
+                "dsa.part3_start",
+                "dsa.compressed_kv_done",
+                "dsa.kv_ready",
+                "dsa.rope_done",
+            ):
+                get_fxrt_event_index(event_name)
+            get_npu_stream_index(torch.npu.current_stream())
+            if self.multistream_dsv4_dsa_overlap:
+                get_npu_stream_index(dsv4_dsa_overlap_stream())
         if self.multistream_dsv4_dsa_overlap and is_a5_bf16_kv_enabled(self.vllm_config):
             self.multistream_dsv4_dsa_overlap = False
 
@@ -1565,7 +1650,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             # matching the A3 layout expected by npu_transpose_batchmatmul.
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
-                self.wo_a.weight,
+                wo_a_weight,
                 bias=None,
                 scale=None,
                 perm_x1=(1, 0, 2),
@@ -1604,6 +1689,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         kv_cache: tuple[torch.Tensor, ...] | None,
         attn_metadata: DSAMetadataDict,
         output: torch.Tensor | None = None,
+        num_actual_tokens: int | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         output_padded = output
@@ -1625,7 +1711,10 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
-        wait_for_kv_layer_from_connector(layer_name)
+        if self._fxrt_prefill_decompose:
+            fxrt_wait_for_kv_layer(layer_name)
+        else:
+            wait_for_kv_layer_from_connector(layer_name)
         cache_is_prepared = self._prepare_caches_before_attention(
             layer_name,
             hidden_states,
@@ -1634,8 +1723,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         )
         if actual_tokens == 0:
             output.zero_()
-            notify_kv_cache_written(layer_name)
-            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+            _notify_kv_cache_written(layer_name, self._fxrt_prefill_decompose)
+            if self._fxrt_prefill_decompose:
+                fxrt_save_kv_layer(layer_name, list(kv_cache))
+            else:
+                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
             return output
 
         req_metadata = _require_req_metadata(common_attn_metadata)
@@ -1659,7 +1751,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         # o
         self._forward_o_proj(o_proj_input, output)
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+
+        if self._fxrt_prefill_decompose:
+            fxrt_save_kv_layer(layer_name, list(kv_cache))
+        else:
+            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
 
@@ -1807,7 +1903,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             main_stream.wait_event(e_kv_quant_done)
 
         with npu_stream_switch(aux_stream, enabled=True):
-            torch.npu.current_stream().wait_event(e_part2_start)
+            _wait_dsa_event(e_part2_start, self._fxrt_prefill_decompose, aux_stream)
             kv = self.cv_wkv.matmul(kv_quant, kv_pertoken_scale)
             e_kv_matmul_done = torch.npu.current_stream().record_event()
 
@@ -1834,7 +1930,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         main_stream.wait_event(e_kv_matmul_done)
 
         with npu_stream_switch(aux_stream, enabled=True):
-            torch.npu.current_stream().wait_event(e_part3_start)
+            _wait_dsa_event(e_part3_start, self._fxrt_prefill_decompose, aux_stream)
             kv = self.kv_norm(kv)
             assert self.rope_head_dim is not None
             kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
@@ -1923,7 +2019,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 compressed_kv: torch.Tensor,
                 compress_slot_mapping: torch.Tensor,
             ) -> None:
-                if compressed_kv.shape[0] > 0:
+                if self._fxrt_prefill_decompose:
+                    fxrt_dsa_scatter_if_nonempty(
+                        compress_kv_cache,
+                        compressed_kv,
+                        compress_slot_mapping,
+                        self.vllm_config.cache_config.cache_dtype,
+                    )
+                elif compressed_kv.shape[0] > 0:
                     get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
                         compress_kv_cache,
                         compressed_kv,
@@ -1957,7 +2060,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 state_cache=state_cache,
                 metadata=layer_metadata.compressor,
             )
-        if compressed_kv.shape[0] > 0:
+        if self._fxrt_prefill_decompose:
+            fxrt_dsa_scatter_if_nonempty(
+                compress_kv_cache,
+                compressed_kv,
+                compress_slot_mapping,
+                self.vllm_config.cache_config.cache_dtype,
+            )
+        elif compressed_kv.shape[0] > 0:
             get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
                 compress_kv_cache,
                 compressed_kv,
@@ -2056,9 +2166,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 write_cache=not cache_is_prepared,
             )
 
-        notify_kv_cache_written(layer_name)
+        _notify_kv_cache_written(layer_name, self._fxrt_prefill_decompose)
         wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_metadata.sas_metadata))
-        record_attention_compute_start()
+        _record_attention_compute_start(self._fxrt_prefill_decompose, self._fxrt_attention_event_index)
         kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
         attn_op = kv_plan.get_dsa_sparse_attn_op()
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()

@@ -738,12 +738,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        y, post, comb, _ = torch.ops._C_ascend.npu_hc_pre_v2(
+        y, post, comb = torch.ops._C_ascend.npu_hc_pre_v2(
             x,
             hc_fn,
             hc_scale,
             hc_base,
-            None,
             hc_mult=self.hc_mult,
             hc_sinkhorn_iters=self.hc_sinkhorn_iters,
             norm_eps=self.norm_eps,

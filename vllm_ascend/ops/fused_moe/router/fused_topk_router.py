@@ -18,37 +18,23 @@ from collections.abc import Callable
 
 import torch
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.logger import logger
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.ops.fxrt_moe import moe_gating_top_k_hash_for_prefill
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
 _VISION_GATING_OP_NAME = "npu_moe_gating_top_k"
-_VISION_GATING_REQUIRED_ARGUMENTS = frozenset(("additional_bias", "additional_token_mask"))
+_VISION_GATING_REQUIRED_ARGUMENTS = frozenset(("image_bias", "image_token_mask"))
 
 
 def _npu_moe_gating_vision_op() -> Callable | None:
     """Return the optional fused op only when its schema supports vision routing."""
-    try:
-        import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
-    except ImportError:
-        logger.warning_once(
-            "[MoE/router] DeepSeek V4 vision fused routing is unavailable: "
-            "custom_ops is not installed; using the Python vision routing fallback."
-        )
-        return None
-
-    op = getattr(torch.ops.custom, _VISION_GATING_OP_NAME, None)
+    op = getattr(torch.ops._C_ascend, _VISION_GATING_OP_NAME, None)
     if op is None:
-        logger.warning_once(
-            "[MoE/router] DeepSeek V4 vision fused routing is unavailable: "
-            "%s is not registered; using the Python vision routing fallback.",
-            _VISION_GATING_OP_NAME,
-        )
         return None
 
     schemas_by_overload = getattr(op, "_schemas", None) or {}
@@ -61,19 +47,10 @@ def _npu_moe_gating_vision_op() -> Callable | None:
     if default_schema is not None:
         schemas.append(default_schema)
 
-    available_arguments: set[str] = set()
     for candidate in schemas:
         argument_names = {argument.name for argument in candidate.arguments}
-        available_arguments.update(argument_names)
         if argument_names >= _VISION_GATING_REQUIRED_ARGUMENTS:
             return op
-    logger.warning_once(
-        "[MoE/router] DeepSeek V4 vision fused routing is unavailable: %s schema is missing %s; "
-        "available_arguments=%s. Using the Python vision routing fallback.",
-        _VISION_GATING_OP_NAME,
-        sorted(_VISION_GATING_REQUIRED_ARGUMENTS - available_arguments),
-        sorted(available_arguments),
-    )
     return None
 
 
@@ -81,6 +58,7 @@ def select_deepseek_v4_vision_experts_with_fusion_op(
     vision_gating_op: Callable,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,
+    tid2eid: torch.Tensor | None,
     bias_vl: torch.Tensor,
     text_bias: torch.Tensor | None,
     top_k: int,
@@ -92,18 +70,16 @@ def select_deepseek_v4_vision_experts_with_fusion_op(
     image_sentinel_lo: int = DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 vision experts with the optional fused operator."""
-    router_logits = router_logits.float()
-    bias_vl = bias_vl.to(router_logits.dtype)
-    if text_bias is not None:
-        text_bias = text_bias.to(router_logits.dtype)
     image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
     image_token_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
     topk_weights, topk_ids, _ = vision_gating_op(
         router_logits,
         k=top_k,
         bias=text_bias,
-        additional_bias=bias_vl,
-        additional_token_mask=image_token_mask.view(-1),
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        image_bias=bias_vl,
+        image_token_mask=image_token_mask,
         k_group=k_group,
         group_count=group_count,
         routed_scaling_factor=1.0,
@@ -240,38 +216,12 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         num_expert_group = self.num_expert_group if self.num_expert_group is not None else 1
         renorm = int(self.renormalize)
         if self.scoring_func == "sqrtsoftplus":
-            if self.tid2eid is None and self.bias_vl is None:
-                # Pure dynamic routing without a hash table (e.g. the V4.1
-                # DSpark draft, whose layers deliberately skip hash routing;
-                # see DeepseekV4MoE: self.hash = ... and not is_draft_layer).
-                # The native moe_gating_top_k_hash op requires input_ids and
-                # the tid2eid table, so use the reference implementation
-                # instead. Semantics match select_deepseek_v4_vision_experts:
-                # noaux_tc â€” the correction bias steers expert selection
-                # only, routing weights come from the raw scores.
-                scores = torch.nn.functional.softplus(router_logits).sqrt()
-                if self.e_score_correction_bias is not None:
-                    bias = self.e_score_correction_bias
-                    if bias.dtype != scores.dtype:
-                        bias = bias.to(scores.dtype)
-                    topk_ids = torch.topk(scores + bias.unsqueeze(0), k=self.top_k, dim=-1, sorted=True).indices
-                else:
-                    topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=True).indices
-                topk_weights = scores.gather(1, topk_ids)
-                if self.renormalize:
-                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-                        torch.finfo(topk_weights.dtype).tiny
-                    )
-                if self.routed_scaling_factor != 1.0:
-                    topk_weights = topk_weights * self.routed_scaling_factor
-                return topk_weights.to(torch.float32), topk_ids.to(
-                    torch.int32 if indices_type is None else indices_type
-                )
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
                     raise ValueError(
                         "DeepSeek V4 hash MoE routing requires input_ids; vision routing requires it as well."
                     )
+                input_ids = input_ids.to(torch.int64)
                 tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
@@ -284,13 +234,9 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     # ids. Apply the identical TP chunk only when communication
                     # has not already aligned ids with local router rows.
                     input_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1)).reshape(-1)
-                if tid2eid_ones is not None:
-                    # Hash routing uses input_ids as table indices and requires
-                    # int64, non-negative values. Non-hash vision routing only
-                    # compares sentinel IDs, so keep its original dtype and
-                    # leave padding at -1 to avoid four device-side ops.
-                    input_ids = input_ids.to(torch.int64)
-                    input_ids = torch.where(input_ids == -1, 0, input_ids)
+                input_ids = torch.where(
+                    input_ids == (input_ids * 0 - 1), torch.zeros_like(input_ids), input_ids
+                )
             else:
                 input_ids = None
                 tid2eid_ones = None
@@ -302,11 +248,12 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 text_bias = text_bias.to(router_logits.dtype)
             if bias_vl is not None:
                 assert input_ids is not None
-                if self.vision_gating_op is not None and tid2eid_ones is None:
+                if self.vision_gating_op is not None:
                     topk_weights, topk_ids = select_deepseek_v4_vision_experts_with_fusion_op(
                         vision_gating_op=self.vision_gating_op,
                         router_logits=router_logits,
                         input_ids=input_ids,
+                        tid2eid=tid2eid_ones,
                         bias_vl=bias_vl,
                         text_bias=text_bias,
                         top_k=self.top_k,
@@ -331,7 +278,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 return topk_weights.to(torch.float32), topk_ids.to(
                     torch.int32 if indices_type is None else indices_type
                 )
-            topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+            topk_weights, topk_ids, _ = moe_gating_top_k_hash_for_prefill(
                 x=router_logits,
                 k=self.top_k,
                 bias=text_bias,
