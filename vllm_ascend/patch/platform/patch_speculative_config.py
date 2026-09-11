@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
 
@@ -37,11 +39,78 @@ def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> Pretra
     return hf_config
 
 
+def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
+    """Restore the DSpark draft architecture after VL config conversion.
+
+    DeepSeek-V4-Vision uses the same checkpoint for the target and DSpark
+    drafter.  vLLM first rewrites that checkpoint to ``DSparkDraftModel``, but
+    rebuilding ``model_arch_config`` with multimodal detection can restore the
+    top-level ``*ForConditionalGeneration`` architecture.  The drafter would
+    then instantiate a second full VL target and register duplicate attention
+    layer names.  Update both config representations without re-running the
+    multimodal architecture conversion.
+    """
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    draft_hf_config = text_config if text_config is not None else hf_config
+    root_model_type = getattr(hf_config, "model_type", None)
+    text_model_type = getattr(draft_hf_config, "model_type", None)
+    is_v41 = root_model_type == "deepseek_v4.1" or text_model_type == "deepseek_v4.1_text"
+    if (
+        hf_config is None
+        or root_model_type not in ("deepseek_v4", "deepseek_v4.1")
+        or getattr(draft_hf_config, "dspark_target_layer_ids", None) is None
+    ):
+        return
+
+    architecture = "DeepseekV41DSparkDraftModel" if is_v41 else "DSparkDraftModel"
+    if is_v41:
+        # The Aurora target and draft experts intentionally have different
+        # widths.  SpeculativeConfig owns a private config copy, so adapting
+        # these fields cannot alter the target model.
+        draft_hf_config.update(
+            {
+                "n_routed_experts": draft_hf_config.dspark_n_routed_experts,
+                "num_experts_per_tok": draft_hf_config.dspark_n_activated_experts,
+                "n_mtp_layers": getattr(draft_hf_config, "num_nextn_predict_layers", 3),
+            }
+        )
+    normalized_model_type = "deepseek_v4.1" if is_v41 else root_model_type
+    hf_config.update(
+        {
+            "architectures": [architecture],
+            "model_type": normalized_model_type,
+        }
+    )
+    arch_updates = dict(
+        architectures=[architecture],
+        model_type=normalized_model_type,
+        is_mm_prefix_lm=False,
+    )
+    if is_v41:
+        arch_updates.update(
+            num_experts=draft_hf_config.n_routed_experts,
+            num_experts_per_token=draft_hf_config.num_experts_per_tok,
+        )
+    draft_model_config.model_arch_config = replace(
+        draft_model_config.model_arch_config,
+        **arch_updates,
+    )
+    architectures = draft_model_config.model_arch_config.architectures
+    model_info, architecture = draft_model_config.registry.inspect_model_cls(
+        architectures,
+        draft_model_config,
+    )
+    draft_model_config._model_info = model_info
+    draft_model_config._architecture = architecture
+
+
 def _dspark_post_init(self):
     _orig_post_init(self)
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
+        _normalize_deepseek_v4_dspark_draft(draft_model_config)
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "dspark_noise_token_id", None)  # type: ignore

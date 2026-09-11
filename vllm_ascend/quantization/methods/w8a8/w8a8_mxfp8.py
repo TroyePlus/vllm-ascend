@@ -454,7 +454,7 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         else:
             layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
             layer.weight_scale.data = layer.weight_scale.data.to(torch.uint8)
-        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
+        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(self.block_size // 32, dim=1).repeat_interleave(self.block_size // 1, dim=0)
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)

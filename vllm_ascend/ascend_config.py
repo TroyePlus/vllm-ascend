@@ -257,6 +257,7 @@ class AscendConfig:
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
             "enable_dsa_cp": false,
+            "enable_force_eplb": false,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -384,6 +385,10 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    # Enable the V4.1 node-sharded Engram path.
+    enable_engram: bool = True
+    # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
+    engram_storage: Literal["bf16", "int8", "fp8", "mxfp8"] = "bf16"
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -391,6 +396,7 @@ class AscendConfig:
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
+    enable_force_eplb: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
@@ -479,6 +485,13 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if (
+            self.enable_force_eplb
+            and self.eplb_config.dynamic_eplb
+            and vc.model_config is not None
+            and vc.model_config.is_moe
+        ):
+            raise ValueError("enable_force_eplb cannot be mixed with dynamic_eplb.")
         self._check_mooncake_c8_kv_cache_quant(vc)
 
         # profiling_chunk vs min_chunk clamp
