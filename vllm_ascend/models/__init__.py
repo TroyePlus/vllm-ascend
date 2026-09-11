@@ -3,6 +3,10 @@ from vllm import ModelRegistry
 
 def register_model():
     ModelRegistry.register_model(
+        "Gemma4ForConditionalGeneration",
+        "vllm_ascend.models.gemma4_mm:AscendGemma4ForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
         "KimiLinearForCausalLM",
         "vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM",
     )
@@ -28,6 +32,14 @@ def register_model():
         "DeepseekV4ForCausalLM", "vllm_ascend.models.deepseek_v4.model:AscendDeepseekV4ForCausalLM"
     )
     ModelRegistry.register_model(
+        "DeepseekV4ForConditionalGeneration",
+        "vllm_ascend.models.deepseek_v4.vl_model:AscendDeepseekV4ForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "DeepseekV41ForConditionalGeneration",
+        "vllm_ascend.models.deepseek_v41.vl_model:AscendDeepseekV41ForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
         "MiniMaxM3SparseForCausalLM",
         "vllm_ascend.models.minimax_m3:MiniMaxM3SparseForCausalLM",
     )
@@ -39,6 +51,10 @@ def register_model():
     ModelRegistry.register_model(
         "DSparkDraftModel",
         "vllm_ascend.models.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "DeepseekV41DSparkDraftModel",
+        "vllm_ascend.models.deepseek_v41.dspark:DSparkDeepseekV41ForCausalLM",
     )
     ModelRegistry.register_model(
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"

@@ -320,6 +320,15 @@ class DeepseekV4MoE(nn.Module):
             )
 
         self.hash = layer_idx < config.num_hash_layers and not is_draft_layer
+        self.gate.bias_vl = None
+        if getattr(config, "vision_n_layers", 0) > 0:
+            self.gate.bias_vl = nn.Parameter(
+                torch.empty(
+                    config.n_routed_experts,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         if self.hash:
             # Use zeros instead of empty to avoid garbage values causing
             # invalid memory access in dummy mode (--load-format="dummy")
@@ -353,6 +362,8 @@ class DeepseekV4MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             swiglu_limit=self.swiglu_limit,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            bias_vl=self.gate.bias_vl,
+            image_sentinel_lo=getattr(config, "image_sentinel_base_id", 129257),
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
@@ -364,12 +375,16 @@ class DeepseekV4MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return hidden_states #TODO wangtao
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if hidden_states_fp32 is not None:
+            hidden_states_fp32 = hidden_states_fp32.view(-1, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
@@ -377,17 +392,21 @@ class DeepseekV4MoE(nn.Module):
         # reduce_scatter instead of chunking here.
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+            if hidden_states_fp32 is not None:
+                hidden_states_fp32 = sequence_parallel_chunk(hidden_states_fp32)
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoEFactory class
+            router_input = hidden_states if hidden_states_fp32 is None else hidden_states_fp32
             fused_moe_out = self.experts(
                 hidden_states=hidden_states,
-                router_logits=hidden_states,
+                router_logits=router_input,
                 input_ids=input_ids,
             )
         else:
             # router_logits: (num_tokens, n_experts)
-            router_logits = F.linear(hidden_states.float(), self.gate.weight)
+            router_input = hidden_states.float() if hidden_states_fp32 is None else hidden_states_fp32
+            router_logits = F.linear(router_input, self.gate.weight)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -445,6 +464,8 @@ def _get_llama_4_scaling(
 
 
 class DeepseekV4Attention(nn.Module):
+    swa_cache_cls = AscendDeepseekV4SWACache
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -594,7 +615,7 @@ class DeepseekV4Attention(nn.Module):
                 )
 
         k_dtype = get_dsv4_attn_kv_dtype(vllm_config)
-        swa_cache_layer = AscendDeepseekV4SWACache(
+        swa_cache_layer = self.swa_cache_cls(
             head_dim=self.head_dim,
             window_size=self.window_size,
             dtype=k_dtype,
@@ -649,6 +670,8 @@ class DeepseekV4Attention(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    attention_cls = DeepseekV4Attention
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -673,7 +696,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
 
-        attn_cls = DeepseekV4Attention
+        attn_cls = self.attention_cls
 
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
@@ -707,11 +730,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
-    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        y = torch.ops._C_ascend.npu_hc_pre_v2(
-            x, hc_fn, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps
+    def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize once and provide the exact FP32 routing input."""
+        return torch.ops._C_ascend.npu_rms_norm_cast(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
         )
-        return y
+
+    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        y, post, comb, _ = torch.ops._C_ascend.npu_hc_pre_v2(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            None,
+            hc_mult=self.hc_mult,
+            hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+        )
+        return y, post, comb
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_post(
@@ -735,8 +774,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, input_ids)
+        hidden_states, hidden_states_fp32 = self.rms_norm_cast(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            input_ids=input_ids,
+            hidden_states_fp32=hidden_states_fp32,
+        )
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -745,6 +788,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 @support_torch_compile
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    decoder_layer_cls = DeepseekV2DecoderLayer
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -782,8 +826,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+            lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
+        )
+        self.needs_moe_input_ids = any(
+            layer.mlp.gate.tid2eid is not None or layer.mlp.gate.bias_vl is not None
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
         )
 
         if get_pp_group().is_last_rank:
@@ -819,6 +867,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32))
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_norm = RMSNorm(hc_dim, eps=config.rms_norm_eps, has_weight=False, dtype=torch.float32)
 
         # Pre-hc_head residual stream buffer for the speculative draft
         # (MTP / DSpark / DFlash). Only needed when the decoder consumes
@@ -846,8 +895,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = torch.nn.functional.linear(x, hc_fn) * rsqrt
+        x_norm = self.hc_norm(x)
+        mixes = torch.nn.functional.linear(x_norm, hc_fn)
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
@@ -889,13 +938,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if pp_group.is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+        moe_input_ids = input_ids
+        if self.needs_moe_input_ids:
+            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
                 llama_4_scaling,
-                input_ids=input_ids,
+                input_ids=moe_input_ids,
             )
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states.mean(dim=1))
@@ -1122,7 +1174,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
             if "rotary_emb.inv_freq" in name:
                 continue
-            if ".gate.bias" in name:
+            if ".gate.bias_vl" in name:
+                # The parameter keeps the checkpoint name on Ascend. It is
+                # passed to the hash router as its vision-only correction
+                # bias, while text rows continue to use tid2eid.
+                pass
+            elif ".gate.bias" in name:
                 name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
 
             if "sink" in name:

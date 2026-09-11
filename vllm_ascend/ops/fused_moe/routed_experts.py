@@ -35,6 +35,7 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.force_eplb import get_force_eplb_topk
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.ops.fused_moe.shared_experts import FusedMoEEvents
@@ -475,6 +476,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             )
             topk_ids = torch.cat([topk_ids, shared_expert_ids], dim=1)
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
+        if get_ascend_config().enable_force_eplb:
+            topk_ids = get_force_eplb_topk(topk_ids, num_logical_experts)
         # MXFP4 packs activations as uint8; skip the cast so topk_weights stays
         # fp32, which is what npu_moe_token_unpermute expects for its `probs` arg.
         if hidden_states.dtype not in [torch.uint8, torch.float8_e4m3fn]:

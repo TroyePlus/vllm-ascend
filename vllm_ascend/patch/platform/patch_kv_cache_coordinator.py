@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -159,9 +160,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # can be a multiple of hash_block_size.
             self.hash_block_size = hash_block_size
             if enable_caching:
+                # The GLM kpool tail spec uses block_size=index_kpool and opts
+                # out of prefix caching, so it is not bound by the MLA hash
+                # block size.
                 assert all(
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
+                    if prefix_cacheable(g.kv_cache_spec)
                 ), "block_size must be divisible by hash_block_size"
             self.enable_partial_hash_hits = dcp_world_size == 1 and any(
                 isinstance(g.kv_cache_spec, MambaSpec)
@@ -205,7 +210,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # with the upstream coordinator interface. PCP is rejected by the platform.
             del pcp_world_size
             # main (cdc4824a21): upstream cache_blocks reads num_reprefillable_tokens
-            self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+            self.num_reprefillable_tokens = max(0, (num_prefill_lookahead or 0) - 1)
             self.dcp_world_size = dcp_world_size
             self.scheduler_block_size = scheduler_block_size
             self.kv_cache_config = kv_cache_config
@@ -268,9 +273,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # can be a multiple of hash_block_size.
             self.hash_block_size = hash_block_size
             if enable_caching:
+                # The GLM kpool tail spec uses block_size=index_kpool and opts
+                # out of prefix caching, so it is not bound by the MLA hash
+                # block size.
                 assert all(
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
+                    if prefix_cacheable(g.kv_cache_spec)
                 ), "block_size must be divisible by hash_block_size"
             self.enable_partial_hash_hits = dcp_world_size == 1 and any(
                 isinstance(g.kv_cache_spec, MambaSpec)
@@ -312,6 +321,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not prefix_cacheable(g.kv_cache_spec):
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
@@ -327,7 +338,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             else:
                 self.attention_groups.append(SpecGroup(spec, [i], manager_cls, use_eagle))
 
-        assert len(self.attention_groups) > 1, "HybridKVCacheCoordinator requires at least two attention groups."
+        # DeepSeek boot configurations may retain multiple physical cache
+        # groups while all of them use one identical attention spec (for
+        # example, when every V4.1 layer temporarily runs the SWA path).  The
+        # Ascend coordinator's grouped lookup works for this degenerate case,
+        # so do not reject it merely because the unique-spec count is one.
+        if not self.attention_groups:
+            self.full_attention_group_id = None
+            self.lcm_block_size = self.scheduler_block_size
+            return
 
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.
@@ -401,6 +420,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             return block_hashes
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
+        if not self.attention_groups:
+            return tuple([] for _ in range(num_groups)), 0
         hit_length = max_cache_hit_length
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups

@@ -21,7 +21,6 @@ from vllm_ascend.utils import (
 
 SFA_QSFA_TILE_SIZE = 128
 
-
 def get_or_register_attention_buffer(
     vllm_config: VllmConfig,
     layer_names: list[str],
