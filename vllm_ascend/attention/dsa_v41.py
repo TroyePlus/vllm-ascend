@@ -376,8 +376,10 @@ class DeepseekV41EagerAttentionImpl:
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
+        cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+        cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
         kv_compress_epilog_v2(
-            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            cache,
             kv,
             swa_metadata.slot_mapping,
             quant_mode="mxfp8_bf16"
@@ -436,8 +438,10 @@ class DeepseekV41EagerAttentionImpl:
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
+            cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
             kv_compress_epilog_v2(
-                attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                cache,
                 kv.squeeze(1),
                 swa_metadata.slot_mapping,
                 quant_mode="mxfp8_bf16"
