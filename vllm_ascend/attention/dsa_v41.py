@@ -14,7 +14,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-import custom
+import custom_ops
+import cann_ops_transformer
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
@@ -282,8 +283,8 @@ def scatter_cache_v2(
 
 
 def kv_compress_epilog_v2(
-        x: torch.Tensor,
         cache: torch.Tensor,
+        x: torch.Tensor,
         slot_mapping: torch.Tensor,
         quant_mode: str
 ) -> None:
@@ -294,7 +295,7 @@ def kv_compress_epilog_v2(
     the plane shape. ``npu_scatter_nd_update_v2`` preserves that stride and
     treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
     """
-    torch.ops.custom.kv_compress_epilog_v2(x, cache, slot_mapping, quant_group_size=32, quant_mode=quant_mode)
+    torch.ops.custom.kv_compress_epilog_v2(cache, x, slot_mapping, quant_group_size=32, quant_mode=quant_mode)
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
@@ -376,8 +377,8 @@ class DeepseekV41EagerAttentionImpl:
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
         kv_compress_epilog_v2(
-            kv,
             attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            kv,
             swa_metadata.slot_mapping,
             quant_mode="mxfp8_bf16"
         )
@@ -436,8 +437,8 @@ class DeepseekV41EagerAttentionImpl:
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
             kv_compress_epilog_v2(
-                kv.squeeze(1),
                 attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                kv.squeeze(1),
                 swa_metadata.slot_mapping,
                 quant_mode="mxfp8_bf16"
             )
@@ -672,11 +673,25 @@ class DeepseekV41EagerAttentionImpl:
         )
         win_topk_length = (win_indices != -1).sum(dim=-1).to(torch.int32)
         cmp_topk_length = (
-            None
+            torch.zeros_like(win_topk_length)
             if cmp_indices is None
             else (cmp_indices != -1).sum(dim=-1).to(torch.int32)
         )
-        output, _ = torch.ops.custom.mixed_quant_sparse_flash_mla(
+        op_metadata = cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla(
+            win_topk_length,
+            cmp_topk_length,
+            cu_seqlens_q=query_start_loc,
+            num_heads_q=q.shape[1],
+            num_heads_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0].shape[2],
+            head_dim=q.shape[-1],
+            quant_mode=1,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            has_win_kv=True,
+            has_cmp_kv=has_compressed,
+        )
+
+        output, _ = cann_ops_transformer.ops.ds41.mixed_quant_sparse_flash_mla(
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
             cmp_kv=source_cache,
