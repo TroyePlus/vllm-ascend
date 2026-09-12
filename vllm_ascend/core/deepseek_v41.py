@@ -11,6 +11,8 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheTensor, UniformT
 
 from vllm_ascend.core.circular_buffer import AscendCircularBufferSpec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 
 STATE_RING_ROWS = 32
 
@@ -28,7 +30,7 @@ class DeepseekV41FullSpec(AscendMLAAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41IndexerSpec(AscendMLAAttentionSpec):
-    """INT8 index keys followed by FP16 scales inside each shared slot page."""
+    """Byte-addressable FP4 index keys followed by E8M0 scales."""
 
     def is_uniform_with_collection(self, specs):
         return all(
@@ -348,8 +350,13 @@ def validate_cache_runtime(vllm_config):
         raise NotImplementedError("V4.1 initial runtime requires PP=DCP=PCP=1")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
+    # V4.1 A5 always uses the byte-addressable quantized cache layout. Keep
+    # DSpark as an explicit BF16 exception because its draft SWA spec and
+    # kernel require BF16.
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        vllm_config.cache_config.cache_dtype = "auto"
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
-        raise NotImplementedError("V4.1 initial cache layout requires BF16")
+        raise NotImplementedError("V4.1 cache dtype selector must be auto or bfloat16")
     if speculative is not None:
         # Aurora's planes are always BF16. Pin the inherited DSV4 draft
         # backend to the same layout, including on hardware where auto is FP8.

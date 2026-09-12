@@ -12,6 +12,8 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache_v2,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.worker.device_metadata import (
@@ -71,6 +73,7 @@ class DeepseekV41Indexer(nn.Module):
                 dtype=torch.bfloat16,
             )
             self.k_norm = DeepseekV41RMSNorm(self.width, _read(config, "rms_norm_eps"))
+            use_a5_quantized_cache = get_ascend_device_type() == AscendDeviceType.A5
             self.k_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.k_cache",
@@ -78,10 +81,10 @@ class DeepseekV41Indexer(nn.Module):
                     block_size=vllm_config.cache_config.block_size,
                     num_kv_heads=1,
                     head_size=self.width,
-                    dtype=torch.int8,
+                    dtype=torch.uint8 if use_a5_quantized_cache else torch.int8,
                     compress_ratio=compress_ratio,
-                    scale_dim=1,
-                    scale_dtype=torch.float16,
+                    scale_dim=self.width // 32 if use_a5_quantized_cache else 1,
+                    scale_dtype=(torch.uint8 if use_a5_quantized_cache else torch.float16),
                 ),
             )
 
