@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    CrossAttentionManager,
     SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
@@ -31,7 +32,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.circular_buffer import prefix_cacheable
+from vllm_ascend.core.private_circle_pool import is_private_circle_kv_cache_spec
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -66,6 +69,20 @@ def _is_deepseek_v4_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
 
 def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
     return any(_is_deepseek_v4_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
+
+
+def _is_private_circle_group_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Return whether a cache group consists exclusively of V4.1 private-circle specs."""
+    if is_private_circle_kv_cache_spec(kv_cache_spec):
+        return True
+    nested = getattr(kv_cache_spec, "kv_cache_specs", None)
+    if isinstance(nested, Mapping):
+        nested = tuple(nested.values())
+    elif isinstance(nested, (list, tuple, set)):
+        nested = tuple(nested)
+    else:
+        return False
+    return bool(nested) and all(_is_private_circle_group_spec(spec) for spec in nested)
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -153,6 +170,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 )
                 for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
             )
+
+            self.private_circle_group_ids = (
+                frozenset(
+                    i
+                    for i, manager in enumerate(self.single_type_managers)
+                    if _is_private_circle_group_spec(manager.kv_cache_spec)
+                ) if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL else frozenset()
+            )
+            self.private_circle_pool = None
+            self.private_circle_config = None
 
             # hash_block_size: the block size used to compute block hashes.
             # The actual block size usually equals hash_block_size, but in cases where
@@ -267,6 +294,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
             )
 
+            self.private_circle_group_ids = (
+                frozenset(
+                    i
+                    for i, manager in enumerate(self.single_type_managers)
+                    if _is_private_circle_group_spec(manager.kv_cache_spec)
+                ) if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL else frozenset()
+            )
+            self.private_circle_pool = None
+            self.private_circle_config = None
+
             # hash_block_size: the block size used to compute block hashes.
             # The actual block size usually equals hash_block_size, but in cases where
             # different KV cache groups have different block sizes, the actual block size
@@ -322,6 +359,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
             if not prefix_cacheable(g.kv_cache_spec):
+                continue
+            if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and _is_private_circle_group_spec(g.kv_cache_spec):
+                # Ring allocations own these groups; they are never hashed or
+                # matched, so they must not constrain prefix-cache lookups.
                 continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
@@ -392,6 +433,131 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # NOTE: use 16k as the alignment tokens for model with compress ratio
         block_sizes = [self._get_effective_block_size(group.spec) for group in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+
+    def cache_blocks(self, request, num_computed_tokens: int) -> None:
+        """Cache shared groups while keeping request-private circle unhashed."""
+        if self.enable_partial_hash_hits:
+            aligned_num_computed_tokens = num_computed_tokens
+        else:
+            aligned_num_computed_tokens = (
+                num_computed_tokens
+                // (self.scheduler_block_size or self.lcm_block_size)
+                * (self.scheduler_block_size or self.lcm_block_size)
+            )
+        for group_id, manager in enumerate(self.single_type_managers):
+            if group_id in self.private_circle_group_ids:
+                continue
+            num_tokens_to_cache = aligned_num_computed_tokens
+            # EAGLE groups match one block past each aligned boundary and
+            # drop it, so make that lookahead block eligible to be cached.
+            if manager.use_eagle and aligned_num_computed_tokens > 0:
+                num_tokens_to_cache = min(
+                    num_computed_tokens,
+                    aligned_num_computed_tokens + manager.block_size,
+                )
+            manager.cache_blocks(
+                request,
+                num_tokens_to_cache,
+                retention_interval=self.retention_interval,
+            )
+
+    def get_num_blocks_to_allocate(
+        self, request_id, num_tokens, new_computed_blocks, num_encoder_tokens,
+        total_computed_tokens, num_local_computed_tokens, num_tokens_main_model,
+        apply_admission_cap=False,
+    ) -> int:
+        """Count only shared-pool blocks; private circle is reserved atomically."""
+        total = 0
+        for group_id, manager in enumerate(self.single_type_managers):
+            if group_id in self.private_circle_group_ids:
+                continue
+            if isinstance(manager, CrossAttentionManager):
+                total += manager.get_num_blocks_to_allocate(
+                    request_id, num_encoder_tokens, [], 0, 0,
+                    num_encoder_tokens, apply_admission_cap=apply_admission_cap)
+            else:
+                total += manager.get_num_blocks_to_allocate(
+                    request_id, num_tokens, new_computed_blocks[group_id],
+                    total_computed_tokens, num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap)
+        return total
+
+    def allocate_new_computed_blocks(
+        self, request_id, new_computed_blocks, num_local_computed_tokens,
+        num_external_computed_tokens,
+    ) -> None:
+        """Attach local hits, then external blocks, for shared groups."""
+        active_managers = [
+            (group_id, manager)
+            for group_id, manager in enumerate(self.single_type_managers)
+            if group_id not in self.private_circle_group_ids
+        ]
+        # Preserve upstream's running-request fast path. Private circle
+        # managers are omitted because they keep no shared-pool bookkeeping.
+        if any(request_id in manager.num_cached_block for _, manager in active_managers):
+            assert all(len(new_computed_blocks[group_id]) == 0
+                       for group_id, _ in active_managers)
+            return
+        # Touch all local hits before allocating external blocks, otherwise an
+        # earlier group's allocation can evict a later group's hit blocks.
+        for group_id, manager in active_managers:
+            manager.add_local_computed_blocks(
+                request_id, new_computed_blocks[group_id],
+                num_local_computed_tokens, num_external_computed_tokens)
+        if num_external_computed_tokens > 0:
+            for _, manager in active_managers:
+                manager.allocate_external_computed_blocks(
+                    request_id, num_local_computed_tokens,
+                    num_external_computed_tokens)
+
+    def allocate_new_blocks(
+        self, request_id, num_tokens, num_tokens_main_model,
+        num_encoder_tokens=0,
+    ):
+        result = []
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid in self.private_circle_group_ids:
+                result.append([])
+            else:
+                result.append(manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens if isinstance(manager, CrossAttentionManager)
+                    else num_tokens,
+                    num_tokens_main_model))
+        return tuple(result)
+
+    def free(self, request_id: str) -> None:
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid not in self.private_circle_group_ids:
+                manager.free(request_id)
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        """Pop shared-group bookkeeping; private circle managers never allocate."""
+        blocks: list[KVCacheBlock] = []
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid not in self.private_circle_group_ids:
+                blocks.extend(manager.pop_blocks_for_free(request_id))
+        return blocks
+
+    def remove_skipped_blocks(
+        self, request_id: str, processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        for gid, manager in enumerate(self.single_type_managers):
+            if gid not in self.private_circle_group_ids:
+                if num_prompt_tokens is None:
+                    manager.remove_skipped_blocks(request_id, processed_computed_tokens)
+                else:
+                    manager.remove_skipped_blocks(
+                        request_id, processed_computed_tokens, num_prompt_tokens)
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        return [
+            0 if gid in self.private_circle_group_ids else
+            manager.get_num_common_prefix_blocks(running_request_id)
+            for gid, manager in enumerate(self.single_type_managers)
+        ]
 
     def find_longest_cache_hit(
         self,

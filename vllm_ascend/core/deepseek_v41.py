@@ -92,6 +92,17 @@ def is_v41_spec(spec):
     )
 
 
+def _resolve_divert(specs, divert_swa):
+    """Private-circle SWA diversion: explicit flag, else env + spec presence."""
+    if divert_swa is not None:
+        return divert_swa
+    from vllm_ascend import envs
+
+    if not envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL:
+        return False
+    return any(isinstance(s, DeepseekV41SWASpec) for s in specs.values())
+
+
 def _uniform(members, label):
     if not members:
         raise ValueError(f"V4.1 cache group {label} is empty")
@@ -151,17 +162,21 @@ def _draft_layer_number(name):
         raise ValueError(f"Invalid Aurora DSpark cache resource name: {name}") from exc
 
 
-def plan_cache_slots(specs):
+def plan_cache_slots(specs, *, divert_swa: bool | None = None):
     """Place source KV/index tuples, state and SWA in four shared layer slots.
 
     Sizes come from payloads, never previously padded specs. Different groups
     overlay a slot at distinct live block IDs; a source's KV and index share
     the same ID at disjoint offsets within its page.
+
+    When ``divert_swa`` is set, SWA layers live in the request-private circle
+    ring instead and receive no shared slot placement.
     """
     if not all(is_v41_spec(spec) for spec in specs.values()):
         raise ValueError(
             "V4.1 requires explicit target or Aurora DSpark cache specs; foreign resources are unsupported"
         )
+    divert = _resolve_divert(specs, divert_swa)
     full = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41FullSpec)), key=_layer_number)
     state = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41CompressorStateSpec)), key=_layer_number)
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
@@ -190,21 +205,27 @@ def plan_cache_slots(specs):
             or kv_spec.block_size != index_spec.block_size
         ):
             raise ValueError(f"V4.1 source {prefix} has incompatible KV/index specs")
-        aliases = ([state[slot_idx]] if slot_idx < len(state) else []) + swa[slot_idx :: len(full)]
+        aliases = [state[slot_idx]] if slot_idx < len(state) else []
+        if not divert:
+            aliases += swa[slot_idx :: len(full)]
         kv_bytes = sum(_cache_plane_sizes(kv_spec))
         index_bytes = sum(_cache_plane_sizes(index_spec))
-        capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases))
+        capacity = max([kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases)])
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
-            swa_spec = specs[swa[slot_idx]]
-            if (
-                draft_spec.block_size != swa_spec.block_size
-                or draft_spec.head_size != swa_spec.head_size
-                or draft_spec.sliding_window != swa_spec.sliding_window
-                or sum(_cache_plane_sizes(draft_spec)) > capacity
-            ):
-                raise ValueError("Aurora DSpark geometry must match target SWA and fit its existing slot")
+            if divert:
+                if sum(_cache_plane_sizes(draft_spec)) > capacity:
+                    raise ValueError("Aurora DSpark draft does not fit the private-circle slot capacity")
+            else:
+                swa_spec = specs[swa[slot_idx]]
+                if (
+                    draft_spec.block_size != swa_spec.block_size
+                    or draft_spec.head_size != swa_spec.head_size
+                    or draft_spec.sliding_window != swa_spec.sliding_window
+                    or sum(_cache_plane_sizes(draft_spec)) > capacity
+                ):
+                    raise ValueError("Aurora DSpark geometry must match target SWA and fit its existing slot")
             aliases.append(draft_name)
         placements = [
             CachePlacement(kv_name, 0, kv_bytes),
@@ -213,28 +234,31 @@ def plan_cache_slots(specs):
         ]
         slots.append(CacheSlot(capacity, tuple(placements)))
     names = [p.name for slot in slots for p in slot.placements]
-    if len(names) != len(set(names)) or set(names) != set(specs):
+    uncovered = set(specs) - set(names) - (set(swa) if divert else set())
+    if len(names) != len(set(names)) or uncovered:
         raise ValueError("V4.1 slot placement must cover each resource exactly once")
     return tuple(slots)
 
 
-def group_cache_specs(specs):
+def group_cache_specs(specs, *, divert_swa: bool | None = None):
     """Merge full-context resources and pad layer tuples without mutating inputs."""
     if not any(is_v41_spec(s) for s in specs.values()):
         return None
-    slots = plan_cache_slots(specs)
+    divert = _resolve_divert(specs, divert_swa)
+    slots = plan_cache_slots(specs, divert_swa=divert)
     padded = {
         p.name: replace(specs[p.name], page_size_padded=p.page_size_bytes) for slot in slots for p in slot.placements
     }
     full = {n: s for n, s in padded.items() if isinstance(s, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))}
     state = {n: s for n, s in padded.items() if isinstance(s, DeepseekV41CompressorStateSpec)}
     groups = [_uniform(full, "full"), _uniform(state, "state")]
-    swa = sorted((n for n, s in padded.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
+    swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
+    swa_source = specs if divert else padded
     groups.extend(
-        _uniform({n: padded[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
+        _uniform({n: swa_source[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
         for start in range(0, len(swa), len(slots))
     )
-    draft = sorted((n for n, s in padded.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
     if draft:
         groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
     return groups
@@ -253,7 +277,7 @@ def has_v41_groups(groups):
     )
 
 
-def cache_slots_from_groups(groups):
+def _group_specs(groups):
     specs = {}
     for group in groups:
         if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -262,28 +286,38 @@ def cache_slots_from_groups(groups):
             if name in specs:
                 raise ValueError(f"V4.1 resource belongs to multiple cache groups: {name}")
             specs[name] = group.kv_cache_spec.kv_cache_specs[name]
-    return plan_cache_slots(specs)
+    return specs
 
 
-def pool_bytes_per_block(groups):
-    return sum(slot.page_size_bytes for slot in cache_slots_from_groups(groups))
+def cache_slots_from_groups(groups, *, divert_swa: bool | None = None):
+    return plan_cache_slots(_group_specs(groups), divert_swa=divert_swa)
 
 
-def request_blocks(vllm_config, groups):
+def pool_bytes_per_block(groups, *, divert_swa: bool | None = None):
+    return sum(slot.page_size_bytes for slot in cache_slots_from_groups(groups, divert_swa=divert_swa))
+
+
+def request_blocks(vllm_config, groups, *, divert_swa: bool | None = None):
     # Different logical groups consume different IDs in one global block pool.
-    return sum(
-        max(
+    # Diverted private-circle groups own ring allocations, not global IDs.
+    divert = _resolve_divert(_group_specs(groups), divert_swa)
+    total = 0
+    for g in groups:
+        if divert and all(isinstance(s, DeepseekV41SWASpec) for s in g.kv_cache_spec.kv_cache_specs.values()):
+            continue
+        total += max(
             (s.max_memory_usage_bytes(vllm_config) + s.page_size_bytes - 1) // s.page_size_bytes
             for s in g.kv_cache_spec.kv_cache_specs.values()
         )
-        for g in groups
-    )
+    return total
 
 
-def allocate_cache_config(vllm_config, groups, available_memory):
+def allocate_cache_config(vllm_config, groups, available_memory, *, divert_swa: bool | None = None, reserved_private_bytes: int = 0):
     """Allocate four independent layer slots backed by one global block-ID pool."""
-    slots = cache_slots_from_groups(groups)
-    capacity = available_memory // sum(slot.page_size_bytes for slot in slots)
+    divert = _resolve_divert(_group_specs(groups), divert_swa)
+    slots = cache_slots_from_groups(groups, divert_swa=divert)
+    budget = available_memory - reserved_private_bytes
+    capacity = budget // sum(slot.page_size_bytes for slot in slots)
     num_blocks = may_override_num_blocks(vllm_config, capacity)
     if num_blocks <= 1 or num_blocks > capacity:
         raise ValueError("Insufficient V4.1 cache memory (including reserved null block), or unsafe block override")

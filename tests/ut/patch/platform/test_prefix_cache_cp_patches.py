@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend.core.deepseek_v41 import DeepseekV41SWASpec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
@@ -32,12 +33,15 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _PRIVATE_CIRCLE_TENSOR_ATTR,
+    _append_private_circle_tensors,
     _ascend_resolve_kv_cache_block_sizes,
     _get_kimi_k3_dspark_mixed_kv_cache_groups,
     _get_kv_cache_config_deepseek_v4,
     group_and_unify_kv_cache_specs,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.worker.v2.attn_utils import _validate_kv_cache_num_blocks
 
 
 def _make_hybrid_kv_cache_config(
@@ -663,6 +667,80 @@ def test_deepseek_v4_detection_handles_non_mapping_nested_specs() -> None:
     assert not _is_deepseek_v4_kv_cache_spec(unknown_spec)
 
 
+def test_get_num_blocks_to_allocate_matches_upstream_interface() -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    manager = MagicMock()
+    manager.get_num_blocks_to_allocate.return_value = 3
+    coordinator.single_type_managers = (manager,)
+    coordinator.private_circle_group_ids = set()
+    computed_blocks = ([MagicMock()],)
+
+    result = coordinator.get_num_blocks_to_allocate(
+        request_id="request-0",
+        num_tokens=12,
+        new_computed_blocks=computed_blocks,
+        num_encoder_tokens=0,
+        total_computed_tokens=8,
+        num_local_computed_tokens=6,
+        num_tokens_main_model=10,
+        apply_admission_cap=True,
+    )
+
+    assert result == 3
+    manager.get_num_blocks_to_allocate.assert_called_once_with(
+        "request-0",
+        12,
+        computed_blocks[0],
+        8,
+        6,
+        10,
+        apply_admission_cap=True,
+    )
+
+
+def test_remove_skipped_blocks_matches_upstream_interface() -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    manager = MagicMock()
+    coordinator.single_type_managers = (manager,)
+    coordinator.private_circle_group_ids = set()
+
+    coordinator.remove_skipped_blocks("request-0", 8)
+
+    manager.remove_skipped_blocks.assert_called_once_with("request-0", 8)
+
+
+def test_allocate_new_computed_blocks_uses_two_phase_upstream_interface() -> None:
+    """Shared groups use the single upstream API for local and external KV."""
+    coordinator = AscendHybridKVCacheCoordinator.__new__(
+        AscendHybridKVCacheCoordinator
+    )
+    shared_manager = MagicMock()
+    private_circle_manager = MagicMock()
+    coordinator.single_type_managers = (shared_manager, private_circle_manager)
+    coordinator.private_circle_group_ids = {1}
+    shared_blocks = [MagicMock()]
+    private_blocks = [MagicMock()]
+
+    coordinator.allocate_new_computed_blocks(
+        "request-0",
+        (shared_blocks, private_blocks),
+        num_local_computed_tokens=128,
+        num_external_computed_tokens=64,
+    )
+
+    shared_manager.add_local_computed_blocks.assert_called_once_with(
+        "request-0", shared_blocks, 128, 64
+    )
+    shared_manager.allocate_external_computed_blocks.assert_called_once_with(
+        "request-0", 128, 64
+    )
+    private_circle_manager.add_local_computed_blocks.assert_not_called()
+    private_circle_manager.allocate_external_computed_blocks.assert_not_called()
+
 def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> None:
     mamba_spec = MambaSpec(
         block_size=16,
@@ -690,6 +768,83 @@ def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> N
     manager = AscendMambaManager(**manager_kwargs)
 
     assert manager.block_size == mamba_spec.block_size
+
+
+def test_private_circle_tensors_are_appended_after_shared_rank_alignment() -> None:
+    shared_spec = MLAAttentionSpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    private_spec = DeepseekV41SWASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    shared_group = UniformTypeKVCacheSpecs.from_specs({"shared": shared_spec})
+    private_group = UniformTypeKVCacheSpecs.from_specs({"private": private_spec})
+    assert shared_group is not None
+    assert private_group is not None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(size=shared_spec.page_size_bytes * 8, shared_by=["shared"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["shared"], kv_cache_spec=shared_group),
+            KVCacheGroupSpec(layer_names=["private"], kv_cache_spec=private_group),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        speculative_config=None,
+    )
+
+    _append_private_circle_tensors(vllm_config, kv_cache_config)
+
+    private_tensor = next(
+        tensor for tensor in kv_cache_config.kv_cache_tensors
+        if tensor.shared_by == ["private"]
+    )
+    # W=128, B=32, no speculation: 2 × max_num_seqs allocations × 4 blocks + null block.
+    assert private_tensor.size == private_spec.page_size_bytes * 17
+    assert getattr(private_tensor, _PRIVATE_CIRCLE_TENSOR_ATTR) is True
+    # The shared count is unchanged and a repeated post-alignment call is idempotent.
+    assert kv_cache_config.num_blocks == 8
+    _append_private_circle_tensors(vllm_config, kv_cache_config)
+    assert len([t for t in kv_cache_config.kv_cache_tensors if t.shared_by == ["private"]]) == 1
+
+
+def test_private_circle_worker_accepts_fixed_ring_capacity(monkeypatch) -> None:
+    private_spec = DeepseekV41SWASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.attn_utils.envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL",
+        True,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        speculative_config=None,
+    )
+    kv_cache_config = SimpleNamespace(num_blocks=8)
+
+    _validate_kv_cache_num_blocks(17, kv_cache_config, private_spec, vllm_config)
+    with pytest.raises(AssertionError, match="fixed ring layout"):
+        _validate_kv_cache_num_blocks(8, kv_cache_config, private_spec, vllm_config)
 
 
 def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
@@ -736,3 +891,218 @@ def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
         f"expected {expected} cached blocks ({4}/{128} per segment), got {true_blocks}/{total_blocks}"
     )
     assert true_blocks > 0 and true_blocks < total_blocks, f"mask should be sparse, got {true_blocks}/{total_blocks}"
+
+
+def _make_deferred_free_scheduler(
+    private_pool,
+    *,
+    defer_block_free: bool = True,
+    processed_step_seq: int = 0,
+):
+    scheduler = SimpleNamespace(
+        defer_block_free=defer_block_free,
+        processed_step_seq=processed_step_seq,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(private_circle_pool=private_pool)
+        ),
+    )
+    calls = []
+    scheduler._orig_calls = calls
+    return scheduler
+
+
+def _install_noop_originals(monkeypatch):
+    """Stub the wrapped upstream methods the deferred-free hooks call into."""
+    import vllm_ascend.patch.platform.patch_private_circle_pool as lifetime
+
+    free_calls = []
+
+    def _noop_free_request_blocks(self, request):
+        free_calls.append(request.request_id)
+
+    def _noop_update_from_output(self, scheduler_output, model_runner_output):
+        return None
+
+    monkeypatch.setattr(
+        lifetime, "_original_free_request_blocks", _noop_free_request_blocks
+    )
+    monkeypatch.setattr(
+        lifetime, "_original_update_from_output", _noop_update_from_output
+    )
+    return lifetime, free_calls
+
+
+def test_deferred_free_path_defers_private_allocation_return(monkeypatch):
+    """abort/preempt on the deferred path must not leak the allocation.
+
+    Ownership detaches immediately (a resumed request reserves a different
+    slot), and the slot only re-enters the free list once the owning step's
+    fence is processed.
+    """
+    from vllm_ascend.core.private_circle_pool import (
+        PrivateCirclePool,
+        PrivateCircleConfig,
+    )
+
+    lifetime, free_calls = _install_noop_originals(monkeypatch)
+    config = PrivateCircleConfig(
+        block_size=32, window_size=128, in_flight_tokens=5, max_num_seqs=4
+    )
+    pool = PrivateCirclePool(config)
+    total = config.num_allocations
+    allocation = pool.reserve("request-d1")
+    assert allocation is not None
+
+    request = SimpleNamespace(
+        request_id="request-d1",
+        last_sched_seq=5,
+        private_circle_allocation=allocation,
+        private_circle_transfer_state=lifetime.PRIVATE_CIRCLE_TRANSFER_RECEIVING,
+        private_circle_imported_window_start=1,
+        private_circle_imported_valid_length=9,
+    )
+    scheduler = _make_deferred_free_scheduler(pool, processed_step_seq=3)
+
+    lifetime._patched_free_request_blocks(scheduler, request)
+    # Original upstream path still ran exactly once.
+    assert free_calls == ["request-d1"]
+    # Bookkeeping dropped, slot not yet recycled, request fields cleaned.
+    assert not pool.contains("request-d1")
+    assert request.private_circle_allocation is None
+    assert request.private_circle_transfer_state == lifetime.PRIVATE_CIRCLE_TRANSFER_NONE
+    assert pool.free_allocations == total - 1
+
+    # A resumed/preempted request cannot observe the detached slot.
+    assert pool.reserve("request-d1") != allocation
+
+    # Fence not yet processed: drain keeps the entry pending.
+    lifetime._patched_update_from_output(scheduler, SimpleNamespace(), SimpleNamespace())
+    assert pool.free_allocations == total - 2  # resumed request still holds one
+
+    # Fence processed: the detached slot returns to the free list once.
+    scheduler.processed_step_seq = 5
+    lifetime._patched_update_from_output(scheduler, SimpleNamespace(), SimpleNamespace())
+    assert pool.free_allocations == total - 1
+    assert scheduler._private_circle_deferred_releases == []
+
+
+def test_deferred_free_disabled_path_defers_nothing(monkeypatch):
+    """Non-deferred finishes keep going through the KVCacheManager.free hook."""
+    from vllm_ascend.core.private_circle_pool import (
+        PrivateCirclePool,
+        PrivateCircleConfig,
+    )
+
+    lifetime, free_calls = _install_noop_originals(monkeypatch)
+    config = PrivateCircleConfig(
+        block_size=32, window_size=128, in_flight_tokens=5, max_num_seqs=4
+    )
+    pool = PrivateCirclePool(config)
+    total = config.num_allocations
+    pool.reserve("request-normal")
+
+    # last step already processed -> upstream takes the immediate-free branch.
+    scheduler = _make_deferred_free_scheduler(pool, processed_step_seq=7)
+    request = SimpleNamespace(
+        request_id="request-normal",
+        last_sched_seq=7,
+        private_circle_allocation=0,
+        private_circle_transfer_state=lifetime.PRIVATE_CIRCLE_TRANSFER_NONE,
+        private_circle_imported_window_start=None,
+        private_circle_imported_valid_length=None,
+    )
+    lifetime._patched_free_request_blocks(scheduler, request)
+    assert free_calls == ["request-normal"]
+    # The patch hook did not detach; the release happens inside
+    # KVCacheManager.free (asserted by ownership still present here).
+    assert pool.contains("request-normal")
+    assert not hasattr(scheduler, "_private_circle_deferred_releases")
+    pool.release("request-normal")
+    assert pool.free_allocations == total
+
+
+def _make_private_pool_scheduler_env(monkeypatch, *, enable_dsa_cp: bool):
+    """Wire a scheduler whose original __init__ already saw private groups."""
+    import vllm_ascend.patch.platform.patch_private_circle_pool as lifetime
+    from vllm_ascend.core.deepseek_v41 import DeepseekV41SWASpec
+
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "1")
+
+    def _noop_original_init(scheduler, vllm_config, *args, **kwargs):
+        private_spec = DeepseekV41SWASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        )
+        scheduler.kv_cache_manager = SimpleNamespace(
+            coordinator=SimpleNamespace(
+                private_circle_group_ids=frozenset({1}),
+                single_type_managers={
+                    1: SimpleNamespace(kv_cache_spec=private_spec)
+                },
+            )
+        )
+
+    monkeypatch.setattr(
+        lifetime, "_original_scheduler_init", _noop_original_init
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.utils.enable_dsa_cp", lambda: enable_dsa_cp
+    )
+    scheduler = SimpleNamespace()
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=None,
+    )
+    return lifetime, scheduler, vllm_config
+
+
+def test_private_pool_rejects_dsa_cp_at_startup(monkeypatch):
+    """pool + DSA-CP must fail fast, not silently mis-write the ring."""
+    lifetime, scheduler, vllm_config = _make_private_pool_scheduler_env(
+        monkeypatch, enable_dsa_cp=True
+    )
+    with pytest.raises(RuntimeError, match="context parallelism"):
+        lifetime._patched_scheduler_init(scheduler, vllm_config)
+
+
+@pytest.mark.parametrize(
+    "parallel_kwargs",
+    [
+        {"prefill_context_parallel_size": 2},
+        {"decode_context_parallel_size": 2},
+    ],
+)
+def test_private_pool_rejects_pcp_and_dcp_at_startup(
+    monkeypatch, parallel_kwargs
+):
+    """PCP / DCP route away from AscendDSAImpl the same way; fail fast too."""
+    lifetime, scheduler, vllm_config = _make_private_pool_scheduler_env(
+        monkeypatch, enable_dsa_cp=False
+    )
+    for key, value in parallel_kwargs.items():
+        setattr(vllm_config.parallel_config, key, value)
+    with pytest.raises(RuntimeError, match="context parallelism"):
+        lifetime._patched_scheduler_init(scheduler, vllm_config)
+
+
+def test_private_pool_startup_succeeds_without_cp(monkeypatch):
+    lifetime, scheduler, vllm_config = _make_private_pool_scheduler_env(
+        monkeypatch, enable_dsa_cp=False
+    )
+    lifetime._patched_scheduler_init(scheduler, vllm_config)
+    coordinator = scheduler.kv_cache_manager.coordinator
+    assert coordinator.private_circle_pool is not None
+    assert coordinator.private_circle_config.window_size == 128
+    assert coordinator.private_circle_group_ids == frozenset({1})
+    # D nodes must never recompute after a private-circle load failure.
+    assert scheduler.recompute_kv_load_failures is False
+
+

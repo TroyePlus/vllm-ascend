@@ -6,10 +6,13 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpecKind,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_ascend import envs
+from vllm_ascend.core.private_circle_pool import is_private_circle_kv_cache_spec
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.ops.triton.compute_slot_mapping import (
     _compute_slot_mapping_kernel,
@@ -47,6 +50,16 @@ class BlockTable:
         self.device = device
         self.physical_block_size = block_size
         self.is_mamba_group = is_mamba_group
+        self.is_private_circle_group = False
+        if kv_cache_group is not None:
+            group_spec = kv_cache_group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                specs = group_spec.kv_cache_specs.values()
+            else:
+                specs = (group_spec,)
+            self.is_private_circle_group = envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and any(
+                is_private_circle_kv_cache_spec(spec) for spec in specs
+            )
 
         # If kernel_sizes is None or [0], use physical block size (no splitting)
         if kernel_sizes is None or kernel_sizes == [0]:
@@ -136,6 +149,34 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks_src
 
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+
+    def compute_private_circle_slot_mapping(
+        self,
+        positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        allocation_ids: torch.Tensor,
+        blocks_per_allocation: int,
+    ) -> None:
+        """Build absolute-position ring slots for request-private circle.
+
+        ``allocation_ids`` maps each request row to the private allocation
+        assigned by the coordinator.  This path intentionally does not use
+        the shared block table or prefix-cache block hashes.
+        """
+        if blocks_per_allocation <= 0:
+            raise ValueError("blocks_per_allocation must be positive")
+        if positions.numel() != request_indices.numel():
+            raise ValueError("positions and request_indices must have equal length")
+        if allocation_ids.numel() == 0 and positions.numel() != 0:
+            raise ValueError("allocation_ids cannot be empty for non-empty positions")
+        block_size = self.physical_block_size
+        req_allocations = allocation_ids.to(device=positions.device, dtype=torch.long)
+        req = request_indices.to(device=positions.device, dtype=torch.long)
+        pos = positions.to(dtype=torch.long)
+        alloc = req_allocations.index_select(0, req)
+        ring_block = torch.remainder(torch.div(pos, block_size, rounding_mode="floor"), blocks_per_allocation)
+        slots = (1 + alloc * blocks_per_allocation + ring_block) * block_size + torch.remainder(pos, block_size)
+        self.slot_mapping.gpu[: slots.numel()].copy_(slots.to(dtype=torch.int32))
 
     def compute_slot_mapping(
         self,
@@ -394,6 +435,88 @@ class MultiGroupBlockTable:
                 )
             ]
 
+        self.private_circle_allocation_ids = torch.full(
+            (max_num_reqs,), -1, dtype=torch.int64, device="cpu")
+        self.private_circle_blocks_per_allocation = 0
+
+    def set_private_circle_allocations(
+        self,
+        allocation_ids: np.ndarray,
+        blocks_per_allocation: int,
+        num_allocations: int,
+        private_num_blocks: int,
+        window_starts: np.ndarray | None = None,
+        valid_lengths: np.ndarray | None = None,
+    ) -> None:
+        """Install the absolute-logical private ring table (protocol A).
+        Column ``L`` represents absolute logical block ``L`` and contains the
+        request-local physical ring block ``L % P``. Repeated physical IDs are
+        intentional; A5 token/offset masks hide invalid positions.
+        """
+        if len(allocation_ids) > self.private_circle_allocation_ids.numel():
+            raise ValueError("too many private circle allocations")
+        if blocks_per_allocation <= 0 or num_allocations <= 0:
+            raise ValueError("private circle allocation dimensions must be positive")
+        expected_num_blocks = 1 + num_allocations * blocks_per_allocation
+        if private_num_blocks != expected_num_blocks:
+            raise ValueError(
+                "private circle block count does not match allocation layout: "
+                f"{private_num_blocks} != {expected_num_blocks}"
+            )
+        if np.any(allocation_ids >= num_allocations):
+            raise IndexError("private circle allocation handle is out of range")
+        self.private_circle_allocation_ids.fill_(-1)
+        if len(allocation_ids):
+            self.private_circle_allocation_ids[:len(allocation_ids)] = torch.as_tensor(
+                allocation_ids, dtype=torch.int64)
+        self.private_circle_blocks_per_allocation = blocks_per_allocation
+        num_rows = len(allocation_ids)
+        for table in self.block_tables:
+            if not table.is_private_circle_group:
+                continue
+            if num_rows == 0:
+                table.block_table.np[:] = 0
+                table.num_blocks_per_row[:] = 0
+                continue
+            block_size = table.physical_block_size
+            valid = (valid_lengths if valid_lengths is not None
+                     else np.zeros(num_rows, dtype=np.int64))
+            window_start = (window_starts if window_starts is not None
+                            else np.maximum(0, valid - blocks_per_allocation * block_size))
+            alloc = np.asarray(allocation_ids, dtype=np.int64)
+            valid = np.asarray(valid, dtype=np.int64)
+            window_start = np.asarray(window_start, dtype=np.int64)
+            last_page = np.where(valid > 0, (valid - 1) // block_size, 0)
+            logical_count = np.maximum(1, last_page + 1)
+            first_page = np.maximum(0, window_start // block_size)
+            num_cols = table.block_table.np.shape[1]
+            if int(logical_count.max()) > num_cols:
+                raise RuntimeError(
+                    "private circle logical table exceeds configured model "
+                    f"length: {int(logical_count.max())} > {num_cols}")
+            cols = np.arange(num_cols, dtype=np.int64)
+            in_range = (cols[None, :] >= first_page[:, None]) & (
+                cols[None, :] < logical_count[:, None])
+            base = 1 + alloc * blocks_per_allocation
+            ids = np.where(
+                cols[None, :] < first_page[:, None],
+                0,
+                base[:, None] + cols[None, :] % blocks_per_allocation,
+            )
+            ids = np.where(in_range, ids, 0)
+            if ids.max() >= private_num_blocks:
+                raise IndexError("private circle block id is out of range")
+            # Block 0 is reserved as the invalid/null block. Valid private
+            # circle blocks start at 1 and are local to the private tensor.
+            table.block_table.np[:] = 0
+            table.num_blocks_per_row[:] = 0
+            active = alloc >= 0
+            if active.any():
+                table.block_table.np[:num_rows] = np.where(
+                    active[:, None], ids, 0)
+                table.num_blocks_per_row[:num_rows] = np.where(
+                    active, logical_count, 0)
+
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
@@ -414,6 +537,29 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.swap_row(src, tgt)
 
+    def mask_shared_slots_for_private_circle_bounded_replay(
+        self,
+        positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        persistent_starts: torch.Tensor,
+    ) -> None:
+        """Prevent [R, H) from updating any shared KV-cache group."""
+        if positions.numel() != request_indices.numel():
+            raise ValueError(
+                "positions and request_indices must have equal length"
+            )
+        req = request_indices.to(device=positions.device, dtype=torch.long)
+        starts = persistent_starts.to(
+            device=positions.device, dtype=torch.long
+        ).index_select(0, req)
+        bounded_replay_mask = (starts >= 0) & (positions.to(torch.long) < starts)
+        for block_table in self.block_tables:
+            if block_table.is_private_circle_group or block_table.is_mamba_group:
+                continue
+            block_table.slot_mapping.gpu[: positions.numel()].masked_fill_(
+                bounded_replay_mask, -1
+            )
+
     def compute_slot_mapping(
         self,
         num_reqs: int,
@@ -424,6 +570,22 @@ class MultiGroupBlockTable:
     ) -> None:
         for i, block_table in enumerate(self.block_tables):
             if block_table.is_mamba_group:
+                continue
+            if block_table.is_private_circle_group:
+                if self.private_circle_blocks_per_allocation <= 0:
+                    raise RuntimeError("private circle allocation metadata is missing")
+                req_indices = torch.repeat_interleave(
+                    torch.arange(num_reqs, dtype=torch.int64,
+                                 device=positions.device),
+                    query_start_loc[1:] - query_start_loc[:-1],
+                    output_size=positions.numel(),
+                )
+                block_table.compute_private_circle_slot_mapping(
+                    positions,
+                    req_indices,
+                    self.private_circle_allocation_ids[:num_reqs],
+                    self.private_circle_blocks_per_allocation,
+                )
                 continue
             if positions_compressed_list and req_indices_compressed_list:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
@@ -439,6 +601,17 @@ class MultiGroupBlockTable:
     ) -> None:
         for i, block_table in enumerate(self.block_tables):
             if block_table.is_mamba_group:
+                continue
+            if block_table.is_private_circle_group:
+                if self.private_circle_blocks_per_allocation <= 0:
+                    raise RuntimeError("private circle allocation metadata is missing")
+                req_tensor = (req_indices if isinstance(req_indices, torch.Tensor)
+                              else torch.from_numpy(req_indices))
+                pos_tensor = (positions if isinstance(positions, torch.Tensor)
+                              else torch.from_numpy(positions))
+                block_table.compute_private_circle_slot_mapping(
+                    pos_tensor, req_tensor, self.private_circle_allocation_ids,
+                    self.private_circle_blocks_per_allocation)
                 continue
             if positions_compressed_list and req_indices_compressed_list:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])

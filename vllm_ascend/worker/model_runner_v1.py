@@ -112,6 +112,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -142,6 +143,10 @@ from vllm_ascend.core.deepseek_v41 import (
     is_v41_spec,
     plan_cache_slots,
     reshape_cache,
+)
+from vllm_ascend.core.private_circle_pool import (
+    PrivateCircleConfig,
+    is_private_circle_kv_cache_spec,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -309,6 +314,38 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        hf_model_type = getattr(
+            getattr(vllm_config.model_config, "hf_config", None), "model_type", None
+        )
+        hf_text_model_type = getattr(
+            getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None
+        )
+        is_deepseek_v41 = (
+            hf_model_type == "deepseek_v4.1"
+            or hf_text_model_type == "deepseek_v4.1_text"
+        )
+        # The pool diverts V4.1 SWA layers only; DSV4 and other models must
+        # not pay buffer inflation or eager-prefill side effects.
+        self._private_circle_active = (
+            envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and is_deepseek_v41
+        )
+        hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        private_circle_window_size = int(
+            getattr(hf_text_config, "sliding_window", 0) or 0
+        )
+        max_private_circle_bounded_replay_tokens = (
+            private_circle_window_size
+            * vllm_config.scheduler_config.max_num_seqs
+            if self._private_circle_active
+            else 0
+        )
+        # Inflate the token budget around super().__init__() so every
+        # parent-allocated execution buffer covers bounded replay warm-up rows;
+        # scheduler-visible accounting stays at the original budget.
+        vllm_config.scheduler_config.max_num_batched_tokens += (
+            max_private_circle_bounded_replay_tokens
+        )
+
         # Must be set before super().__init__() because parent init may call
         # _allocate_kv_cache_tensors which accesses self.use_compress.
         model_config = getattr(vllm_config, "model_config", None)
@@ -319,6 +356,16 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        vllm_config.scheduler_config.max_num_batched_tokens -= (
+            max_private_circle_bounded_replay_tokens
+        )
+        self._private_circle_bounded_replay_capacity_tokens = (
+            max_private_circle_bounded_replay_tokens
+        )
+        self._private_circle_window_size = private_circle_window_size
+        self._private_circle_prefill_workspace = False
+        self._private_circle_has_bounded_replay = False
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
@@ -429,7 +476,12 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             self.dcp_size = 1
             self.dcp_rank = 0
-        max_buffer_num_tokens = self.max_num_tokens
+        max_buffer_num_tokens = (
+            self.max_num_tokens + self._private_circle_bounded_replay_capacity_tokens
+        )
+        # Execution-buffer capacity incl. bounded replay padding; scheduler
+        # accounting stays at max_num_tokens.
+        self._max_input_batch_tokens = max_buffer_num_tokens
         if self.dcp_size > 1:
             self.dcp_manager = DCPManager(
                 self.dcp_size,
@@ -535,7 +587,7 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self.max_num_tokens,
+            max_num_batched_tokens=self._max_input_batch_tokens,
             device=self.device,
             pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
@@ -864,9 +916,64 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
-        sampling_metadata = super()._update_states(scheduler_output)
+        callback = super()._update_states(scheduler_output)
         self._track_tmp_encoder_cache_refs(scheduler_output)
-        return sampling_metadata
+
+        private_metadata = getattr(scheduler_output, "private_circle_metadata", None)
+        if not self._private_circle_active:
+            private_metadata = None
+        if private_metadata is not None:
+            if not hasattr(self, "_private_circle_metadata_by_req"):
+                self._private_circle_metadata_by_req: dict[str, dict[str, Any]] = {}
+            self._private_circle_metadata_by_req.update(private_metadata)
+            for req_id in getattr(scheduler_output, "finished_req_ids", ()):
+                self._private_circle_metadata_by_req.pop(req_id, None)
+
+            num_reqs = self.input_batch.num_reqs
+            allocations = np.full(num_reqs, -1, dtype=np.int64)
+            window_starts = np.zeros(num_reqs, dtype=np.int64)
+            valid_lengths = np.zeros(num_reqs, dtype=np.int64)
+            blocks_per_allocation = 0
+            num_allocations = 0
+            private_num_blocks = 0
+            for row, req_id in enumerate(self.input_batch.req_ids):
+                metadata = self._private_circle_metadata_by_req.get(req_id)
+                if metadata is None:
+                    continue
+                allocations[row] = metadata["allocation_handle"]
+                window_starts[row] = metadata["window_start"]
+                valid_lengths[row] = metadata["valid_length"]
+                current_blocks = metadata["blocks_per_allocation"]
+                if blocks_per_allocation not in (0, current_blocks):
+                    raise RuntimeError("mixed private circle layouts in one batch")
+                blocks_per_allocation = current_blocks
+                current_allocations = metadata["num_allocations"]
+                current_num_blocks = metadata["private_num_blocks"]
+                if num_allocations not in (0, current_allocations):
+                    raise RuntimeError("mixed private circle pool sizes in one batch")
+                if private_num_blocks not in (0, current_num_blocks):
+                    raise RuntimeError("mixed private circle block counts in one batch")
+                num_allocations = current_allocations
+                private_num_blocks = current_num_blocks
+                self._private_circle_blocks_per_allocation = blocks_per_allocation
+            if blocks_per_allocation:
+                if np.any(allocations < 0):
+                    missing = [
+                        self.input_batch.req_ids[i]
+                        for i in np.flatnonzero(allocations < 0)
+                    ]
+                    raise RuntimeError(
+                        f"missing private circle allocation metadata for {missing}"
+                    )
+                self.input_batch.block_table.set_private_circle_allocations(
+                    allocations,
+                    blocks_per_allocation,
+                    num_allocations,
+                    private_num_blocks,
+                    window_starts,
+                    valid_lengths,
+                )
+        return callback
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -1165,6 +1272,67 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        # Execution view expands to [R, P) for the one-shot bounded replay warm-up.
+        compute_starts = self.input_batch.num_computed_tokens_cpu[:num_reqs].copy()
+        bounded_replay_lengths = np.zeros(num_reqs, dtype=np.int32)
+        persistent_starts = np.full(num_reqs, -1, dtype=np.int64)
+        metadata_by_req = getattr(self, "_private_circle_metadata_by_req", {})
+        if self._private_circle_active:
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                item = metadata_by_req.get(req_id)
+                if item is None:
+                    continue
+                shared_cache_length = int(
+                    item.get("shared_cache_length", compute_starts[row])
+                )
+                circle_compute_start = int(
+                    item.get("circle_compute_start", shared_cache_length)
+                )
+                if shared_cache_length != int(compute_starts[row]):
+                    raise RuntimeError(
+                        "private circle shared-cache length is inconsistent with "
+                        f"runner state for {req_id}: {shared_cache_length} != "
+                        f"{int(compute_starts[row])}"
+                    )
+                if not 0 <= circle_compute_start <= shared_cache_length:
+                    raise ValueError(
+                        f"invalid private circle compute interval for {req_id}: "
+                        f"[{circle_compute_start}, {shared_cache_length})"
+                    )
+                bounded_replay_length = shared_cache_length - circle_compute_start
+                metadata_window_size = int(
+                    item.get("window_size", self._private_circle_window_size)
+                )
+                if bounded_replay_length > metadata_window_size:
+                    raise ValueError(
+                        f"private circle bounded replay for {req_id} exceeds configured "
+                        f"window: {bounded_replay_length} > {metadata_window_size}"
+                    )
+                if bounded_replay_length == 0:
+                    continue
+                bounded_replay_lengths[row] = bounded_replay_length
+                persistent_starts[row] = shared_cache_length
+                compute_starts[row] = circle_compute_start
+
+        num_scheduled_tokens += bounded_replay_lengths
+        total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
+        if total_num_scheduled_tokens > self.input_ids.cpu.shape[0]:
+            raise RuntimeError(
+                "private circle bounded replay exceeds runner token-buffer capacity: "
+                f"{total_num_scheduled_tokens} > {self.input_ids.cpu.shape[0]}"
+            )
+        has_private_circle_bounded_replay = bool(np.any(bounded_replay_lengths))
+        self._private_circle_compute_starts_np = compute_starts
+        self._private_circle_has_bounded_replay = has_private_circle_bounded_replay
+        compute_starts_cpu = getattr(self, "_private_circle_compute_starts_cpu", None)
+        if compute_starts_cpu is None:
+            compute_starts_cpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device="cpu"
+            )
+            self._private_circle_compute_starts_cpu = compute_starts_cpu
+        compute_starts_cpu[:num_reqs].copy_(torch.from_numpy(compute_starts))
+        compute_starts_cpu[num_reqs:].fill_(0)
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
@@ -1179,7 +1347,8 @@ class NPUModelRunner(GPUModelRunner):
                 [
                     scheduler_output.num_scheduled_tokens[i]
                     - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
-                    for i in self.input_batch.req_ids
+                    + bounded_replay_lengths[row]
+                    for row, i in enumerate(self.input_batch.req_ids)
                 ],
                 dtype=np.int32,
             )
@@ -1188,6 +1357,11 @@ class NPUModelRunner(GPUModelRunner):
         # Determine if it's a splitfuse batch
         with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]
         self.with_prefill = with_prefill
+        # The prefill workspace runs data-dependent host logic; capture would
+        # bake stale indices.
+        self._private_circle_prefill_workspace = (
+            self._private_circle_active and with_prefill
+        )
 
         # Get positions.
         cu_num_tokens = self._get_cumsum_and_arange(
@@ -1195,7 +1369,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
         np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
+            compute_starts[req_indices],
             self.query_pos.np[: cu_num_tokens[-1]],
             out=positions_np,
         )
@@ -1204,7 +1378,7 @@ class NPUModelRunner(GPUModelRunner):
             self.dcp_manager.init_batch_info(
                 num_scheduled_tokens,
                 self.input_batch.num_reqs,
-                self.input_batch.num_computed_tokens_cpu,
+                compute_starts,
                 self.input_batch.num_prompt_tokens,
             )
 
@@ -1279,7 +1453,7 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 req_embeds = self.input_batch.req_prompt_embeds[req_idx]
-                start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+                start_pos = compute_starts[req_idx]
 
                 # Skip if trying to read beyond available embeddings
                 if start_pos >= req_embeds.shape[0]:
@@ -1318,7 +1492,7 @@ class NPUModelRunner(GPUModelRunner):
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
         # seq_lens (GPU) will be computed later using the same optimistic values.
         torch.add(
-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            torch.from_numpy(compute_starts),
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
@@ -1379,7 +1553,7 @@ class NPUModelRunner(GPUModelRunner):
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
         if self.use_async_spec_decode:
-            computed_token_tensor_cpu = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+            computed_token_tensor_cpu = torch.from_numpy(compute_starts).to(
                 device=self.device, non_blocking=True
             )
         if (
@@ -1400,7 +1574,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                torch.from_numpy(compute_starts),
                 non_blocking=True,
             )
 
@@ -1495,6 +1669,12 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        if has_private_circle_bounded_replay:
+            self.input_batch.block_table.mask_shared_slots_for_private_circle_bounded_replay(
+                self.positions[:total_num_scheduled_tokens],
+                req_indices_gpu,
+                torch.from_numpy(persistent_starts).to(self.device),
+            )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -2119,11 +2299,18 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_tokens_copy = (
                 scheduler_output.scheduled_spec_decode_tokens.copy()
             )
+            # replace() drops dynamic attributes: re-attach the scheduler
+            # patch's metadata or ring slots compute with stale handles.
+            private_circle_metadata_copy = getattr(
+                scheduler_output, "private_circle_metadata", None
+            )
             scheduler_output = replace(
                 scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens_copy,
                 scheduled_spec_decode_tokens=spec_decode_tokens_copy,
             )
+            if private_circle_metadata_copy is not None:
+                scheduler_output.private_circle_metadata = private_circle_metadata_copy
 
         # NOTE: The async-scheduling deepcopy was removed in
         # vllm-project/vllm#29821. Draft token ids are now propagated via
@@ -2215,7 +2402,6 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2224,11 +2410,19 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                # _prepare_inputs expands scheduled tokens in place with the
+                # one-shot bounded replay warm-up, so the max must be read after it.
+                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                num_tokens_unpadded = total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
-                if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
+                if (
+                    self.cascade_attn_enabled
+                    and not self.parallel_config.enable_dbo
+                    and not self._private_circle_has_bounded_replay
+                    and not self._private_circle_prefill_workspace
+                ):
                     # Pre-compute cascade attention prefix lengths
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
@@ -2248,7 +2442,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or self._private_circle_has_bounded_replay
+                        or self._private_circle_prefill_workspace
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -2438,7 +2636,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_across_dp=num_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                # Execution token count incl. the bounded replay warm-up expansion:
+                # MC2/moe masks must cover the executed rows, not the
+                # scheduler's logical count.
+                num_actual_tokens=total_num_scheduled_tokens,
                 model_instance=self.model,
                 device_metadata_executor=active_device_metadata_executor,
                 skip_compiled=has_encoder_input or v41_eager_fallback,
@@ -3292,9 +3493,11 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_dcp_metadata(block_table_gid_0)
-        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
+        num_computed_tokens_cpu = getattr(
+            self,
+            "_private_circle_compute_starts_cpu",
+            self.input_batch.num_computed_tokens_cpu_tensor,
+        )[:num_reqs_padded]
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3390,6 +3593,31 @@ class NPUModelRunner(GPUModelRunner):
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
+
+        if self._private_circle_active:
+            bounded_replay_start = torch.zeros(num_reqs_padded, dtype=torch.int32, device=self.device)
+            persistent_start = torch.full((num_reqs_padded,), -1, dtype=torch.int32, device=self.device)
+            metadata_by_req = getattr(self, "_private_circle_metadata_by_req", {})
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                item = metadata_by_req.get(req_id)
+                if item is not None:
+                    bounded_replay_start[row] = int(item.get("effective_compute_start", 0))
+                    original_hit = item.get("original_prefix_hit_length")
+                    # -1 = no prefix hit; ordinary requests keep the
+                    # normal start_pos.
+                    persistent_start[row] = (
+                        int(original_hit) if original_hit is not None and int(original_hit) > 0 else -1
+                    )
+            cm_base.private_circle_bounded_replay_start = bounded_replay_start
+            cm_base.private_circle_persistent_start = persistent_start
+            # Host mirror of the tensors above; skips async device tasks on
+            # bounded replay steps and all GPU read-backs otherwise.
+            cm_base.private_circle_has_bounded_replay = self._private_circle_has_bounded_replay
+            # Pool-side ring geometry: the impl cross-checks its own
+            # derivation against this value (a mismatch would silently
+            # corrupt the ring).
+            cm_base.private_circle_blocks_per_allocation = getattr(
+                self, "_private_circle_blocks_per_allocation", None)
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -4436,6 +4664,19 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
+    def _private_circle_config_for(self, spec) -> PrivateCircleConfig:
+        draft_tokens = (
+            getattr(self.vllm_config.speculative_config, "num_speculative_tokens", 0)
+            if self.vllm_config.speculative_config is not None
+            else 0
+        )
+        return PrivateCircleConfig(
+            block_size=spec.block_size,
+            window_size=spec.sliding_window,
+            in_flight_tokens=1 + draft_tokens,
+            max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+        )
+
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
@@ -4460,10 +4701,38 @@ class NPUModelRunner(GPUModelRunner):
         if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
             if not all(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
                 raise ValueError("Mixed V4.1 cache allocation is not supported")
-            slots = plan_cache_slots(layer_kv_cache_spec)
-            if len(kv_cache_config.kv_cache_tensors) != len(slots):
+            private_circle_layers = {
+                name: spec
+                for name, spec in layer_kv_cache_spec.items()
+                if is_private_circle_kv_cache_spec(spec)
+            }
+            ring_tensors = [
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if len(tensor.shared_by) == 1
+                and tensor.shared_by[0] in private_circle_layers
+            ]
+            # Match the layout the engine planner actually produced: divert
+            # only when dedicated ring tensors are present in the config, so
+            # a stale or missing env flag cannot desynchronize the worker
+            # from the config it is given.
+            self._private_circle_ring_layers = frozenset(
+                tensor.shared_by[0] for tensor in ring_tensors
+            )
+            slots = plan_cache_slots(
+                layer_kv_cache_spec, divert_swa=bool(ring_tensors)
+            )
+            shared_tensors = [
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if not (
+                    len(tensor.shared_by) == 1
+                    and tensor.shared_by[0] in private_circle_layers
+                )
+            ]
+            if len(shared_tensors) != len(slots):
                 raise ValueError("V4.1 requires one allocation per layer slot")
-            for allocation, slot in zip(kv_cache_config.kv_cache_tensors, slots):
+            for allocation, slot in zip(shared_tensors, slots):
                 if (
                     allocation.offset
                     or allocation.block_stride != slot.page_size_bytes
@@ -4486,6 +4755,26 @@ class NPUModelRunner(GPUModelRunner):
                     backing = self._align_memory(raw_backing, alignment)[: allocation.size]
                 for name in allocation.shared_by:
                     kv_cache_raw_tensors[name] = backing
+            for allocation in ring_tensors:
+                layer_name = allocation.shared_by[0]
+                layer_spec = private_circle_layers[layer_name]
+                private_config = self._private_circle_config_for(layer_spec)
+                expected_size = (
+                    layer_spec.unpadded_page_size_bytes * private_config.num_blocks
+                )
+                if (
+                    allocation.offset
+                    or allocation.block_stride
+                    or allocation.size != expected_size
+                ):
+                    raise ValueError(
+                        "V4.1 private circle ring allocation disagrees with its layout"
+                    )
+                kv_cache_raw_tensors[layer_name] = torch.zeros(
+                    allocation.size,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
             expected = set(layer_kv_cache_spec)
             if set(kv_cache_raw_tensors) != expected:
                 raise ValueError("V4.1 cache descriptors do not cover every resource")
@@ -4730,10 +5019,13 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         layer_placements = {}
+        ring_layers = getattr(self, "_private_circle_ring_layers", frozenset())
         if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
             layer_placements = {
                 p.name: (p.offset, slot.page_size_bytes)
-                for slot in plan_cache_slots(layer_kv_cache_spec)
+                for slot in plan_cache_slots(
+                    layer_kv_cache_spec, divert_swa=bool(ring_layers)
+                )
                 for p in slot.placements
             }
 
@@ -4745,6 +5037,20 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if (
+                    is_private_circle_kv_cache_spec(current_kv_cache_spec)
+                    and layer_name in ring_layers
+                ):
+                    private_config = self._private_circle_config_for(current_kv_cache_spec)
+                    kv_caches[layer_name] = reshape_cache(
+                        kv_cache_raw_tensors[layer_name],
+                        current_kv_cache_spec,
+                        num_blocks=private_config.num_blocks,
+                        offset=0,
+                        block_stride=current_kv_cache_spec.unpadded_page_size_bytes,
+                    )
+                    continue
 
                 if is_v41_spec(current_kv_cache_spec):
                     offset, block_stride = layer_placements[layer_name]
@@ -5196,7 +5502,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
+                max_num_batched_tokens=self._max_input_batch_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
