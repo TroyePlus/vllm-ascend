@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+import custom
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
@@ -280,6 +281,21 @@ def scatter_cache_v2(
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
 
 
+def kv_compress_epilog_v2(
+        x: torch.Tensor,
+        cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        quant_mode: str
+) -> None:
+    """Store rows using builder-prepared coordinates and V4's Ascend op.
+
+    V4.1 cache planes can be views into a larger layer-outermost slot, so the
+    physical page stride is not necessarily the contiguous stride implied by
+    the plane shape. ``npu_scatter_nd_update_v2`` preserves that stride and
+    treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
+    """
+    torch.ops.custom.kv_compress_epilog_v2(x, cache, slot_mapping, quant_group_size=32, quant_mode=quant_mode)
+
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
     if indices.ndim != 2:
@@ -359,12 +375,12 @@ class DeepseekV41EagerAttentionImpl:
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
-        # TODO kezong
-        # scatter_cache_v2(
-        #     attn.dsa_attn.swa_cache_layer.kv_cache[0],
-        #     swa_metadata.slot_mapping,
-        #     kv,
-        # )
+        kv_compress_epilog_v2(
+            kv,
+            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            swa_metadata.slot_mapping,
+            quant_mode="mxfp8_bf16"
+        )
         return q, qr
 
     def multistream_preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
@@ -419,12 +435,12 @@ class DeepseekV41EagerAttentionImpl:
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
-            # TODO KEZONG
-            # scatter_cache_v2(
-            #     attn.dsa_attn.swa_cache_layer.kv_cache[0],
-            #     swa_metadata.slot_mapping,
-            #     kv.squeeze(1),
-            # )
+            kv_compress_epilog_v2(
+                kv.squeeze(1),
+                attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                swa_metadata.slot_mapping,
+                quant_mode="mxfp8_bf16"
+            )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_local_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
@@ -549,6 +565,57 @@ class DeepseekV41EagerAttentionImpl:
             compressed_indices=compressed_indices,
         )
 
+
+    def _get_window_topk_idxs(
+            self,
+            attn,
+            q: torch.Tensor,
+            swa_metadata: DeepseekV41Metadata,
+            num_reqs: int,
+            query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute sliding-window KV slot indices in TNK format.
+
+        Fully vectorised on-device implementation — no per-request Python
+        loop, no CPU-side tensor creation, no D2H/H2D copy.
+
+        Returns a ``[total_tokens, 1, window_size]`` int32 tensor
+        where rows are concatenated across requests (TNK layout).  ``-1`` marks
+        a slot that holds nothing or padding.  Returns an empty tensor when
+        ``start_pos`` is unavailable (e.g. drafting metadata).
+        """
+        window_size = attn.window_size
+        total_tokens = q.shape[0]
+        device = q.device
+        start_pos = swa_metadata.start_pos
+        if start_pos is None or total_tokens == 0:
+            return torch.empty(
+                (total_tokens, 1, window_size),
+                dtype=torch.int32,
+                device=device,
+            )
+        global_indices = torch.arange(total_tokens, device=device, dtype=torch.int32)
+        token_req_idx = torch.searchsorted(
+            query_start_loc[1:num_reqs + 1], global_indices, right=True
+        )
+        token_pos = global_indices - query_start_loc[token_req_idx].to(torch.int32)
+        token_sp = start_pos[token_req_idx].to(torch.int32)
+        cols = torch.arange(window_size, device=device, dtype=torch.int32)
+        lo = torch.clamp(token_pos - window_size + 1, min=0)
+        slots_sp0 = lo.unsqueeze(1) + cols.unsqueeze(0)
+        slots_sp0 = slots_sp0.masked_fill(
+            slots_sp0 > token_pos.unsqueeze(1), -1
+        )
+        valid_len = torch.clamp(token_sp + 1, max=window_size)
+        slots_nz = cols.unsqueeze(0).expand_as(slots_sp0)
+        slots_nz = slots_nz.masked_fill(
+            cols.unsqueeze(0) >= valid_len.unsqueeze(1), -1
+        )
+        win_indices = torch.where(
+            (token_sp == 0).unsqueeze(1), slots_sp0, slots_nz
+        )
+        return win_indices.unsqueeze(1).to(torch.int32)
+
     def _native_attention(
         self,
         attn,
@@ -598,32 +665,40 @@ class DeepseekV41EagerAttentionImpl:
         #     DeviceMetadataStage.ATTENTION,
         #     id(op_metadata),
         # )
-        # output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
-        #     q,
-        #     ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
-        #     cmp_kv=source_cache,
-        #     cmp_sparse_indices=cmp_indices,
-        #     ori_block_table=ori_block_table,
-        #     cmp_block_table=cmp_block_table,
-        #     cu_seqlens_q=query_start_loc,
-        #     seqused_ori_kv=seq_lens,
-        #     seqused_cmp_kv=cmp_seq_lens,
-        #     cmp_residual_kv=cmp_residual,
-        #     sinks=attn.attn_sink,
-        #     metadata=op_metadata,
-        #     softmax_scale=attn.softmax_scale,
-        #     cmp_ratio=ratio,
-        #     ori_mask_mode=4,
-        #     cmp_mask_mode=3 if has_compressed else 0,
-        #     ori_win_left=attn.window_size - 1,
-        #     ori_win_right=0,
-        #     layout_q="TND",
-        #     layout_kv="PA_BBND",
-        #     topk_value_mode=1,
-        #     return_softmax_lse=False,
-        # )
+
+        win_indices = self._get_window_topk_idxs(
+            attn, q, metadata.swa, num_reqs, query_start_loc
+        )
+        win_topk_length = (win_indices != -1).sum(dim=-1).to(torch.int32)
+        cmp_topk_length = (
+            None
+            if cmp_indices is None
+            else (cmp_indices != -1).sum(dim=-1).to(torch.int32)
+        )
+        output, _ = torch.ops.custom.mixed_quant_sparse_flash_mla(
+            q,
+            ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            cmp_kv=source_cache,
+            win_sparse_indices=win_indices,
+            cmp_sparse_indices=cmp_indices,
+            win_block_table=ori_block_table,
+            cmp_block_table=cmp_block_table,
+            cu_seqlens_q=query_start_loc,
+            seqused_win_kv=seq_lens,
+            seqused_cmp_kv=cmp_seq_lens,
+            win_topk_lenth=win_topk_length,
+            cmp_topk_length=cmp_topk_length,
+            sinks=attn.attn_sink,
+            metadata=op_metadata,
+            quant_mode=1,
+            softmax_scale=attn.softmax_scale,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            return_softmax_lse=False
+        )
         output = torch.zeros_like(q)
         return output
+
 
     @staticmethod
     def update_graph_params(*args, **kwargs):
