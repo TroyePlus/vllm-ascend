@@ -681,7 +681,11 @@ class DeepseekV41EagerAttentionImpl:
             if cmp_indices is None
             else (cmp_indices != -1).sum(dim=-1).to(torch.int32)
         )
-        op_metadata = cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla(
+
+        from cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla import (
+            mixed_quant_sparse_flash_mla_metadata,
+        )
+        op_metadata = mixed_quant_sparse_flash_mla_metadata(
             win_topk_length,
             cmp_topk_length,
             cu_seqlens_q=query_start_loc,
@@ -697,7 +701,7 @@ class DeepseekV41EagerAttentionImpl:
 
         output, _ = cann_ops_transformer.ops.ds41.mixed_quant_sparse_flash_mla(
             q,
-            ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            win_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
             cmp_kv=source_cache,
             win_sparse_indices=win_indices,
             cmp_sparse_indices=cmp_indices,
@@ -706,7 +710,7 @@ class DeepseekV41EagerAttentionImpl:
             cu_seqlens_q=query_start_loc,
             seqused_win_kv=seq_lens,
             seqused_cmp_kv=cmp_seq_lens,
-            win_topk_lenth=win_topk_length,
+            win_topk_length=win_topk_length,
             cmp_topk_length=cmp_topk_length,
             sinks=attn.attn_sink,
             metadata=op_metadata,
