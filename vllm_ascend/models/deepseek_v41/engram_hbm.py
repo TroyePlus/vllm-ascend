@@ -446,10 +446,18 @@ class NodeShardedEngram(nn.Module):
 
     @torch.inference_mode()
     def route_many(self, tables, ids_list):
-        if ids.device.type != "cpu" or ids.dtype != torch.int64:
-            raise ValueError("Engram routing expects CPU int64 IDs")
-        device = self.weight.device if self.weight.device.type == "npu" else torch.device("npu")
-        return torch.empty((*ids.shape, self.width), dtype=torch.bfloat16, device=device)
+        """Return shape-compatible empty outputs for distinct Engram tables."""
+        if not ids_list:
+            return []
+        if len(tables) != len(ids_list):
+            raise ValueError("tables and ids_list must have the same length")
+        outputs = []
+        for table, ids in zip(tables, ids_list):
+            if ids.device.type != "cpu" or ids.dtype != torch.int64:
+                raise ValueError("Engram routing expects CPU int64 IDs")
+            device = table.weight.device if table.weight.device.type == "npu" else torch.device("npu")
+            outputs.append(torch.empty((*ids.shape, table.width), dtype=torch.bfloat16, device=device))
+        return outputs
         # q = self.query_group
         # if ids.device.type != "cpu" or ids.dtype != torch.int64:
         #     raise ValueError("Engram routing expects CPU int64 IDs")
