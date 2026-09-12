@@ -716,7 +716,6 @@ class DeepseekV41EagerAttentionImpl:
             layout_kv="PA_BBND",
             return_softmax_lse=False
         )
-        output = torch.zeros_like(q)
         return output
 
 
