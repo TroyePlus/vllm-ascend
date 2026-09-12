@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
@@ -26,6 +27,8 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41SWASpec,
     validate_cache_runtime,
 )
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.models.deepseek_v4.model import (
     AscendDeepseekV4ForCausalLM,
     AscendDeepseekV4SWACache,
@@ -40,7 +43,6 @@ from .engram_hash import PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
-import torch.nn.functional as F
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor,  # [b, s, mix_hc] => [b, s, (2 + hc) * hc]
@@ -237,11 +239,14 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
+        use_a5_quantized_cache = get_ascend_device_type() == AscendDeviceType.A5
+        head_size = (spec.head_size + (spec.head_size // 32) * torch.bfloat16.itemsize if use_a5_quantized_cache
+                     else spec.head_size)
         return DeepseekV41SWASpec(
             block_size=spec.block_size,
             num_kv_heads=spec.num_kv_heads,
-            head_size=spec.head_size,
-            dtype=spec.dtype,
+            head_size=head_size,
+            dtype=torch.uint8 if use_a5_quantized_cache else spec.dtype,
             sliding_window=spec.sliding_window,
             cache_dtype_str=spec.cache_dtype_str,
             model_version="deepseek_v4",
@@ -324,16 +329,25 @@ class DeepseekV41Attention(DeepseekV4Attention):
         self.prefix = prefix
         width = _read(config, "head_dim")
         self.softmax_scale = width**-0.5
+        use_a5_quantized_cache = (
+            get_ascend_device_type() == AscendDeviceType.A5
+        )
         if role.is_kv_source:
+            head_size = (
+                width + (width // 32) * torch.bfloat16.itemsize
+                if use_a5_quantized_cache
+                else width
+            )
+            cache_dtype = torch.uint8 if use_a5_quantized_cache else torch.bfloat16
             self.long_kv_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.long_kv_cache",
                 DeepseekV41FullSpec(
                     block_size=block_size,
                     num_kv_heads=1,
-                    head_size=width,
-                    dtype=torch.bfloat16,
-                    compress_ratio=role.compress_ratio,
+                    head_size=head_size,
+                    dtype=cache_dtype,
+                    compress_ratio=role.compress_ratio
                 ),
             )
         self.compressor = (
