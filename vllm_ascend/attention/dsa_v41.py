@@ -581,7 +581,7 @@ class DeepseekV41EagerAttentionImpl:
 
         Returns a ``[total_tokens, 1, window_size]`` int32 tensor
         where rows are concatenated across requests (TNK layout).  ``-1`` marks
-        a slot that holds nothing or padding.  Returns an empty tensor when
+        a slot that holds nothing or padding.  Returns all ``-1`` when
         ``start_pos`` is unavailable (e.g. drafting metadata).
         """
         window_size = attn.window_size
@@ -589,8 +589,9 @@ class DeepseekV41EagerAttentionImpl:
         device = q.device
         start_pos = swa_metadata.start_pos
         if start_pos is None or total_tokens == 0:
-            return torch.empty(
+            return torch.full(
                 (total_tokens, 1, window_size),
+                -1,
                 dtype=torch.int32,
                 device=device,
             )
@@ -606,7 +607,7 @@ class DeepseekV41EagerAttentionImpl:
         slots_sp0 = slots_sp0.masked_fill(
             slots_sp0 > token_pos.unsqueeze(1), -1
         )
-        valid_len = torch.clamp(token_sp + 1, max=window_size)
+        valid_len = torch.clamp(token_sp + token_pos + 1, max=window_size)
         slots_nz = cols.unsqueeze(0).expand_as(slots_sp0)
         slots_nz = slots_nz.masked_fill(
             cols.unsqueeze(0) >= valid_len.unsqueeze(1), -1
