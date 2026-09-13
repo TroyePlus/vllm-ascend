@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch_npu
 import custom_ops
 import cann_ops_transformer
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -282,21 +283,6 @@ def scatter_cache_v2(
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
 
 
-def kv_compress_epilog_v2(
-        cache: torch.Tensor,
-        x: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        quant_mode: str
-) -> None:
-    """Store rows using builder-prepared coordinates and V4's Ascend op.
-
-    V4.1 cache planes can be views into a larger layer-outermost slot, so the
-    physical page stride is not necessarily the contiguous stride implied by
-    the plane shape. ``npu_scatter_nd_update_v2`` preserves that stride and
-    treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
-    """
-    torch.ops.custom.kv_compress_epilog_v2(cache, x, slot_mapping, quant_group_size=32, quant_mode=quant_mode)
-
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
     if indices.ndim != 2:
@@ -500,14 +486,12 @@ class DeepseekV41EagerAttentionImpl:
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
-        cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
-        cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
-        kv_compress_epilog_v2(
-            cache,
-            kv,
-            swa_metadata.slot_mapping,
-            quant_mode="mxfp8_bf16"
-        )
+        self._write_attention_cache(attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                                    swa_metadata.slot_mapping,
+                                    kv,
+                                    kind="win",
+                                    backend="native"
+                                    )
         return q, qr
 
     def multistream_preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
@@ -562,8 +546,6 @@ class DeepseekV41EagerAttentionImpl:
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
-            #cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
-            #cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
             self._write_attention_cache(attn.dsa_attn.swa_cache_layer.kv_cache[0],
                                         swa_metadata.slot_mapping,
                                         kv.squeeze(1),
@@ -801,11 +783,11 @@ class DeepseekV41EagerAttentionImpl:
         win_indices = self._get_window_topk_idxs(
             attn, q, metadata.swa, num_reqs, query_start_loc
         )
-        win_topk_length = (win_indices != -1).sum(dim=-1).to(torch.int32)
+        win_topk_length = (win_indices >= 0).sum(dim=-1).to(torch.int32)
         cmp_topk_length = (
-            None
+            torch.zeros_like(win_topk_length)
             if cmp_indices is None
-            else (cmp_indices != -1).sum(dim=-1).to(torch.int32)
+            else (cmp_indices >= 0).sum(dim=-1).to(torch.int32)
         )
 
         from cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla import (
@@ -824,7 +806,7 @@ class DeepseekV41EagerAttentionImpl:
             has_win_kv=True,
             has_cmp_kv=has_compressed,
         )
-
+        cmp_topk_length = None if cmp_indices is None else cmp_topk_length
         output, _ = cann_ops_transformer.ops.ds41.mixed_quant_sparse_flash_mla(
             q,
             win_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
@@ -838,7 +820,7 @@ class DeepseekV41EagerAttentionImpl:
             seqused_cmp_kv=cmp_seq_lens,
             win_topk_length=win_topk_length,
             cmp_topk_length=cmp_topk_length,
-            sinks=attn.attn_sink,
+            sinks=attn.attn_sink.data,
             metadata=op_metadata,
             quant_mode=1,
             softmax_scale=attn.softmax_scale,
