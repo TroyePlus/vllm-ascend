@@ -517,6 +517,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
             return_bias=False,
+            disable_tp=True
         )
 
         self.wkv = ReplicatedLinear(

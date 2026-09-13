@@ -354,7 +354,9 @@ class DeepseekV41EagerAttentionImpl:
     def _project_q_kv(attn, hidden_states, cos, sin):
         q_a = attn.wq_a(hidden_states)
         qr = attn.q_norm(q_a)
-        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
+        q = attn.wq_b(qr)
+        n_q_heads = q.shape[-1]
+        q = q.unflatten(-1, (n_q_heads, attn.head_dim))
         kv = attn.kv_norm(attn.wkv(hidden_states))
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
@@ -446,7 +448,9 @@ class DeepseekV41EagerAttentionImpl:
                 swa_metadata.slot_mapping,
                 quant_mode="mxfp8_bf16"
             )
-        q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_local_heads, attn.head_dim))
+        q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias)
+        n_q_heads = q.shape[-1]
+        q = q.unflatten(-1, (n_q_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
