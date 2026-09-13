@@ -43,6 +43,8 @@ from .engram_hash import PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
+_BF16_BYTES = torch.bfloat16.itemsize
+
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor,  # [b, s, mix_hc] => [b, s, (2 + hc) * hc]
@@ -240,8 +242,14 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
         use_a5_quantized_cache = get_ascend_device_type() == AscendDeviceType.A5
-        head_size = (spec.head_size + (spec.head_size // 32) * torch.bfloat16.itemsize if use_a5_quantized_cache
-                     else spec.head_size)
+        # DSV4's base spec may widen FP8 rows by 128 bytes. DSV4.1 owns its
+        # layout, so recalculate from the configured payload dimension.
+        payload_dim = self.head_dim
+        head_size = (
+            payload_dim + (payload_dim // 32) * _BF16_BYTES
+            if use_a5_quantized_cache
+            else spec.head_size
+        )
         return DeepseekV41SWASpec(
             block_size=spec.block_size,
             num_kv_heads=spec.num_kv_heads,
