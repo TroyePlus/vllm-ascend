@@ -449,7 +449,7 @@ class DeepseekV41EagerAttentionImpl:
                 quant_mode="mxfp8_bf16"
             )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias)
-        n_q_heads = q.shape[-1]
+        n_q_heads = q.shape[-1] // attn.head_dim
         q = q.unflatten(-1, (n_q_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
