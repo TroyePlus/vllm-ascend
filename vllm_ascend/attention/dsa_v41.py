@@ -681,7 +681,7 @@ class DeepseekV41EagerAttentionImpl:
         )
         win_topk_length = (win_indices != -1).sum(dim=-1).to(torch.int32)
         cmp_topk_length = (
-            torch.zeros_like(win_topk_length)
+            None
             if cmp_indices is None
             else (cmp_indices != -1).sum(dim=-1).to(torch.int32)
         )
