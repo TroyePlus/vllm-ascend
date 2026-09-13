@@ -375,6 +375,128 @@ class DeepseekV41EagerAttentionImpl:
         )
         return q.to(hidden_states.dtype), qr, kv.squeeze(1)
 
+
+    def _to_attention_cache_order(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert model [NoPE|RoPE] rows to the A5 cache [RoPE|NoPE] ABI."""
+        if x.shape[-1] != 448 + 64:
+            raise ValueError(
+                f"A5 attention cache requires logical width 512, got {x.shape[-1]}"
+            )
+
+        return torch.cat(
+            (
+                x[..., 448:],   # RoPE：最后64维
+                x[..., :448],   # NoPE：前448维
+            ),
+            dim=-1,
+        )
+    def _scatter_rows(self, cache: torch.Tensor, slot_mapping: torch.Tensor, rows: torch.Tensor) -> None:
+        """Scatter packed rows into a possibly page-strided A3 slot view.
+
+        Production metadata supplies ``[T, 2]`` page/offset coordinates and uses
+        ``[-1, -1]`` for padded rows.  Keep that fixed-shape representation on NPU
+        and delegate the skip/update semantics to the same ScatterNd primitive as
+        the A3 index writer.  In particular, do not boolean-index device tensors:
+        that lowers to dynamic ``Nonzero`` and cannot be captured by ACLGraph.
+        """
+        target = cache.squeeze(-2)
+        slots = slot_mapping[: rows.shape[0]]
+        if slots.ndim == 1:
+            valid = slots >= 0
+            physical = slots.clamp_min(0).long()
+            pages = torch.div(physical, target.shape[1], rounding_mode="floor")
+            offsets = physical.remainder(target.shape[1])
+            indices = torch.stack((pages, offsets), dim=-1)
+        elif slots.ndim == 2 and slots.shape[-1] == 2:
+            valid = (slots >= 0).all(-1)
+            indices = slots
+        else:
+            raise ValueError(f"A5 slot_mapping must be [T] or [T,2], got {tuple(slots.shape)}")
+
+        # Normalize partially invalid coordinates as well as flat -1 slots to the
+        # sentinel consumed by ScatterNd.  All tensors retain their static T shape.
+        # CANN ScatterNd silently stops updating when an INT32-indexed target view
+        # reaches 2 GiB.  V4.1's layer-outermost slots legitimately exceed that
+        # size (the FP32 state ring gives the first three slots a 128 KiB page
+        # stride), so use the operator's INT64 index path.  The page/row values are
+        # still small; INT64 is required for the internal byte-offset calculation.
+        indices = (
+            torch.where(valid.unsqueeze(-1), indices, torch.full_like(indices, -1))
+            .to(torch.int64)
+            .contiguous()
+        )
+        updates = rows.to(target.dtype).contiguous()
+        if target.device.type == "npu":
+            torch_npu.npu_scatter_nd_update_(target, indices, updates)
+            return
+
+        # CPU-only deterministic golden used by unit tests.  Device execution must
+        # stay on the fixed-shape branch above.
+        if bool(valid.any()):
+            target[indices[valid, 0].long(), indices[valid, 1].long()] = updates[valid]
+
+    def _native_pack_rows(self, x: torch.Tensor, kind: str) -> torch.Tensor:
+        import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
+
+        if kind == "cmp":
+            row_bytes, row_dtype, group_size, quant_mode = (
+                320,
+                torch.uint8,
+                16,
+                "mxfp4_bf16",
+            )
+        elif kind == "win":
+            # The Host ABI validates FP8 cache dtype even though vLLM stores this
+            # physical plane as opaque bytes.  Reinterpret the completed row as
+            # U8 before scattering it into the shared 544-byte cache slot.
+            row_bytes, row_dtype, group_size, quant_mode = (
+                544,
+                torch.float8_e4m3fn,
+                32,
+                "mxfp8_bf16",
+            )
+        else:
+            raise ValueError(f"Unsupported A5 packed cache kind: {kind}")
+        # V2 addresses cache as a flat row table.  Use local flat slots here and
+        # scatter into vLLM's possibly page-strided cache only after the operator
+        # has produced rows.  The attention ABI stores RoPE before NoPE.
+        rows = torch.empty((x.shape[0], row_bytes), dtype=row_dtype, device=x.device)
+        slots = torch.arange(x.shape[0], dtype=torch.int64, device=x.device)
+        torch.ops.custom.kv_compress_epilog_v2(
+            rows,
+            self._to_attention_cache_order(x).contiguous(),
+            slots,
+            quant_group_size=group_size,
+            quant_mode=quant_mode,
+            round_scale=True,
+            x_scale=1.0,
+        )
+        return rows.view(torch.uint8)
+
+    def _write_attention_cache(
+            self,
+            cache: torch.Tensor,
+            slot_mapping: torch.Tensor,
+            values: torch.Tensor,
+            *,
+            kind: str,
+            backend: str = "reference",
+    ) -> str:
+        """Write cmp/win rows and return the backend that actually executed."""
+        if backend not in ("reference", "auto", "native"):
+            raise ValueError(f"Unsupported A5 cache-writer backend: {backend}")
+        if values.shape[0] == 0:
+            return "reference" if backend == "reference" else backend
+        if backend != "reference":
+            try:
+                rows = self._native_pack_rows(values, kind)
+                self._scatter_rows(cache, slot_mapping, rows)
+                return "native"
+            except Exception:
+                if backend == "native":
+                    raise
+        return "reference"
+
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
@@ -440,14 +562,14 @@ class DeepseekV41EagerAttentionImpl:
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
-            cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
-            cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
-            kv_compress_epilog_v2(
-                cache,
-                kv.squeeze(1),
-                swa_metadata.slot_mapping,
-                quant_mode="mxfp8_bf16"
-            )
+            #cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            #cache=cache.view(-1, cache.shape[-1]).view(torch.float8_e4m3fn)
+            self._write_attention_cache(attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                                        swa_metadata.slot_mapping,
+                                        kv.squeeze(1),
+                                        kind="win",
+                                        backend="native"
+                                        )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias)
         n_q_heads = q.shape[-1] // attn.head_dim
         q = q.unflatten(-1, (n_q_heads, attn.head_dim))
