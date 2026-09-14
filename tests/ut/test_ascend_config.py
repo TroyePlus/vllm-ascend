@@ -88,6 +88,249 @@ class TestRlConfig(TestBase):
 
 
 class TestAscendConfig(TestBase):
+    def test_engram_defaults_to_disabled(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        )
+
+        self.assertFalse(config.enable_engram)
+        self.assertFalse(config.enable_engram_offload)
+        self.assertEqual(config.engram_tp_size, 1)
+        self.assertEqual(config.engram_storage, "bf16")
+
+    def test_engram_offload_requires_engram(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram_offload=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires enable_engram"):
+            config._validate_engram_config(SimpleNamespace())
+
+    def test_engram_quantized_storage_falls_back_to_bf16(self):
+        for requested_storage in ("fp8", "mxfp8"):
+            with self.subTest(requested_storage=requested_storage):
+                config = AscendConfig(
+                    sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                    enable_engram=True,
+                    enable_engram_offload=True,
+                    engram_storage=requested_storage,
+                )
+                vllm_config = SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+                    ),
+                    load_config=SimpleNamespace(model_loader_extra_config={}),
+                    parallel_config=SimpleNamespace(
+                        pipeline_parallel_size=1,
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                        world_size_across_dp=1,
+                    ),
+                    scheduler_config=SimpleNamespace(async_scheduling=False),
+                    speculative_config=None,
+                )
+
+                config._validate_engram_config(vllm_config)
+
+                self.assertEqual(config.engram_storage, "bf16")
+
+    def test_engram_rejects_prompt_embeddings(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+                enable_prompt_embeds=True,
+            ),
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "enable-prompt-embeds"):
+            config._validate_engram_config(vllm_config)
+
+    def test_engram_disables_multithread_checkpoint_loading(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+        )
+        loader_extra = {"enable_multithread_load": True, "num_threads": 128}
+        vllm_config = SimpleNamespace(
+            load_config=SimpleNamespace(
+                model_loader_extra_config=loader_extra,
+            ),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=1,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        config._validate_engram_config(vllm_config)
+
+        self.assertFalse(loader_extra["enable_multithread_load"])
+        self.assertEqual(loader_extra["num_threads"], 128)
+
+    def test_engram_downgrades_unsupported_optimizations_for_sync_flow(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+            engram_tp_size=8,
+            engram_storage="fp8",
+        )
+        scheduler_config = SimpleNamespace(async_scheduling=True)
+        loader_extra = {"enable_multithread_load": True, "num_threads": 128}
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            load_config=SimpleNamespace(model_loader_extra_config=loader_extra),
+            parallel_config=SimpleNamespace(
+                enable_expert_parallel=True,
+                enable_elastic_ep=False,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=8,
+                local_world_size=4,
+                data_parallel_size_local=2,
+            ),
+            scheduler_config=scheduler_config,
+            speculative_config=None,
+        )
+
+        config._validate_engram_config(vllm_config)
+
+        self.assertEqual(config.engram_storage, "bf16")
+        self.assertFalse(loader_extra["enable_multithread_load"])
+        self.assertFalse(scheduler_config.async_scheduling)
+
+    def test_engram_rejects_elastic_expert_parallelism(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(enable_elastic_ep=True),
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "elastic expert"):
+            config._validate_engram_config(vllm_config)
+
+    def test_single_node_engram_requires_world_sized_shard_group(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+            engram_tp_size=2,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=4,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "host storage remains non-redundant"):
+            config._validate_engram_config(vllm_config)
+
+    def test_engram_tp_size_cannot_exceed_world_size(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+            engram_tp_size=8,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=4,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot be greater than"):
+            config._validate_engram_config(vllm_config)
+
+    def test_multinode_engram_allows_node_sized_shard_group(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+            engram_tp_size=8,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=16,
+                local_world_size=8,
+                data_parallel_size_local=1,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        config._validate_engram_config(vllm_config)
+
+    def test_engram_accepts_tp4_dp2_ep_with_global_etp8(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_engram=True,
+            enable_engram_offload=True,
+            engram_tp_size=8,
+        )
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+            ),
+            parallel_config=SimpleNamespace(
+                enable_expert_parallel=True,
+                enable_elastic_ep=False,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                world_size_across_dp=8,
+                local_world_size=4,
+                data_parallel_size_local=2,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        config._validate_engram_config(vllm_config)
+
     @staticmethod
     def _clean_up_ascend_config(func):
         def wrapper(*args, **kwargs):
