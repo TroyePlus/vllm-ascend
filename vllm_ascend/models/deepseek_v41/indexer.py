@@ -106,7 +106,7 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        slot_mapping = slots[:, 0] * 64 + slots[:, 1]
+        slot_mapping = slots[:, 0] * k_cache.shape[1] + slots[:, 1]
         slots = slot_mapping.to(torch.int32)
         key = key.squeeze(1)
 
