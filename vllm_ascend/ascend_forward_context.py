@@ -349,6 +349,27 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         getattr(vllm_config.model_config.hf_text_config, "quantize", None),
     )
 
+    # Test-only A2 compatibility switch: exercise the complete A3 selector
+    # (including MC2 capacity and fused-MC2 guards) without changing the
+    # hardware-reported SoC or the production A2 default path.
+    import os
+    if os.environ.get("DSV4_TEST_MOCK_A3_ROUTE") == "1":
+        moe_comm_type = _select_a3_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            quant_type,
+            mc2_tokens_capacity,
+            get_ascend_config().enable_fused_mc2,
+        )
+        logger.info_once(
+            "[TEST_ONLY_MOCK_A3] tokens=%s capacity=%s fused_mc2=%s route=%s",
+            num_tokens,
+            mc2_tokens_capacity,
+            get_ascend_config().enable_fused_mc2,
+            moe_comm_type.name,
+        )
+        return moe_comm_type
+
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version == AscendDeviceType.A2:
