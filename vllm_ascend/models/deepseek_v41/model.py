@@ -212,7 +212,7 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
         # layout, so recalculate from the configured payload dimension.
         payload_dim = self.head_dim
         head_size = (
-            payload_dim + (payload_dim // 32) * _BF16_BYTES
+            payload_dim + (payload_dim // 32) * torch.bfloat16.itemsize
             if use_a5_quantized_cache
             else spec.head_size
         )
