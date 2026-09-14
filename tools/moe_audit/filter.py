@@ -15,7 +15,7 @@ def summarize(paths):
         with open(path, errors="replace") as source:
             for line in source:
                 if "Enter external FX backend graph_id=" in line:
-                    backend_entries[line.split("pid=", 1)[-1].split(";", 1)[0]] += 1
+                    backend_entries[line.rsplit("pid=", 1)[-1].split(";", 1)[0]] += 1
                 if "Bind cpus failed" in line:
                     binding_failures += 1
                 if "[MOE_AUDIT_VERSION]" in line:
