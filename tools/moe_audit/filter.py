@@ -15,7 +15,10 @@ def summarize(paths):
                     versions.add(line.split("[MOE_AUDIT_VERSION]", 1)[1].strip())
                 for part in line.split("[MOE_AUDIT] ")[1:]:
                     try:
-                        records.append(json.JSONDecoder().raw_decode(part)[0])
+                        row = json.JSONDecoder().raw_decode(part)[0]
+                        if not isinstance(row, dict) or "event" not in row:
+                            raise ValueError("not an audit record")
+                        records.append(row)
                     except (ValueError, TypeError):
                         malformed += 1
     for version in sorted(versions):
