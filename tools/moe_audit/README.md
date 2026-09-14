@@ -99,7 +99,7 @@ python tools/moe_audit/filter.py prefill.dp0.log prefill.dp1.log > prefill.audit
 P.sh 内模型路径、网卡、IP、RPC 地址等属于部署参数，保持现网脚本原值；
 不要把示例中的 `/workspace/P.sh`、设备号、端口当作固定值。
 每种模式测试前将上一份日志改名留档，不要混合三次运行：
-`mv prefill.log prefill.eager.log`（确认服务已停止后）。
+例如保留本模式日志：`mkdir -p logs/eager && mv prefill.dp*.log logs/eager/`（确认服务已停止后）。
 不拆分/拆分模式的 JSON 仍写 `backend=inductor`，这是此基线外部 backend 入口的匹配条件；
 实际经 `VLLM_EXTERNAL_FX_BACKEND=fxrt` 交给 FXRT，不是先执行 Inductor 优化。
 `debug_dump_path` 直接写入 JSON，避免旧 platform 在环境默认值传播前关闭编译。
@@ -127,12 +127,12 @@ done
 
 chat 模板、benchmark 的测试请求及调度会影响实际 token 数，不能把参数 256 当成每次
 forward 的实际 token 数；以日志 `selector_tokens/local/actual` 和原生 iteration 日志为准。
-若报错，保留错误和完整 prefill.log，不必继续后续长度，也不要打印“warmup 成功”。
+若报错，保留错误和完整的 `prefill.dp*.log`，不必继续后续长度，也不要打印“warmup 成功”。
 
 ## 5. 过滤与回传
 
 ```bash
-python tools/moe_audit/filter.py prefill.log > prefill.audit.txt
+python tools/moe_audit/filter.py prefill.dp0.log prefill.dp1.log > prefill.audit.txt
 wc -lc prefill.audit.txt
 ```
 
@@ -145,9 +145,9 @@ wc -lc prefill.audit.txt
 不用 Python 时可先粗筛（不去重，可能较长）：
 
 ```bash
-grep -F '[MOE_AUDIT' prefill.log > prefill.audit.raw.txt
+grep -hF '[MOE_AUDIT' prefill.dp*.log > prefill.audit.raw.txt
 grep -E 'async_op=True|all_to_all_single|Traceback|WorkerProc hit|Using external FX backend' \
-  prefill.log | tail -60
+  prefill.dp*.log | tail -60
 ```
 
 ## 6. 如何解释
