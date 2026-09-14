@@ -194,9 +194,6 @@ def plan_cache_slots(specs):
         kv_bytes = sum(_cache_plane_sizes(kv_spec))
         index_bytes = sum(_cache_plane_sizes(index_spec))
         capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases))
-        if isinstance(kv_spec, DeepseekV41FullSpec) and kv_spec.dtype == torch.uint8:
-            col = kv_spec.head_size
-            capacity = ((capacity + col - 1) // col) * col
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
@@ -324,16 +321,7 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
             storage_offset=storage_offset // dtype_size,
         )
 
-    if isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
-        rows_per_block = block_stride // spec.head_size
-        key = torch.as_strided(
-            raw.view(torch.uint8),
-            size=(num_blocks * rows_per_block, spec.head_size),
-            stride=(spec.head_size, 1),
-            storage_offset=raw.storage_offset() + offset,
-        )
-    else:
-        key = view(spec.dtype, spec.head_size, offset)
+    key = view(spec.dtype, spec.head_size, offset)
     if isinstance(spec, DeepseekV41IndexerSpec):
         return key, view(spec.scale_dtype, spec.scale_dim, offset + plane_sizes[0])
     return key

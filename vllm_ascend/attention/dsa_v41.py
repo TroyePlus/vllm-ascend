@@ -31,7 +31,6 @@ from vllm.v1.attention.backend import (
 
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
-    MXFP4_QUANT_GROUP_SIZE,
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
@@ -636,28 +635,12 @@ class DeepseekV41EagerAttentionImpl:
                     "DeepSeek V4.1 compressed-KV store requires the custom_ops module "
                     "registering torch.ops.custom.kv_compress_epilog_v2."
                 ) from exc
-            cache_2d = attn.long_kv_cache.kv_cache[0]
-            rows_per_block = compressor_metadata.cache.block_stride_rows
-            valid_mask = long_slots[:, 0] >= 0
-            flat_slots = torch.where(
-                valid_mask,
-                long_slots[:, 0] * rows_per_block + long_slots[:, 1],
-                -1,
-            ).to(torch.int32)
-            _kv_rows = latent.squeeze(1).contiguous()
-            _nope_dim = attn.nope_head_dim
-            _kv_rows_reordered = torch.cat(
-                [_kv_rows[:, _nope_dim:], _kv_rows[:, :_nope_dim]],
-                dim=-1,
-            ).contiguous()
-            torch.ops.custom.kv_compress_epilog_v2(
-                cache_2d,
-                _kv_rows_reordered,
-                flat_slots,
-                quant_group_size=MXFP4_QUANT_GROUP_SIZE,
-                quant_mode="mxfp4_bf16",
-                round_scale=True,
-                x_scale=1.0,
+            cache_4d = attn.long_kv_cache.kv_cache[0]
+            self._write_attention_cache(cache_4d,
+                long_slots,
+                latent.squeeze(1),
+                kind="cmp",
+                backend="native"
             )
         else:
             scatter_cache_v2(
