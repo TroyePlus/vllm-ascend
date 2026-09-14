@@ -146,6 +146,21 @@ MC2 是否调用 v2 应在 OPS 寻找 `npu_moe_distribute_dispatch_v2`；FUSED_M
 融合路径，不能当成 MC2 的同名开关。若拆分版在 Dynamo 处拒绝 async_op=True，
 这时是入图失败，不能说 FXRT 已执行此通信算子。
 
+源码定位：
+
+- `vllm_ascend/ascend_forward_context.py`：`set_mc2_tokens_capacity`、
+  `select_moe_comm_method`、`_select_a3_moe_comm_method`；在现网 EP8 / fused=0 下，
+  `selector_tokens <= capacity` 选 MC2，否则选 ALLTOALL。
+- `vllm_ascend/ops/fused_moe/token_dispatcher.py`：MC2 dispatcher 根据
+  `enable_dispatch_v2` 调用 v2 或旧 dispatch；ALLTOALL dispatcher 的
+  `with_quant` 分支额外交换 scale，然后交换 hidden states。
+- `vllm_ascend/ops/fused_moe/comm_utils.py`：`async_all_to_all` 真正调用
+  `dist.all_to_all_single(..., async_op=True)`；本次没有将其改成同步。
+- `vllm_ascend/moe_route_audit.py`：统一日志及可选 CPU profiler，MRv1 forward 图外执行。
+
+`CONFIG.quant` 是选择器实际读取的 HF quant 字段，可能为 null；
+`model_quant` 是加载的量化配置类。前者为空不能推导为模型未量化。
+
 ## 7. 验证记录
 
 131 A2 / dsv4-pr72-final 的本次验证结果与使用版本记录在同目录 `VALIDATION.md`。
