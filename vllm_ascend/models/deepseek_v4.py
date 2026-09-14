@@ -968,12 +968,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        # The reduced dummy model can be exercised in containers whose CANN
-        # package predates the optional hc_pre kernel.  Keep this explicit and
-        # opt-in; real-weight execution always uses the native operator.
-        import os
-        if os.getenv("VLLM_ASCEND_FXRT_DUMMY_HC_PRE") == "1":
-            return x, torch.zeros_like(x), torch.zeros_like(x)
         y = torch.ops._C_ascend.npu_hc_pre_v2(
             x, hc_fn, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps
         )

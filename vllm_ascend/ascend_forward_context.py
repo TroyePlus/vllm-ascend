@@ -353,7 +353,9 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     # (including MC2 capacity and fused-MC2 guards) without changing the
     # hardware-reported SoC or the production A2 default path.
     import os
-    if os.environ.get("DSV4_TEST_MOCK_A3_ROUTE") == "1":
+    if (os.environ.get("DSV4_TEST_MOCK_A3_ROUTE") == "1"
+            and vllm_config.parallel_config.enable_expert_parallel
+            and get_ep_group().world_size > 1):
         moe_comm_type = _select_a3_moe_comm_method(
             num_tokens,
             vllm_config,
