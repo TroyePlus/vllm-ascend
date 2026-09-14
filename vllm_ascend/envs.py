@@ -28,6 +28,14 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Opt-in MRv1 MoE route diagnostics; 0/1, default 0, not sensitive.
+    "VLLM_ASCEND_MOE_AUDIT": lambda: os.getenv("VLLM_ASCEND_MOE_AUDIT", "0") == "1",
+    # CPU operator sampling outside forward; 0/1, default 0, not sensitive.
+    # Adds profiling overhead; not for performance measurements.
+    "VLLM_ASCEND_MOE_AUDIT_PROFILE": lambda: os.getenv("VLLM_ASCEND_MOE_AUDIT_PROFILE", "0") == "1",
+    # Unique forward signatures sampled twice per worker; >=1, default 16.
+    # Not sensitive. Restart the worker to reset its sampling budget.
+    "VLLM_ASCEND_MOE_AUDIT_LIMIT": lambda: max(1, int(os.getenv("VLLM_ASCEND_MOE_AUDIT_LIMIT", "16"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
