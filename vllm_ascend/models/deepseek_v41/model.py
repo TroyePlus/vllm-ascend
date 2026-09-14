@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
+import custom_ops
+import cann_ops_transformer
 from safetensors import safe_open
 from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
@@ -43,43 +44,6 @@ from .engram_gate import engram_gate
 from .engram_hash import PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
-
-_BF16_BYTES = torch.bfloat16.itemsize
-
-
-def hc_split_sinkhorn(
-    mixes: torch.Tensor,  # [b, s, mix_hc] => [b, s, (2 + hc) * hc]
-    hc_scale: torch.Tensor,  # [3]
-    hc_base: torch.Tensor,  # [(2 + hc) * hc]
-    hc_mult: int = 4,  # hc
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-):
-    mixes = mixes.unsqueeze(0)
-    b, s, _ = mixes.size()
-    # get pre
-    mixes_pre = mixes[:, :, :hc_mult]
-    hc_scale_pre = hc_scale[0]
-    hc_base_pre = hc_base[:hc_mult]
-    pre = F.sigmoid(hc_scale_pre * mixes_pre + hc_base_pre) + eps
-    # get post
-    mixes_post = mixes[:, :, hc_mult : 2 * hc_mult]
-    hc_scale_post = hc_scale[1]
-    hc_base_post = hc_base[hc_mult : 2 * hc_mult]
-    post = 2 * F.sigmoid(hc_scale_post * mixes_post + hc_base_post)
-    # get comb
-    # step 1 : init comb
-    mixes_comb = mixes[:, :, 2 * hc_mult :]
-    hc_scale_comb = hc_scale[2]
-    hc_base_comb = hc_base[2 * hc_mult :]
-    comb = (hc_scale_comb * mixes_comb + hc_base_comb).reshape(b, s, hc_mult, hc_mult)  # [b, s, hc, hc]
-    comb = F.softmax(comb, dim=-1) + eps
-    # step 2: do sinkhorn ops
-    for _ in range(sinkhorn_iters):
-        comb = comb / (comb.sum(dim=-1).unsqueeze(-1) + eps)
-        comb = comb / (comb.sum(dim=-2).unsqueeze(-2) + eps)
-
-    return pre.squeeze(0), post.squeeze(0), comb.squeeze(0)
 
 @dataclass(frozen=True)
 class DeepseekV41LayerRole:
@@ -433,29 +397,29 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.engram = None
         self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
 
-    @staticmethod
-    def hc_collapse(x, pre_mix):
-        return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
-
-    def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
-        pre / post / comb coefficients, split out of one projection of the flattened stream."""
-        # normalized over the whole flattened hc*d stream, one statistic per token
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        return hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
-
-    def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor):
-        """Collapse the hc copies into one, weighted by pre_mix. [b,s,hc,d] x [b,s,hc] -> [b,s,d]"""
-        y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=1)
-        return y.to(x.dtype)
+    def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor,
+               hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        y, post, comb, pre = torch.ops.custom.npu_hc_pre_v2(
+            x=x,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            pre_mix=pre_mix,
+            hc_mult=self.hc_mult,
+            hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+        )
+        return y, post, comb, pre
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
-        x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]"""
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=1)
-        return y.type_as(x)
+        y = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
+        return y
+
+    @staticmethod
+    def hc_pre_mix(x: torch.Tensor, pre_mix: torch.Tensor):
+        y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=1)
+        return y.to(x.dtype)
 
     def forward(
         self,
@@ -466,20 +430,17 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         input_ids=None,
     ):
         residual = hidden_states
-        attn_pre, attn_post, attn_comb = self.hc_mixes(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.hc_pre(hidden_states, pre_mix)
+        x, attn_post, attn_comb, attn_pre = self.hc_pre(
+            hidden_states, pre_mix, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
         x = self.input_layernorm(x)
         x = self.self_attn(positions, x, llama_4_scaling)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
+        x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
+            hidden_states, attn_pre, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        x = self.hc_pre(hidden_states, attn_pre)
         x = self.ffn_norm(x)
         x_fp32 = x.to(torch.float32)
         x = self.mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32)
@@ -681,7 +642,7 @@ class DeepseekV41Model(DeepseekV4Model):
                 )
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=moe_input_ids)
         assert last_layer is not None
-        hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
+        hidden_states = last_layer.hc_pre_mix(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
