@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FP32 C2 ring compressor, ratio-1 path, and fused RMS normalization."""
+"""C1 projection path, C2 fused-compressor pooling with token-aligned bridge,
+and fused RMS normalization."""
 
 from typing import Any
 
@@ -10,6 +11,30 @@ from torch import nn
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
 from vllm_ascend.core.deepseek_v41 import STATE_RING_ROWS, DeepseekV41CompressorStateSpec
+
+
+def _compact_to_token_aligned(
+    compact: torch.Tensor,
+    complete: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Spread compact closed-group rows back onto their closing tokens.
+
+    ``compact`` holds one row per completed group in token order (the
+    compressor_v2 output contract, padded at the tail); ``complete[t]``
+    marks the closing token of each group. Non-closing rows of ``out`` are
+    zeroed and never consumed downstream (their cache slots are -1).
+    """
+    num_tokens = complete.shape[0]
+    if compact.shape[0] == 0 or num_tokens == 0:
+        out.zero_()
+        return out
+    rank = complete.long().cumsum(0) - 1
+    rank = rank.clamp_(min=0, max=compact.shape[0] - 1)
+    gathered = compact[rank]
+    out.zero_()
+    out[complete] = gathered[complete].to(out.dtype)
+    return out
 
 
 def _read(config: Any, name: str) -> Any:
@@ -92,34 +117,54 @@ class DeepseekV41Compressor(nn.Module):
                 )
 
     def prepare_ring_compressor(self, max_tokens, device):
-        """Check the profiled per-source buffer and resolve hardware before capture."""
-        from vllm_ascend.ops.triton.compressor.compressor_triton import _cube_core_num
-
+        """Check the profiled per-source output buffer before capture."""
         actual_device = self._ring_pooled.device
         compatible_device = actual_device.type == device.type and (
             device.index is None or actual_device.index == device.index
         )
         if self._ring_pooled.shape[0] < max_tokens or not compatible_device:
             raise ValueError("Ring output capacity/device must be established before memory profiling")
-        self._ring_num_cores = _cube_core_num()
 
-    def pool_projected(self, kv, scores, metadata):
-        from vllm_ascend.ops.triton.compressor.compressor_triton import compressor_from_projected
+    def pool_projected(self, hidden_states, metadata):
+        """Fused compressor_v2 path: project + gated-pool inside the op.
 
-        if not hasattr(self, "_ring_pooled") or not hasattr(self, "_ring_num_cores"):
+        The op (cann_ops_transformer.ops.ds41.compressor) takes the raw
+        hidden_states plus the wkv/wgate weights, pools closed groups with a
+        per-channel softmax gate over the FP32 ring state, and returns
+        compact closed-group rows; norm/RoPE/scatter stay outside per the
+        op contract.
+        """
+        try:
+            from cann_ops_transformer.ops.ds41 import compressor as compressor_v2
+        except ImportError as exc:
+            raise RuntimeError(
+                "DeepSeek V4.1 C2 compression requires cann_ops_transformer "
+                "(CANN 9.2) with the ds41 compressor op."
+            ) from exc
+        if not hasattr(self, "_ring_pooled"):
             raise RuntimeError("Ring compressor must be initialized before graph capture")
-        if kv.shape[0] > self._ring_pooled.shape[0]:
+        if hidden_states.shape[0] > self._ring_pooled.shape[0]:
             raise ValueError("Compressor batch exceeds its prepared output capacity")
-        pooled = compressor_from_projected(
-            kv,
-            scores,
+        ring_meta = metadata.c2_ring_metadata
+        compact = compressor_v2(
+            hidden_states,
+            self.wkv.weight.to(torch.bfloat16),
+            self.wgate.weight.to(torch.bfloat16),
             self.state_cache.kv_cache[0].squeeze(-2),
-            metadata.c2_ring_metadata,
-            self._ring_pooled[: kv.shape[0]],
-            max_query_len=metadata.max_query_len,
-            num_cores=self._ring_num_cores,
+            state_block_table=ring_meta[4],  # ring page id per request
+            cu_seqlens=metadata.query_start_loc.int(),
+            seqused=ring_meta[1],  # per-request valid tokens in this chunk
+            start_pos=ring_meta[0],  # chunk-first-token absolute position
+            cmp_ratio=2,
         )
-        return self.norm(pooled)
+        num_tokens = hidden_states.shape[0]
+        latent = _compact_to_token_aligned(
+            compact,
+            metadata.c2_complete_mask[:num_tokens],
+            self._ring_pooled[:num_tokens],
+        )
+        latent = self.norm(latent)
+        return latent
 
     def forward(self, x):
         """Project an uncompressed source; ratio-2 uses ``pool_projected``."""

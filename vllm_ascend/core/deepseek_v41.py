@@ -114,6 +114,21 @@ class CacheSlot:
     placements: tuple[CachePlacement, ...]
 
 
+MXFP4_QUANT_GROUP_SIZE = 16
+
+
+def mxfp4_row_bytes(width: int, group_size: int = MXFP4_QUANT_GROUP_SIZE) -> int:
+    """Packed uint8 row width of the mxfp4 compressed KV plane.
+
+    Matches the kv_compress_epilog_v2 op layout: width/2 data bytes (two fp4
+    nibbles per byte) + 2 * (width/group) bf16 scale bytes, padded up to a
+    32-byte boundary. width=512 -> 256 + 64 -> 320.
+    """
+    data = width // 2
+    scales = 2 * (width // group_size)
+    return (data + scales + 31) // 32 * 32
+
+
 def _layer_number(name):
     try:
         return int(name.rsplit(".layers.", 1)[1].split(".", 1)[0])
@@ -179,6 +194,9 @@ def plan_cache_slots(specs):
         kv_bytes = sum(_cache_plane_sizes(kv_spec))
         index_bytes = sum(_cache_plane_sizes(index_spec))
         capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases))
+        if isinstance(kv_spec, DeepseekV41FullSpec) and kv_spec.dtype == torch.uint8:
+            col = kv_spec.head_size
+            capacity = ((capacity + col - 1) // col) * col
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
@@ -291,8 +309,8 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
     plane_sizes = _cache_plane_sizes(spec)
     if offset < 0 or offset + sum(plane_sizes) > block_stride:
         raise ValueError("V4.1 cache component exceeds its slot page")
-    if isinstance(spec, DeepseekV41CompressorStateSpec) and sum(plane_sizes) != block_stride:
-        raise ValueError("Aurora circular state must fill its slot with 32 contiguous FP32 rows")
+    if isinstance(spec, DeepseekV41CompressorStateSpec) and sum(plane_sizes) > block_stride:
+        raise ValueError("Aurora circular state exceeds its slot")
 
     def view(dtype, width, byte_offset):
         dtype_size = dtype.itemsize
@@ -306,7 +324,16 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
             storage_offset=storage_offset // dtype_size,
         )
 
-    key = view(spec.dtype, spec.head_size, offset)
+    if isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
+        rows_per_block = block_stride // spec.head_size
+        key = torch.as_strided(
+            raw.view(torch.uint8),
+            size=(num_blocks * rows_per_block, spec.head_size),
+            stride=(spec.head_size, 1),
+            storage_offset=raw.storage_offset() + offset,
+        )
+    else:
+        key = view(spec.dtype, spec.head_size, offset)
     if isinstance(spec, DeepseekV41IndexerSpec):
         return key, view(spec.scale_dtype, spec.scale_dim, offset + plane_sizes[0])
     return key

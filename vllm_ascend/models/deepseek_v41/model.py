@@ -25,6 +25,7 @@ from vllm_ascend.attention.dsa_v41 import (
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
     DeepseekV41SWASpec,
+    mxfp4_row_bytes,
     validate_cache_runtime,
 )
 from vllm_ascend.device.device_config import get_ascend_device_type
@@ -341,11 +342,13 @@ class DeepseekV41Attention(DeepseekV4Attention):
             get_ascend_device_type() == AscendDeviceType.A5
         )
         if role.is_kv_source:
-            head_size = (
-                width + (width // 32) * torch.bfloat16.itemsize
-                if use_a5_quantized_cache
-                else width
-            )
+            # On A5 the long-context KV is stored quantized:
+            # kv_compress_epilog_v2 packs mxfp4 values + bf16 scales
+            # (group 16) into uint8 rows, so head_size is the packed byte
+            # width rather than the element count (NPU-verified op
+            # contract). Other devices keep the raw BF16 plane and the
+            # builder-prepared [T, 2] scatter write.
+            head_size = mxfp4_row_bytes(width) if use_a5_quantized_cache else width
             cache_dtype = torch.uint8 if use_a5_quantized_cache else torch.bfloat16
             self.long_kv_cache = DeepseekV41CacheLayer(
                 vllm_config,
@@ -355,7 +358,7 @@ class DeepseekV41Attention(DeepseekV4Attention):
                     num_kv_heads=1,
                     head_size=head_size,
                     dtype=cache_dtype,
-                    compress_ratio=role.compress_ratio
+                    compress_ratio=role.compress_ratio,
                 ),
             )
         self.compressor = (
