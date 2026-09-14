@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Wrap the user's existing P script without replacing its parallel/model settings.
 set -euo pipefail
-audit7323_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-audit7323_repo=$(cd "$audit7323_dir/../.." && pwd)
+audit7323_dir=${MOE_AUDIT_TOOL_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
+audit7323_repo=${MOE_AUDIT_REPO:-$(cd "$audit7323_dir/../.." && pwd)}
 audit7323_mode=$(<"$audit7323_dir/mode")
 audit7323_server=${1:?Usage: bash tools/moe_audit/run.sh /absolute/P.sh [P arguments...]}
 shift
-audit7323_dump=${MOE_AUDIT_DUMP:-/workspace/fx_dump_7323/$audit7323_mode}
+audit7323_dump=${MOE_AUDIT_DUMP:-$PWD/fx_dump_7323/$audit7323_mode}
 vllm() {
     local args=() arg
     export PYTHONPATH="$audit7323_repo:${PYTHONPATH:-}"
@@ -18,7 +18,7 @@ vllm() {
     unset DSV4_TEST_FORCE_MC2 DSV4_TEST_FORCE_ALLTOALL
     export VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL=0
     if [[ "$audit7323_mode" == eager ]]; then
-        unset VLLM_EXTERNAL_FX_BACKEND VLLM_ASCEND_ENABLE_FXRT_BACKEND
+        unset VLLM_EXTERNAL_FX_BACKEND VLLM_ASCEND_ENABLE_FXRT_BACKEND VLLM_DEBUG_DUMP_PATH
     else
         export VLLM_EXTERNAL_FX_BACKEND=fxrt
         export VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL=$([[ "$audit7323_mode" == split ]] && echo 1 || echo 0)
@@ -36,7 +36,11 @@ vllm() {
     if [[ "$audit7323_mode" == eager ]]; then
         args+=(--enforce-eager --compilation-config '{"mode":0,"cudagraph_mode":"NONE"}')
     else
-        args+=(--compilation-config "{\"mode\":1,\"backend\":\"inductor\",\"cudagraph_mode\":\"NONE\",\"debug_dump_path\":\"$audit7323_dump\"}")
+        args+=(--compilation-config "$(python -c 'import json,sys; print(json.dumps(dict(mode=1, backend="inductor", cudagraph_mode="NONE", debug_dump_path=sys.argv[1])))' "$audit7323_dump")")
+    fi
+    if [[ "${MOE_AUDIT_DRY_RUN:-0}" == 1 ]]; then
+        python -c 'import os,json,sys; print(json.dumps(dict(argv=sys.argv[1:], env={k:v for k,v in os.environ.items() if k.startswith(("VLLM_", "HCCL_", "ASCEND_RT_"))}),sort_keys=True))' "${args[@]}"
+        return
     fi
     echo "[MOE_AUDIT_VERSION] mode=$audit7323_mode ascend=$(git -C "$audit7323_repo" rev-parse HEAD) source=$audit7323_repo"
     python -c 'import importlib.metadata as m; import vllm, vllm_ascend; print("[MOE_AUDIT_VERSION]", "vllm="+vllm.__file__, "ascend="+vllm_ascend.__file__, "fxrt="+m.version("fxrt"))'

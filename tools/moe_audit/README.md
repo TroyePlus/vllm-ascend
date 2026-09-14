@@ -51,62 +51,129 @@ git switch -c run-7323-split refs/remotes/audit7323/audit/7323-fxrt-split
 P.sh 使用问题中已有的现网脚本；保留：DP2、TP4、EP、DSA-CP、shared expert DP、
 MTP1、max_model_len4096、max_batched_tokens8192、max_seqs16、真实权重、
 CPU binding、原来的 IP/网卡及 Mooncake P2×4/D8×1 配置。
-不要为了本次比较打开 enable_prefill_mc2/enable_fused_mc2，也不要强制路由。
+7.3.26以本次现网配置enable_prefill_mc2=true为准；旧false实验须单独标记，不混比。不要强制路由。
 wrapper 只替换 compile/eager 参数和诊断环境；不替换上述模型/并行参数。
 
-## 3. 拉起并记录 prefill.log
+## 3. 7.3.26：按现网 launcher 启动，统一 prefill.log
 
-脚本不要求固定目录。`run.sh` 参数和环境变量如下：
+保留现网 `start.sh → p-launch_online_dp.py → p-run_dp_template.sh → vllm serve` 链路，
+不要套用131 mock驱动或删除KV配置。两个DP分别启动API是现网已有方式，
+不能仅凭“Waiting for READY message from DP Coordinator”断定需要Decode提供READY：
+该消息属于vLLM内部DP coordinator，须查各DP启动异常、地址和端口，不能与Mooncake握手混同。
 
-| 参数/变量 | 含义 | 默认值 |
-| --- | --- | --- |
-| 第1个参数 | 现网 P 启动脚本绝对路径 | 必填 |
-| `MOE_AUDIT_REPO` | 当前分支 checkout 根目录 | wrapper 的上两级目录 |
-| `MOE_AUDIT_TOOL_DIR` | wrapper 所在目录 | `run.sh` 所在目录 |
-| `MOE_AUDIT_DUMP` | 当前模式 FX 图目录 | 当前工作目录下 `fx_dump_7323/模式` |
-| `VLLM_ASCEND_MOE_AUDIT_LIMIT` | 每 worker 最多不同签名数（每签名采样2次） | 16 |
+### 3.1 仅修改P launcher的调用入口
 
-自动验证脚本 `validate_131.py` 也支持 `MOE_AUDIT_VARIANT_ROOT`、
-`MOE_AUDIT_LOG_ROOT`、`MOE_AUDIT_SERVER`、`MOE_AUDIT_HTTP_PORT`、
-`MOE_AUDIT_RPC_PORT`、`MOE_AUDIT_BIND_HOST` 和 `MOE_AUDIT_DEVICES`；
-前两个根目录参数必填；SERVER默认指向该分支自带的参数化 P 模板（7个位置参数），
-不再使用旧的 `server_ep8_opaque.sh` 的4参数接口。
-其中 `MOE_AUDIT_DEVICES` 是以分号分隔的每个 DP rank 可见卡列表，
-例如 `0,1,2,3;4,5,6,7`。这样容器路径、卡号、HTTP/RPC 端口均可替换。
+在原 `p-launch_online_dp.py` 的 `run_command()` 中，把 command 的开头：
 
-确认所有待用卡空闲；在两个终端分别启动 DP0/DP1。下面 IP/端口请换成现网当前值，
-原始 P.sh 位置也要替换；RPC 端口两边相同，HTTP 端口不同。
-
-```bash
-export VLLM_ASCEND_MOE_AUDIT_PROFILE=1
-export VLLM_ASCEND_MOE_AUDIT_LIMIT=16
-export MOE_AUDIT_DUMP=/workspace/fx_dump_7323/eager  # 每种模式换独立目录
-
-# 终端一：DP0，参数顺序沿用原始 P.sh
-bash tools/moe_audit/run.sh /workspace/P.sh \
-  0,1,2,3 8900 2 0 7.150.1.10 13345 4 >prefill.dp0.log 2>&1
-
-# 终端二：同一个分支、相同的诊断环境和 P.sh
-bash tools/moe_audit/run.sh /workspace/P.sh \
-  4,5,6,7 8901 2 1 7.150.1.10 13345 4 >prefill.dp1.log 2>&1
-
-python tools/moe_audit/filter.py prefill.dp0.log prefill.dp1.log > prefill.audit.txt
+```python
+command = [
+    "bash",
+    "./p-run_dp_template.sh",
 ```
 
-两个 rank 不要并发写同一个 `prefill.log`：虽然 `>>` 通常是追加，但多进程输出可能交错，
-不便于按 rank 审计。使用独立的 `prefill.dp0.log`/`prefill.dp1.log`，最后由过滤器合并；
-不同模式使用不同文件名或目录，因此不会相互覆盖。
-P.sh 内模型路径、网卡、IP、RPC 地址等属于部署参数，保持现网脚本原值；
-不要把示例中的 `/workspace/P.sh`、设备号、端口当作固定值。
-每种模式测试前将上一份日志改名留档，不要混合三次运行：
-例如保留本模式日志：`mkdir -p logs/eager && mv prefill.dp*.log logs/eager/`（确认服务已停止后）。
-不拆分/拆分模式的 JSON 仍写 `backend=inductor`，这是此基线外部 backend 入口的匹配条件；
-实际经 `VLLM_EXTERNAL_FX_BACKEND=fxrt` 交给 FXRT，不是先执行 Inductor 优化。
-`debug_dump_path` 直接写入 JSON，避免旧 platform 在环境默认值传播前关闭编译。
+改为：
 
-wrapper 不会替你更改原 P.sh 的 dummy quant 开关。本次若需严格复现历史配置，保持其原值；
-真实权重验收不应把 dummy quant 兼容路径视作数值精度保证。请保留完整启动日志供审计。
-采样打开后有 profiling 开销，**本次不用于测 TTFT 性能**；生产性能测试前关闭诊断并重启。
+```python
+command = [
+    "bash",
+    os.path.join(os.environ["MOE_AUDIT_REPO"], "tools/moe_audit/run.sh"),
+    os.path.abspath("./p-run_dp_template.sh"),
+```
+
+后面的七个参数保持原样：visible_devices、engine_port、dp_size、dp_rank、
+dp_address、dp_rpc_port、tp_size。launcher已import os，无需新增依赖。
+建议同时把 `dp_rpc_port = args.dp_rpc_port` 改为 `dp_rpc_port = str(args.dp_rpc_port)`，
+避免省略CLI参数时默认整数传给subprocess；本例显式传12320也可正常工作。
+原模板存在性检查保留。只把run.sh套在Python launcher外层不会拦截其新bash子进程，
+必须在上述command中接入wrapper。
+
+### 3.2 P模板与环境保持一致
+
+优先使用你本次提供的现网模板，不需要复制131脚本。保留：
+
+- P DP2/TP4/EP8，卡0–3与4–7；DSA-CP、shared expert DP、CPU binding均true。
+- model_len4096、batch8192、seq16、MTP1、真实权重、多线程加载、显存比例0.9。
+- **本次enable_prefill_mc2=true**；不要使用旧指导中的false。fused_mc2不额外开启。
+  按本分支公式batch8192/TP4对应capacity=2048；selector实际token数≤2048通常选MC2，
+  超过2048且未启用fused时选ALLTOALL。请求标称长度不等于selector token数。
+- MooncakeHybridConnector、kv_producer、KV端口30000、P2×4/D8×1、engine_id=0。
+- 原网卡/IP及HCCL参数；本机IP必须实际存在。DP address是可连接的master IP，
+  **不能用HTTP通配监听地址0.0.0.0替代**。HTTP的--host仍为0.0.0.0。
+- 为逐项复现本次脚本，保持DUMMY_QUANT=1；它是测试兼容开关，不能作为真实权重精度保证。
+  三种模式都保持相同值，不在本轮同时改变数值兼容路径。
+
+若选择仓库自带参数化模板，需要显式设置
+`P_NIC=enp23s0f3 P_LOCAL_IP=7.150.1.10 P_MODEL=/data/models/DeepSeek-V4-Flash-w8a8-mtp`、
+`P_PREFILL_MC2=true VLLM_ASCEND_FXRT_DUMMY_QUANT=1`；真实权重不要设置P_LOAD_FORMAT=dummy。
+原现网模板使用nic_name/local_ip，不读取这些P_*变量。
+
+wrapper在P模板export之后覆盖三模式开关，因此仅在start.sh里unset变量是不够的：
+
+| 项目 | eager | fxrt-opaque | fxrt-split |
+| --- | --- | --- | --- |
+| enforce_eager / compilation mode | 开启 / 0 | 关闭 / 1 | 关闭 / 1 |
+| VLLM_EXTERNAL_FX_BACKEND | unset | fxrt | fxrt |
+| DECOMPOSE_DSV4_PREFILL | 0 | 0 | 1 |
+| cudagraph_mode | NONE | NONE | NONE |
+| JSON backend | 无外部backend | inductor（实际direct FXRT） | 同左 |
+
+两FXRT分支保持fullgraph=True。wrapper还设置AOT_COMPILE=0、USE_V2_MODEL_RUNNER=0、
+ENABLE_INDUCTOR_ASCENDC/ENABLE_INDUCTOR_FXRT=0，并清除强制MC2/ALLTOALL测试开关；
+不改变DP/TP、MTP、KV或prefill_mc2。完整变量名称见PARAMETERS.md。
+
+### 3.3 start.sh：只替换P启动行，D与Proxy保持原样
+
+在P容器选好源码分支、停止上一轮全部P进程并确认卡已释放后，设置实际路径：
+
+```bash
+export MOE_AUDIT_REPO=/absolute/path/to/vllm-ascend
+export MOE_AUDIT_TOOL_DIR="$MOE_AUDIT_REPO/tools/moe_audit"
+# start.sh从原现网部署目录执行，保证./p-run_dp_template.sh存在
+RUN_DIR=$(mktemp -d "$PWD/audit-7326-$(date +%Y%m%d-%H%M%S)-XXXXXX")
+export MOE_AUDIT_DUMP="$RUN_DIR/fx_dump"
+export VLLM_ASCEND_MOE_AUDIT_PROFILE=1
+export VLLM_ASCEND_MOE_AUDIT_LIMIT=16
+git -C "$MOE_AUDIT_REPO" rev-parse HEAD > "$RUN_DIR/commit.txt"
+cat "$MOE_AUDIT_TOOL_DIR/mode" > "$RUN_DIR/mode.txt"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+# 先通过真实launcher做无卡参数检查，两个rank都必须出现
+MOE_AUDIT_DRY_RUN=1 python p-launch_online_dp.py \
+  --dp-size 2 --tp-size 4 --dp-size-local 2 --dp-rank-start 0 \
+  --dp-address 7.150.1.10 --dp-rpc-port 12320 --vllm-start-port 7100 \
+  > "$RUN_DIR/argv-check.log" 2>&1
+
+# 用这一行替换start.sh中的P启动行；不要保留旧P行造成重复启动
+nohup python -u p-launch_online_dp.py \
+  --dp-size 2 --tp-size 4 --dp-size-local 2 --dp-rank-start 0 \
+  --dp-address 7.150.1.10 --dp-rpc-port 12320 --vllm-start-port 7100 \
+  > "$RUN_DIR/prefill.log" 2>&1 < /dev/null &
+echo $! > "$RUN_DIR/launcher.pid"
+```
+
+每轮文件名仍是无后缀的 **prefill.log**，但所在RUN_DIR唯一，避免覆盖历史。
+P端口为7100/7101、DP RPC12320；D端口7200–7207、DP RPC12321；
+KV30000与上述端口用途不同，不能合并。Proxy继续指向原P/D端口。
+原D和Proxy命令无需改动，不要给D套P审计wrapper，也不要重复启动已经运行的D/Proxy。
+切换分支前不能仅kill launcher.pid：其子进程可能继续运行，须检查该轮P API/engine/worker均退出。
+
+### 3.4 单文件日志的含义与过滤
+
+一次launcher的 `>prefill.log 2>&1` 打开一个文件，两个DP子进程继承输出，
+**不会各自截断一次文件**；包含所有rank，不会只打印一个分支/DP。
+但并发日志可能交错甚至拼接，不承诺逐行原子性。不要再起另一套launcher重定向同一路径；
+三模式顺序测试、使用独立RUN_DIR。不要只grep rank0，缺失记录也不能当作算子未执行。
+
+```bash
+python "$MOE_AUDIT_TOOL_DIR/filter.py" "$RUN_DIR/prefill.log" > "$RUN_DIR/prefill.audit.txt"
+grep -F '[MOE_AUDIT_VERSION]' "$RUN_DIR/prefill.log"
+wc -lc "$RUN_DIR/prefill.audit.txt"
+```
+
+确认mode/ascend源码路径符合当前分支，CONFIG覆盖DP0/DP1及TP/EP rank。
+未看到版本行说明wrapper未接入或启动在此前已失败。
+若必须使用部署目录的./prefill.log，可保留原重定向；每轮全部P进程停止后再归档，下一轮才用>重建。
+CPU审计profiler打开时不要同时调用/start_profile，避免嵌套profiler；本轮不用于TTFT测量。
 
 ## 4. 发送请求（先看 health，不吞掉 warmup 错误）
 
@@ -127,13 +194,13 @@ done
 
 chat 模板、benchmark 的测试请求及调度会影响实际 token 数，不能把参数 256 当成每次
 forward 的实际 token 数；以日志 `selector_tokens/local/actual` 和原生 iteration 日志为准。
-若报错，保留错误和完整的 `prefill.dp*.log`，不必继续后续长度，也不要打印“warmup 成功”。
+若报错，保留错误和完整的 `"$RUN_DIR/prefill.log"`，不必继续后续长度，也不要打印“warmup 成功”。
 
 ## 5. 过滤与回传
 
 ```bash
-python tools/moe_audit/filter.py prefill.dp0.log prefill.dp1.log > prefill.audit.txt
-wc -lc prefill.audit.txt
+python tools/moe_audit/filter.py "$RUN_DIR/prefill.log" > "$RUN_DIR/prefill.audit.txt"
+wc -lc "$RUN_DIR/prefill.audit.txt"
 ```
 
 该脚本读取所有 rank，不只保留 rank0；合并相同条件，输出实际出现的 `dp/tp/ep` rank 集合。
@@ -145,9 +212,9 @@ wc -lc prefill.audit.txt
 不用 Python 时可先粗筛（不去重，可能较长）：
 
 ```bash
-grep -hF '[MOE_AUDIT' prefill.dp*.log > prefill.audit.raw.txt
+grep -hF '[MOE_AUDIT' "$RUN_DIR/prefill.log" > prefill.audit.raw.txt
 grep -E 'async_op=True|all_to_all_single|Traceback|WorkerProc hit|Using external FX backend' \
-  prefill.dp*.log | tail -60
+  "$RUN_DIR/prefill.log" | tail -60
 ```
 
 ## 6. 如何解释
