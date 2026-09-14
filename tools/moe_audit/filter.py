@@ -9,9 +9,15 @@ def summarize(paths):
     records = []
     versions = set()
     malformed = 0
+    backend_entries = Counter()
+    binding_failures = 0
     for path in paths:
         with open(path, errors="replace") as source:
             for line in source:
+                if "Enter external FX backend graph_id=" in line:
+                    backend_entries[line.split("pid=", 1)[-1].split(";", 1)[0]] += 1
+                if "Bind cpus failed" in line:
+                    binding_failures += 1
                 if "[MOE_AUDIT_VERSION]" in line:
                     versions.add(line.split("[MOE_AUDIT_VERSION]", 1)[1].strip())
                 for part in line.split("[MOE_AUDIT] ")[1:]:
@@ -44,6 +50,10 @@ def summarize(paths):
             step = steps.setdefault((row["pid"], row["seq"]), {})
             step[row["event"]] = row
     print("AUDIT", json.dumps(dict(events=events, malformed=malformed, steps=len(steps))))
+    print(
+        "NATIVE",
+        json.dumps(dict(external_backend_entries_by_pid=backend_entries, cpu_binding_failures=binding_failures)),
+    )
     for config, ranks in configs.items():
         print("CONFIG", config, "ranks=" + ",".join(sorted(ranks)))
     grouped = defaultdict(list)
