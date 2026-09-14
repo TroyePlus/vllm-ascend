@@ -378,13 +378,28 @@ class AscendSharedExperts:
                         dst_type=SITU_MX_DST_TYPE_E4M3FN,
                     )
                 else:
-                    quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+                    import custom_ops
+                    import cann_ops_transformer
+                    import cann_ops_nn
+
+                    # Legacy CANN operator call kept for reference:
+                    # quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+                    #     hidden_states,
+                    #     topk_weight=None,
+                    #     group_index=None,
+                    #     dst_type=torch.float8_e4m3fn,
+                    #     quant_mode=2,
+                    #     clamp_value=self.swiglu_limit,
+                    # )
+                    swiglu_limit_args = {}
+                    if self.swiglu_limit is not None:
+                        swiglu_limit_args["clamp_limit"] = self.swiglu_limit
+                    quantized_x, swiglu_out_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
                         hidden_states,
-                        topk_weight=None,
-                        group_index=None,
                         dst_type=torch.float8_e4m3fn,
-                        quant_mode=2,
-                        clamp_value=self.swiglu_limit,
+                        round_scale=True,
+                        quant_mode=1,
+                        **swiglu_limit_args,
                     )
                 maybe_wait_event(down_projection_ready)
                 shared_out = self.layer.down_proj((quantized_x, swiglu_out_scale))[0]

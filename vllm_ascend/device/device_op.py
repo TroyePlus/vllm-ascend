@@ -1022,13 +1022,28 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 output_dtype=torch.bfloat16,
             )[0]
             # DSV4 need swiglu_limit input
-            out, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+            import custom_ops
+            import cann_ops_transformer
+            import cann_ops_nn
+
+            # Legacy CANN operator call kept for reference:
+            # out, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+            #     hidden_states,
+            #     topk_weight=None,
+            #     group_index=None,
+            #     dst_type=torch.float8_e4m3fn,
+            #     quant_mode=2,
+            #     clamp_value=swiglu_limit,
+            # )
+            swiglu_limit_args = {}
+            if swiglu_limit is not None:
+                swiglu_limit_args["clamp_limit"] = swiglu_limit
+            out, out_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
                 hidden_states,
-                topk_weight=None,
-                group_index=None,
                 dst_type=torch.float8_e4m3fn,
-                quant_mode=2,
-                clamp_value=swiglu_limit,
+                round_scale=True,
+                quant_mode=1,
+                **swiglu_limit_args,
             )
         elif mxfp_quant_dtype == QuantType.W4A16MXFP:
             hidden_states = torch_npu.npu_grouped_matmul(

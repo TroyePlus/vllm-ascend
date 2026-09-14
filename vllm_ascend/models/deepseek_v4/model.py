@@ -377,7 +377,6 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return hidden_states #TODO wangtao
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 

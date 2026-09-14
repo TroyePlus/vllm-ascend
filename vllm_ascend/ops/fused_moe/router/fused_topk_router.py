@@ -26,6 +26,75 @@ from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTo
 
 DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
+_VISION_GATING_OP_NAME = "npu_moe_gating_top_k"
+_VISION_GATING_REQUIRED_ARGUMENTS = frozenset(("image_bias", "image_token_mask"))
+
+
+def _npu_moe_gating_vision_op() -> Callable | None:
+    """Return the optional fused op only when its schema supports vision routing."""
+    op = getattr(torch.ops._C_ascend, _VISION_GATING_OP_NAME, None)
+    if op is None:
+        return None
+
+    schemas_by_overload = getattr(op, "_schemas", None) or {}
+    schemas = list(schemas_by_overload.values())
+    schema = getattr(op, "_schema", None)
+    if schema is not None:
+        schemas.append(schema)
+    default_overload = getattr(op, "default", None)
+    default_schema = getattr(default_overload, "_schema", None)
+    if default_schema is not None:
+        schemas.append(default_schema)
+
+    for candidate in schemas:
+        argument_names = {argument.name for argument in candidate.arguments}
+        if argument_names >= _VISION_GATING_REQUIRED_ARGUMENTS:
+            return op
+    return None
+
+
+def select_deepseek_v4_vision_experts_with_fusion_op(
+    vision_gating_op: Callable,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor | None,
+    bias_vl: torch.Tensor,
+    text_bias: torch.Tensor | None,
+    top_k: int,
+    renormalize: bool,
+    k_group: int,
+    group_count: int,
+    routed_scaling_factor: float = 1.0,
+    eps: float = 1e-20,
+    image_sentinel_lo: int = DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select DeepSeek V4 vision experts with the optional fused operator."""
+    image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
+    image_token_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
+    topk_weights, topk_ids, _ = vision_gating_op(
+        router_logits,
+        k=top_k,
+        bias=text_bias,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        image_bias=bias_vl,
+        image_token_mask=image_token_mask,
+        k_group=k_group,
+        group_count=group_count,
+        routed_scaling_factor=1.0,
+        eps=eps,
+        group_select_mode=1,
+        renorm=0,
+        norm_type=2,
+        out_flag=False,
+    )
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(topk_weights.dtype).tiny
+        )
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_ids
 
 
 def select_deepseek_v4_vision_experts(
@@ -57,7 +126,9 @@ def select_deepseek_v4_vision_experts(
         topk_ids = torch.where(image_mask.unsqueeze(-1), dynamic_ids, text_ids)
     topk_weights = scores.gather(1, topk_ids)
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(topk_weights.dtype).tiny)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(topk_weights.dtype).tiny
+        )
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
@@ -104,6 +175,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         self.tid2eid = tid2eid
         self.bias_vl = bias_vl
         self.image_sentinel_lo = image_sentinel_lo
+        self.vision_gating_op = _npu_moe_gating_vision_op() if bias_vl is not None else None
 
     def is_fused_supported(
         self,
@@ -145,9 +217,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         if self.scoring_func == "sqrtsoftplus":
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
-                    raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+                    raise ValueError(
+                        "DeepSeek V4 hash MoE routing requires input_ids; vision routing requires it as well."
+                    )
                 input_ids = input_ids.to(torch.int64)
-                tid2eid_ones = self.tid2eid.to(torch.int32)
+                tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
                     input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
@@ -159,22 +233,54 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     # ids. Apply the identical TP chunk only when communication
                     # has not already aligned ids with local router rows.
                     input_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1)).reshape(-1)
+                input_ids = torch.where(input_ids == -1, 0, input_ids)
+            else:
+                input_ids = None
+                tid2eid_ones = None
             bias_vl = self.bias_vl
             if bias_vl is not None and bias_vl.dtype != router_logits.dtype:
                 bias_vl = bias_vl.to(router_logits.dtype)
             text_bias = self.e_score_correction_bias
             if text_bias is not None and text_bias.dtype != router_logits.dtype:
                 text_bias = text_bias.to(router_logits.dtype)
-            else:
-                input_ids = None
-                tid2eid_ones = None
+            if bias_vl is not None:
+                assert input_ids is not None
+                if self.vision_gating_op is not None:
+                    topk_weights, topk_ids = select_deepseek_v4_vision_experts_with_fusion_op(
+                        vision_gating_op=self.vision_gating_op,
+                        router_logits=router_logits,
+                        input_ids=input_ids,
+                        tid2eid=tid2eid_ones,
+                        bias_vl=bias_vl,
+                        text_bias=text_bias,
+                        top_k=self.top_k,
+                        renormalize=self.renormalize,
+                        k_group=topk_group,
+                        group_count=num_expert_group,
+                        routed_scaling_factor=self.routed_scaling_factor,
+                        image_sentinel_lo=self.image_sentinel_lo,
+                    )
+                else:
+                    topk_weights, topk_ids = select_deepseek_v4_vision_experts(
+                        router_logits=router_logits,
+                        input_ids=input_ids,
+                        tid2eid=tid2eid_ones,
+                        bias_vl=bias_vl,
+                        text_bias=text_bias,
+                        top_k=self.top_k,
+                        renormalize=self.renormalize,
+                        routed_scaling_factor=self.routed_scaling_factor,
+                        image_sentinel_lo=self.image_sentinel_lo,
+                    )
+                return topk_weights.to(torch.float32), topk_ids.to(
+                    torch.int32 if indices_type is None else indices_type
+                )
             topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
                 x=router_logits,
                 k=self.top_k,
                 bias=text_bias,
                 input_ids=input_ids,
                 tid2eid=tid2eid_ones,
-                bias_vl=bias_vl,
                 k_group=topk_group,
                 group_count=num_expert_group,
                 routed_scaling_factor=self.routed_scaling_factor,
@@ -185,8 +291,6 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 renorm=0,
                 norm_type=2,
                 out_flag=False,
-                image_sentinel_lo=self.image_sentinel_lo,
-                image_sentinel_count=DEEPSEEK_V4_IMAGE_SENTINEL_COUNT,
             )
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32 if indices_type is None else indices_type)
         norm_type = 0 if self.scoring_func == "softmax" else 1
