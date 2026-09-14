@@ -125,9 +125,10 @@ class DeepseekV41Topology:
 class DeepseekV41SharedAttentionState:
     """Per-forward handoff between index sources and their consumer layers."""
 
-    def __init__(self, topk_indices, candidates):
+    def __init__(self, topk_indices, candidate_indices, candidate_lengths):
         self.topk_indices = topk_indices
-        self.candidates = candidates
+        self.candidate_indices = candidate_indices
+        self.candidate_lengths = candidate_lengths
 
     def reset(self):
         # Source layers overwrite the active rows before any consumer reads
@@ -510,10 +511,17 @@ class DeepseekV41Model(DeepseekV4Model):
             dtype=torch.int32,
             device=self.topk_indices_buffer.device,
         )
+        candidate_length_buffer = torch.zeros(
+            (max_tokens, 1),
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
         self.candidate_indices_buffer = candidate_buffer
+        self.candidate_length_buffer = candidate_length_buffer
         self.shared_attention_state = DeepseekV41SharedAttentionState(
             self.topk_indices_buffer,
             candidate_buffer,
+            candidate_length_buffer,
         )
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):

@@ -662,7 +662,7 @@ class DeepseekV41EagerAttentionImpl:
 
         context = get_forward_context().no_compile_layers
         source_layer = context[self.index_k_source_prefix]
-        selected, candidates = attn.indexer.select(
+        selected, candidate_indices, candidate_lengths = attn.indexer.select(
             hidden_states,
             qr,
             positions,
@@ -674,11 +674,15 @@ class DeepseekV41EagerAttentionImpl:
             uses_candidate_filter=self.role.uses_candidate_filter,
             candidate_topk_blocks=self.topology.candidate_topk_blocks,
             candidate_block_size=self.topology.candidate_block_size,
-            candidates=shared.candidates[: hidden_states.shape[0]],
+            candidate_indices=shared.candidate_indices[: hidden_states.shape[0]],
+            candidate_lengths=shared.candidate_lengths[: hidden_states.shape[0]],
         )
         shared.topk_indices[: selected.shape[0]].copy_(selected)
         if self.role.is_candidate_source:
-            shared.candidates[: candidates.shape[0]].copy_(candidates)
+            shared.candidate_indices[: candidate_indices.shape[0]].copy_(candidate_indices)
+            shared.candidate_lengths[: candidate_indices.shape[0]].copy_(
+                candidate_lengths.reshape(candidate_indices.shape[0], -1)[:, :1]
+            )
         return shared.topk_indices[: selected.shape[0]]
 
     def _attention(self, attn, q, metadata, compressed_indices):
@@ -1160,37 +1164,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         #         DeviceMetadataStage.ATTENTION,
         #         build_smla_metadata,
         #     )
-# TODO zhixuan
-        # if self._supports_device_ops and cache_kind == "index_k":
-        #     residual = cmp_residual_buffer
 
-        #     def build_qli_metadata() -> None:
-        #         value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-        #             int(_config_value(text_config, "index_n_heads")),
-        #             1,
-        #             int(_config_value(text_config, "index_head_dim")),
-        #             index_topk,
-        #             2,
-        #             cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-        #             seqused_k=self._cache_seq_lens[:num_reqs],
-        #             cmp_residual_k=residual,
-        #             batch_size=num_reqs,
-        #             max_seqlen_q=int(getattr(common, "max_query_len", 0)),
-        #             max_seqlen_k=coordinates["max_cache_seq_len"],
-        #             layout_q="TND",
-        #             layout_k="PA_BBND",
-        #             mask_mode=3,
-        #             cmp_ratio=ratio,
-        #         )
-        #         self._qli_metadata.copy_(value)
-
-        #     qli_metadata = self._publish_task(
-        #         shared,
-        #         f"qli:c{ratio}",
-        #         self._qli_metadata,
-        #         DeviceMetadataStage.INDEXER,
-        #         build_qli_metadata,
-        #     )
+        if self._supports_device_ops and cache_kind == "index_k":
+            self._qli_metadata = None
+            qli_metadata = None
 
         c2_ring_metadata = None
         c2_complete_mask = None

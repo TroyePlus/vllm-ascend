@@ -15,14 +15,14 @@ from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
-from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
 )
 
 from .compressor import DeepseekV41RMSNorm, _read
-
+from cann_ops_transformer.ops.ds41 import quant_lightning_indexer
+from cann_ops_transformer.ops.ds41 import quant_sparse_lightning_indexer
 
 class DeepseekV41Indexer(nn.Module):
     """Small side attention that selects compressed KV positions.
@@ -80,7 +80,7 @@ class DeepseekV41Indexer(nn.Module):
                 DeepseekV41IndexerSpec(
                     block_size=vllm_config.cache_config.block_size,
                     num_kv_heads=1,
-                    head_size=self.width,
+                    head_size=self.width // 2 if use_a5_quantized_cache else self.width,
                     dtype=torch.uint8 if use_a5_quantized_cache else torch.int8,
                     compress_ratio=compress_ratio,
                     scale_dim=self.width // 32 if use_a5_quantized_cache else 1,
@@ -105,18 +105,21 @@ class DeepseekV41Indexer(nn.Module):
             rotary_mode="interleave",
             partial_slice=[self.width - self.rope_width, self.width],
         )
-        key = key.squeeze(1)
-        quantized, scale = torch_npu.npu_dynamic_quant(
-            key, dst_type=torch.int8
-        )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        # TODO zhixuan
-        # scatter_cache_v2(k_cache, slots, quantized)
-        # scatter_cache_v2(
-        #     scale_cache,
-        #     slots,
-        #     scale.unsqueeze(-1).to(torch.float16),
-        # )
+        slot_mapping = slots[:, 0] * 64 + slots[:, 1]
+        slots = slot_mapping.to(torch.int32)
+        key = key.squeeze(1)
+
+        torch.ops.cann_ops_transformer.indexer_quant_cache(
+            cache=k_cache,
+            cache_scale=scale_cache,
+            x=key,
+            slot_mapping=slots,
+            quant_mode="mxfp4"
+        )
+        '''print("zzx update_keys k_cache", k_cache.shape, k_cache.dtype)
+        print("zzx update_keys scale_cache", scale_cache.shape, scale_cache.dtype)
+        print("zzx update_keys key", key.shape, key.dtype)'''
 
     def select(
         self,
@@ -132,7 +135,8 @@ class DeepseekV41Indexer(nn.Module):
         uses_candidate_filter,
         candidate_topk_blocks,
         candidate_block_size,
-        candidates,
+        candidate_indices,
+        candidate_lengths,
     ):
         """Score index K, optionally filter blocks, then return position TopK."""
         query = self._output(self.wq_b, qr).unflatten(-1, (self.n_heads, self.width))
@@ -156,7 +160,8 @@ class DeepseekV41Indexer(nn.Module):
             uses_candidate_filter=uses_candidate_filter,
             candidate_topk_blocks=candidate_topk_blocks,
             candidate_block_size=candidate_block_size,
-            candidates=candidates,
+            candidate_indices=candidate_indices,
+            candidate_lengths=candidate_lengths,
         )
 
     def select_projected(
@@ -171,92 +176,96 @@ class DeepseekV41Indexer(nn.Module):
         uses_candidate_filter,
         candidate_topk_blocks,
         candidate_block_size,
-        candidates,
+        candidate_indices,
+        candidate_lengths,
     ):
-        """Return shape-compatible empty index and candidate tensors."""
         if is_candidate_source and uses_candidate_filter:
             raise ValueError("A candidate source must use the unfiltered position TopK")
-        if uses_candidate_filter and candidates is None:
+        if uses_candidate_filter and (candidate_indices is None or candidate_lengths is None):
             raise RuntimeError("V4.1 candidate-filtering indexer ran before its source")
         candidate_shape = (query.shape[0], 1, candidate_topk_blocks)
-        if uses_candidate_filter and (candidates.shape != candidate_shape or candidates.dtype != torch.int32):
+        if uses_candidate_filter and (candidate_indices.shape != candidate_shape or candidate_indices.dtype != torch.int32):
             raise ValueError("Candidate consumer requires INT32 block IDs with matching query rows")
-        selected = torch.empty(
-            (query.shape[0], self.index_topk), dtype=torch.int32, device=query.device
+        topk = self.index_topk
+        if query.shape[0] == 0:
+            selected = torch.full(
+                (0, topk), -1, dtype=torch.int32, device=query.device
+            )
+            if is_candidate_source:
+                candidate_indices = torch.full(
+                    candidate_shape, -1, dtype=torch.int32, device=query.device
+                )
+                candidate_lengths = torch.zeros(
+                    (0, 1), dtype=torch.int32, device=query.device
+                )
+            return selected, candidate_indices, candidate_lengths
+
+        quantized_query, query_scale = torch_npu.npu_dynamic_mx_quant(
+            query, dst_type=torch_npu.float4_e2m1fn_x2)
+        quantized_query = quantized_query.view(torch.uint8)
+
+        packed_dim = self.width // 2
+        quantized_query = quantized_query.reshape(-1, self.n_heads, packed_dim)
+        query_scale = query_scale.contiguous().view(torch.uint8).reshape(
+            quantized_query.shape[0], self.n_heads, self.width // 64, 2,
         )
-        if is_candidate_source:
-            candidates = torch.empty(candidate_shape, dtype=torch.int32, device=query.device)
-        return selected, candidates
-        # """Run QLI V2 on paged INT8 K; candidates are block IDs, not positions.
 
-        # Source and consumer share [tokens, 1, candidate_topk_blocks] INT32
-        # block IDs only within this forward. Query quantization and position
-        # ordering stay outside the native QLI/candidate operator.
-        # """
-        # if is_candidate_source and uses_candidate_filter:
-        #     raise ValueError("A candidate source must use the unfiltered position TopK")
-        # if uses_candidate_filter and candidates is None:
-        #     raise RuntimeError("V4.1 candidate-filtering indexer ran before its source")
-        # if self.width != 128 or self.n_heads not in (32, 64):
-        #     raise ValueError("A3 QLI requires index_head_dim=128 and 32 or 64 index heads")
-        # if not 1 <= self.index_topk <= 2048:
-        #     raise ValueError("A3 QLI requires index_topk in [1, 2048]")
-        # if self.compress_ratio not in (1, 2):
-        #     raise ValueError("Aurora QLI supports compression ratios 1 and 2")
-        # if is_candidate_source or uses_candidate_filter:
-        #     if not 0 < candidate_topk_blocks <= 2048 or candidate_topk_blocks % 64:
-        #         raise ValueError("candidate_topk_blocks must be a multiple of 64 in [64, 2048]")
-        #     if candidate_block_size != 8:
-        #         raise ValueError("The current A3 candidate kernel requires candidate_block_size=8")
-        # candidate_shape = (query.shape[0], 1, candidate_topk_blocks)
-        # if uses_candidate_filter and (candidates.shape != candidate_shape or candidates.dtype != torch.int32):
-        #     raise ValueError("Candidate consumer requires INT32 block IDs with matching query rows")
-        # topk = self.index_topk
-        # if query.shape[0] == 0:
-        #     selected = torch.full(
-        #         (0, topk), -1, dtype=torch.int32, device=query.device
-        #     )
-        #     if is_candidate_source:
-        #         candidates = torch.full(candidate_shape, -1, dtype=torch.int32, device=query.device)
-        #     return selected, candidates
+        key, key_scale = source_cache
+        key = key.contiguous()
+        key_scale = key_scale.view(*key_scale.shape[:-1], 2, 2).contiguous()
 
-        # quantized_query, query_scale = quantize_indexer_query(query)
-        # weights = weights.to(torch.float16)
-        # key, key_scale = source_cache
-        # key_scale = key_scale.squeeze(-1)  # Preserve the Hybrid cache page stride.
-        # cu_seqlens_q = source_metadata.query_start_loc
-        # seqused_k = source_metadata.cache_seq_lens
-        # residual = source_metadata.cmp_residual
-        # common = dict(
-        #     cu_seqlens_q=cu_seqlens_q,
-        #     seqused_k=seqused_k,
-        #     cmp_residual_k=residual,
-        #     max_seqlen_q=source_metadata.max_query_len,
-        #     layout_q="TND",
-        #     layout_k="PA_BBND",
-        #     mask_mode=3,
-        #     cmp_ratio=self.compress_ratio,
-        # )
-        # op_metadata = source_metadata.qli_metadata
-        # if op_metadata is None:
-        #     raise RuntimeError("V4.1 QLI metadata was not built")
-        # wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
-        # mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
-        # selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
-        #     quantized_query,
-        #     key,
-        #     weights,
-        #     query_scale,
-        #     key_scale,
-        #     topk,
-        #     2,
-        #     block_table=source_metadata.block_table,
-        #     metadata=op_metadata,
-        #     candidate_topk_index=candidates if uses_candidate_filter else None,
-        #     candidate_mode=mode,
-        #     candidate_topk_blocks=candidate_topk_blocks,
-        #     candidate_block_size=candidate_block_size,
-        #     **common,
-        # )
-        # selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
-        # return selected, candidate_out if is_candidate_source else candidates
+        weights = weights.reshape(-1, self.n_heads).float().contiguous()
+
+        '''print("zzx select_projected quantized_query", quantized_query.shape, quantized_query.dtype)
+        print("zzx select_projected query_scale", query_scale.shape, query_scale.dtype)
+        print("zzx select_projected key", key.shape, key.dtype)
+        print("zzx select_projected key_scale", key_scale.shape, key_scale.dtype)
+        print("zzx select_projected weights", weights.shape, weights.dtype)'''
+
+        common = dict(
+            cu_seqlens_q=source_metadata.query_start_loc,
+            seqused_q=source_metadata.query_lens,
+            seqused_k=source_metadata.cache_seq_lens,
+            cmp_residual_k=source_metadata.cmp_residual,
+            block_table=source_metadata.block_table,
+            metadata=source_metadata.qli_metadata,
+            max_seqlen_q=source_metadata.max_query_len,
+            mask_mode=3,
+            cmp_ratio=self.compress_ratio,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            return_value=False,
+        )
+        if uses_candidate_filter:
+            selected, _ = quant_sparse_lightning_indexer(
+                q=quantized_query,
+                k=key,
+                w=weights,
+                descale_q=query_scale,
+                descale_k=key_scale,
+                candidate_block_indices=candidate_indices,
+                candidate_block_length=candidate_lengths,
+                topk=topk,
+                quant_mode=1, # mxpf4
+                candidate_block_size=candidate_block_size,
+                **common,
+            )
+        else:
+            selected, _, cand_indices, cand_lengths = quant_lightning_indexer(
+                q=quantized_query,
+                k=key,
+                w=weights,
+                q_descale=query_scale,
+                k_descale=key_scale,
+                topk=topk,
+                quant_mode=1, # mxpf4
+                candidate_topk_blocks=candidate_topk_blocks,
+                candidate_block_size=candidate_block_size,
+                **common,
+            )
+            if is_candidate_source:
+                candidate_indices = cand_indices
+                candidate_lengths = cand_lengths
+
+        selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
+        return selected, candidate_indices, candidate_lengths
