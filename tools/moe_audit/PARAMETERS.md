@@ -67,29 +67,14 @@ eager会unset它。wrapper删除原compilation-config并重建，不合并额外
 CPU诊断profiler与原`--profiler-config`可共存，但采样时不要再调用服务的start_profile接口，
 以免嵌套启动profiler；本轮不用于TTFT性能测量。
 
-## 启动示例
+## 7.3.26现网启动
 
-在选定分支根目录，两终端相同环境，每次只启动一种模式：
+以README.md第3节为准：保留start.sh和p-launch_online_dp.py的七参数调用，
+在P launcher的command中插入run.sh，D/Proxy不改动。统一输出到每轮独立目录的prefill.log。
+本次现网基线P_PREFILL_MC2=true、DUMMY_QUANT=1；后者不同于参数化模板默认0，需显式设置。
+原现网模板直接写定这些值时不用P_*变量；wrapper在模板export之后覆盖模式。
+不使用131 mock的P_DISABLE_KV或强制路由开关，不把DP address设为0.0.0.0。
 
-```bash
-export P_NIC=enp23s0f3 P_LOCAL_IP=7.150.1.10
-export P_MODEL=/data/models/DeepSeek-V4-Flash-w8a8-mtp
-export P_PREFILL_MC2=true
-export VLLM_ASCEND_FXRT_DUMMY_QUANT=0 # 若严格复现用户原脚本则改1
-export MOE_AUDIT_DUMP="$PWD/fx_dump_test" P_PROFILE_DIR="$PWD/profile_test"
-# 首先检查最终参数；切换分支后再次检查
-MOE_AUDIT_DRY_RUN=1 bash tools/moe_audit/run.sh \
-  "$PWD/tools/moe_audit/p-run_dp_template.sh" 0,1,2,3 8900 2 0 7.150.1.10 13345 4
-# DP0
-bash tools/moe_audit/run.sh "$PWD/tools/moe_audit/p-run_dp_template.sh" \
-  0,1,2,3 8900 2 0 7.150.1.10 13345 4 >>prefill.log 2>&1
-# 另一终端DP1
-bash tools/moe_audit/run.sh "$PWD/tools/moe_audit/p-run_dp_template.sh" \
-  4,5,6,7 8901 2 1 7.150.1.10 13345 4 >>prefill.log 2>&1
-python tools/moe_audit/filter.py prefill.log > prefill.audit.txt
-```
-
-网络和端口是示例，必须替换成部署机器的值。普通 `vllm ...` 或 `exec vllm ...`
-才会被wrapper拦截；若自定义P脚本用绝对路径可执行文件、`python -m`或另起bash，需要改用本模板。
-7.3.24验证仅检查参数生成/JSON/三模式覆盖，不重复启动NPU服务；
-7.3.23的三模式8卡结果仍是prefill_mc2=false的历史结果，不能当成本次true配置的实测。
+7.3.26本地无设备检查覆盖三模式×两个DP rank的最终argv/env：卡号、7100/7101、
+DP2/TP4、RPC12320、KV P2×4/D8×1、prefill_mc2=true、DUMMY_QUANT=1及编译入口。
+通过shell语法和参数检查不等于A3请求/profiling实测；本次未启动NPU服务。
