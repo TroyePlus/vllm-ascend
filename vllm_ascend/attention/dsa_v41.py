@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
 
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
+    MXFP4_QUANT_GROUP_SIZE,
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
@@ -141,6 +142,7 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_source_cos: torch.Tensor | None = None
     c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
+    block_stride_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -467,10 +469,7 @@ class DeepseekV41EagerAttentionImpl:
             if state_metadata.c2_ring_metadata is None or state_metadata.c2_metadata_group_id is None:
                 raise RuntimeError("V4.1 ring compressor metadata is missing")
             wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
-            hidden_states_fp32 = hidden_states.float()
-            kv = compressor.wkv(hidden_states_fp32)
-            score = compressor.wgate(hidden_states_fp32)
-            latent = compressor.pool_projected(kv, score, state_metadata)
+            latent = compressor.pool_projected(hidden_states, state_metadata)
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
             if source_cos is None or source_sin is None:
@@ -498,12 +497,45 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        # TODO weicheng
-        # scatter_cache_v2(
-        #     attn.long_kv_cache.kv_cache[0],
-        #     long_slots,
-        #     latent.squeeze(1),
-        # )
+        if attn.long_kv_cache.kv_cache[0].dtype == torch.uint8:
+            # A5 quantized path: the epilog op packs mxfp4 rows into the
+            # flat uint8 view and expects the RoPE dims first.
+            try:
+                import custom_ops  # noqa: F401  registers torch.ops.custom.*
+            except ImportError as exc:
+                raise RuntimeError(
+                    "DeepSeek V4.1 compressed-KV store requires the custom_ops module "
+                    "registering torch.ops.custom.kv_compress_epilog_v2."
+                ) from exc
+            cache_2d = attn.long_kv_cache.kv_cache[0]
+            rows_per_block = compressor_metadata.cache.block_stride_rows
+            valid_mask = long_slots[:, 0] >= 0
+            flat_slots = torch.where(
+                valid_mask,
+                long_slots[:, 0] * rows_per_block + long_slots[:, 1],
+                -1,
+            ).to(torch.int32)
+            _kv_rows = latent.squeeze(1).contiguous()
+            _nope_dim = attn.nope_head_dim
+            _kv_rows_reordered = torch.cat(
+                [_kv_rows[:, _nope_dim:], _kv_rows[:, :_nope_dim]],
+                dim=-1,
+            ).contiguous()
+            torch.ops.custom.kv_compress_epilog_v2(
+                cache_2d,
+                _kv_rows_reordered,
+                flat_slots,
+                quant_group_size=MXFP4_QUANT_GROUP_SIZE,
+                quant_mode="mxfp4_bf16",
+                round_scale=True,
+                x_scale=1.0,
+            )
+        else:
+            scatter_cache_v2(
+                attn.long_kv_cache.kv_cache[0],
+                long_slots,
+                latent.squeeze(1),
+            )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
         if not self.role.has_long_context:
@@ -1054,6 +1086,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 c2_source_cos = self._c2_source_cos[:num_input_tokens]
                 c2_source_sin = self._c2_source_sin[:num_input_tokens]
             c2_metadata_group_id = id(self._c2_complete_mask)
+        block_stride_rows = 0
+        if cache_kind == "long_kv" and isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
+            block_stride_rows = (getattr(spec, "page_size_padded", None) or 0) // spec.head_size
         return DeepseekV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
             slot_mapping=slots,
@@ -1061,6 +1096,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             storage_block_size=spec.storage_block_size,
             is_compressor_state=is_compressor_state,
             cache_kind=cache_kind,
+            block_stride_rows=block_stride_rows,
             positions=positions,
             cos=cos,
             sin=sin,
