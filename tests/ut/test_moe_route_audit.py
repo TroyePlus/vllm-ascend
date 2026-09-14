@@ -1,4 +1,5 @@
 """Standalone: python tests/ut/test_moe_route_audit.py (no NPU allocation)."""
+
 import contextlib
 import io
 import json
@@ -26,8 +27,14 @@ class RouteAuditTest(unittest.TestCase):
         self.stack.enter_context(patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT_PROFILE", False))
         self.stack.enter_context(patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT_LIMIT", 2))
         self.config = NS(_moe_audit_state=dict(seen=audit.Counter(), sequence=0, config_printed=True))
-        self.ctx = NS(num_tokens=256, max_tokens_across_dp=256, pad_size=0,
-                      in_profile_run=False, is_draft_model=False, moe_comm_type=NS(name="ALLGATHER"))
+        self.ctx = NS(
+            num_tokens=256,
+            max_tokens_across_dp=256,
+            pad_size=0,
+            in_profile_run=False,
+            is_draft_model=False,
+            moe_comm_type=NS(name="ALLGATHER"),
+        )
 
     def run_forward(self):
         return audit.audit_forward(self.config, self.ctx, 256, 256, None, False)
@@ -38,35 +45,38 @@ class RouteAuditTest(unittest.TestCase):
             for _ in range(5):
                 with self.run_forward():
                     pass
-        events = [json.loads(line.split("[MOE_AUDIT] ")[1])["event"]
-                  for line in output.getvalue().splitlines()]
+        events = [json.loads(line.split("[MOE_AUDIT] ")[1])["event"] for line in output.getvalue().splitlines()]
         self.assertEqual(events, ["SELECT", "END", "SELECT", "END"])
-        with patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT", False):
-            with self.run_forward():
-                pass
+        with patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT", False), self.run_forward():
+            pass
         self.assertEqual(self.config._moe_audit_state["sequence"], 5)
 
     def test_exception_preserved_and_no_tensor_reads(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(ValueError, "original"):
-                with self.run_forward():
-                    raise ValueError("original")
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "original"),
+            self.run_forward(),
+        ):
+            raise ValueError("original")
+
         class TensorLike:
             def item(self):
                 raise AssertionError("must not read tensor")
+
         self.assertEqual(audit._plain(TensorLike()), "TensorLike")
 
     def test_fullgraph_and_profiler_boundary(self):
         graphs = []
+
         def backend(gm, inputs):
             graphs.append(gm)
             return gm.forward
+
         fn = torch.compile(lambda x: x * 2 + 1, backend=backend, fullgraph=True)
-        with patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT_PROFILE", True):
-            with contextlib.redirect_stdout(io.StringIO()):
-                for _ in range(2):
-                    with self.run_forward():
-                        torch.testing.assert_close(fn(torch.ones(4)), torch.full((4,), 3.0))
+        with patch.object(audit.envs, "VLLM_ASCEND_MOE_AUDIT_PROFILE", True), contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                with self.run_forward():
+                    torch.testing.assert_close(fn(torch.ones(4)), torch.full((4,), 3.0))
         self.assertEqual(len(graphs), 1)
 
 

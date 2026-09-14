@@ -1,4 +1,5 @@
 """Standalone stdlib-only test of compact log parsing."""
+
 import contextlib
 import importlib.util
 import io
@@ -24,8 +25,10 @@ class FilterTest(unittest.TestCase):
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as temp:
             log = Path(temp) / "prefill.log"
-            log.write_text("\n".join("(Worker) [MOE_AUDIT] " + json.dumps(row) for row in rows)
-                           + '\n[MOE_AUDIT] {broken\n[MOE_AUDIT] {"not_event":1}\n')
+            log.write_text(
+                "\n".join("(Worker) [MOE_AUDIT] " + json.dumps(row) for row in rows)
+                + '\n[MOE_AUDIT] {broken\n[MOE_AUDIT] {"not_event":1}\n'
+            )
             with contextlib.redirect_stdout(output):
                 module.summarize([log])
         text = output.getvalue()
