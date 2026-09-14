@@ -28,6 +28,7 @@ class FilterTest(unittest.TestCase):
             log.write_text(
                 "\n".join("(Worker) [MOE_AUDIT] " + json.dumps(row) for row in rows)
                 + '\n[MOE_AUDIT] {broken\n[MOE_AUDIT] {"not_event":1}\n'
+                + "(Worker pid=123) Enter external FX backend graph_id=1 pid=123; saved\n"
             )
             with contextlib.redirect_stdout(output):
                 module.summarize([log])
@@ -36,6 +37,7 @@ class FilterTest(unittest.TestCase):
         self.assertIn("ranks=0/0/0,0/1/1", text)
         self.assertIn("missing_END", text)
         self.assertIn("route=ALLTOALL", text)
+        self.assertIn('"external_backend_entries_by_pid": {"123": 1}', text)
 
     def test_no_records_fails_visibly(self):
         with tempfile.TemporaryDirectory() as temp:
