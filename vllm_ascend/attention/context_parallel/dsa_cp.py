@@ -1261,7 +1261,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     # o = torch.einsum("tgd,grd->tgr", o, wo_a)
                     o_proj_input = torch_npu.npu_transpose_batchmatmul(
                         o_proj_input,
-                        self.wo_a.weight,
+                        self.wo_a.weight.view(
+                            o_proj_groups, -1, o_proj_input.shape[2]
+                        ).transpose(1, 2),
                         bias=None,
                         scale=None,
                         perm_x1=(1, 0, 2),
