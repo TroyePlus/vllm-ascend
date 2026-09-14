@@ -11,10 +11,11 @@ import torch
 import custom_ops
 import cann_ops_transformer
 from safetensors import safe_open
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
+from vllm.logger import logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -40,9 +41,13 @@ from vllm_ascend.models.deepseek_v4.model import (
 )
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
-from .engram_gate import engram_gate
-from .engram_hash import PagedNgramHistory
-from .engram_hbm import EngramQueryGroup, NodeShardedEngram
+from .engram import AscendEngram
+from .engram_hash import NgramHashState
+from .engram_offload import (
+    ElasticEngramEmbedding,
+    EngramTableState,
+    create_engram_process_group,
+)
 from .indexer import DeepseekV41Indexer
 
 @dataclass(frozen=True)
@@ -377,22 +382,9 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         config = vllm_config.model_config.hf_config
         engram_enabled = get_ascend_config().enable_engram
         quant_config = vllm_config.quant_config
-        if engram_enabled and self.layer_idx in config.engram_layer_ids:
-            self.engram = torch.nn.Module()
-            self.engram.wkv = ReplicatedLinear(
-                (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
-                (config.hc_mult + 1) * config.hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.wkv",
-                return_bias=False
-            )
-            self.engram.q_weight = torch.nn.Parameter(
-                torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
-            )
-            self.engram.k_weight = torch.nn.Parameter(
-                torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
-            )
+        is_draft_layer = bool(kwargs.get("is_draft_layer", False))
+        if engram_enabled and not is_draft_layer and self.layer_idx in config.engram_layer_ids:
+            self.engram = AscendEngram(config, quant_config, prefix)
         else:
             self.engram = None
         self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
@@ -454,12 +446,23 @@ class DeepseekV41Model(DeepseekV4Model):
     decoder_layer_cls = DeepseekV41DecoderLayer
 
     def __init__(self, *, vllm_config, prefix=""):
-        if (
-            get_ascend_config().enable_engram
-            and vllm_config.load_config.load_format != "dummy"
-            and vllm_config.load_config.safetensors_load_strategy != "lazy"
-        ):
-            raise ValueError("Engram HBM shards require --safetensors-load-strategy lazy")
+        ascend_config = get_ascend_config()
+        if ascend_config.enable_engram:
+            hf_config = vllm_config.model_config.hf_config
+            logger.info(
+                "FOR-ENGRAM model initialization started: model=%s prefix=%s layers=%s engram_tp_size=%d storage=%s",
+                vllm_config.model_config.model,
+                prefix,
+                getattr(hf_config, "engram_layer_ids", None),
+                ascend_config.engram_tp_size,
+                ascend_config.engram_storage,
+            )
+            if not ascend_config.enable_engram_offload:
+                raise NotImplementedError("The synchronous Engram milestone requires enable_engram_offload=True")
+            if vllm_config.load_config.load_format == "dummy":
+                raise ValueError("Engram offload cannot be initialized from dummy weights")
+            if vllm_config.load_config.safetensors_load_strategy != "lazy":
+                raise ValueError("Engram offload requires --safetensors-load-strategy lazy")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
@@ -489,83 +492,126 @@ class DeepseekV41Model(DeepseekV4Model):
                 layer.self_attn.shared_state = self.shared_attention_state
         self.engram_root = vllm_config.model_config.model
         config = self.config
-        # Target storage is a loader/runtime choice.  Checkpoint metadata is
-        # used only by load_checkpoint to validate the source representation.
-        # Read the storage choice after AscendConfig validation.
-        ascend_config = get_ascend_config()
-        storage_format = ascend_config.engram_storage
+        self.engram_hash = None
         if ascend_config.enable_engram:
-            query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
-            for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
-                self.layers[layer_id].engram.embed = NodeShardedEngram(
+            root = Path(self.engram_root)
+            if not root.is_dir():
+                raise ValueError("Engram lazy loading requires a local model directory")
+            with torch.device("cpu"):
+                tokenizer = AutoTokenizer.from_pretrained(
+                    root,
+                    trust_remote_code=getattr(
+                        vllm_config.model_config,
+                        "trust_remote_code",
+                        False,
+                    ),
+                )
+                engram_hash = NgramHashState(config, tokenizer)
+            self.engram_hash = engram_hash.to(self.topk_indices_buffer.device)
+            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
+                group, owns_group = create_engram_process_group(
+                    ascend_config.engram_tp_size,
+                    layer_id=layer_id,
+                    expected_world_size=int(
+                        vllm_config.parallel_config.world_size_across_dp
+                    ),
+                )
+                self.layers[layer_id].engram.embed = ElasticEngramEmbedding(
                     rows,
                     config.engram_head_dim,
-                    query_group,
-                    storage_format=storage_format,
+                    ascend_config.engram_tp_size,
+                    group=group,
+                    owns_group=owns_group,
+                    layer_id=layer_id,
+                    storage_format=ascend_config.engram_storage,
+                    minimum_rows=self.engram_hash.required_num_embeddings[slot],
+                    device=self.topk_indices_buffer.device,
                 )
-        self.engram_history = None
         self._engram_input_buffers = None
         self._engram_max_tokens = max(
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
-        self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
-        # TODO geyi
-        # if ascend_config.enable_engram and vllm_config.load_config.load_format != "dummy":
-        #     with torch.device("cpu"):
-        #         tokenizer = AutoTokenizer.from_pretrained(self.engram_root)
-        #         self.engram_history = PagedNgramHistory(config, tokenizer)
-        #         with safe_open(Path(self.engram_root) / "optional/quarot.safetensors", framework="pt") as file:
-        #             rotation = file.get_tensor("global_rotation")
-        #         block = rotation[:32, :32].contiguous()
-        #         if not torch.equal(rotation, torch.block_diag(*[block] * (config.hidden_size // 32))):
-        #             raise ValueError("Engram gate requires repeated block32 global rotation")
-        #     self.engram_rotation.copy_(block)
+        if ascend_config.enable_engram:
+            logger.info(
+                "FOR-ENGRAM model initialization completed: layers=%s max_graph_tokens=%d device=%s",
+                config.engram_layer_ids,
+                self._engram_max_tokens,
+                self.topk_indices_buffer.device,
+            )
 
-    def prepare_engram(self, input_ids, positions):
-        """Eager boundary: every DP participates, including metadata-free dummies."""
+    def prepare_engram(
+        self,
+        input_ids,
+        positions,
+        query_start_loc=None,
+        lookback_token_ids=None,
+        lookback_dead_mask=None,
+        current_dead_mask=None,
+    ):
+        """Hash and synchronously fetch embeddings outside the model graph."""
         config = self.config
         if not get_ascend_config().enable_engram:
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
-        columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
-        hashes = torch.empty((0, len(config.engram_layer_ids), columns), dtype=torch.int64, device="cpu")
-        mask = torch.empty(0, dtype=torch.bool, device="cpu")
-        metadata = get_forward_context().attn_metadata
-        if metadata is not None and self.engram_history is not None:
+        if input_ids is None or self.engram_hash is None:
+            raise ValueError("Engram requires raw input token IDs")
+        if query_start_loc is None:
+            metadata = get_forward_context().attn_metadata
+            if metadata is None:
+                raise ValueError("Engram requires query_start_loc for every synchronous batch")
             first = self.layers[0].self_attn.dsa_attn.swa_cache_layer
             meta = metadata[first.prefix]
-            boundaries = (
+            query_start_loc = (
                 meta.query_start_loc_cpu
                 if getattr(meta, "query_start_loc_cpu", None) is not None
                 else meta.query_start_loc.detach().cpu()
             ).long()
-            n = int(boundaries[-1])
-            requests = torch.repeat_interleave(torch.arange(len(boundaries) - 1, device="cpu"), boundaries.diff())
-            hashes, mask = self.engram_history.update(
-                input_ids[:n].cpu().long(),
-                positions[:n].cpu().long(),
-                requests,
-                (
-                    meta.block_table_cpu
-                    if getattr(meta, "block_table_cpu", None) is not None
-                    else meta.block_table.detach().cpu()
-                ),
-                meta.storage_block_size,
-            )
+        n = int(query_start_loc[-1])
+        current_ids = input_ids[:n]
+        if current_dead_mask is not None:
+            current_dead_mask = current_dead_mask[:n]
+        hashes, mask = self.engram_hash(
+            current_ids,
+            positions[:n],
+            query_start_loc,
+            dead_mask=current_dead_mask,
+            lookback_token_ids=lookback_token_ids,
+            lookback_dead_mask=lookback_dead_mask,
+        )
         lookups = {}
-        tables = [self.layers[layer_id].engram.embed for layer_id in config.engram_layer_ids]
-        ids_list = [hashes[:, slot] for slot in range(len(tables))]
-        if hasattr(tables[0], "route_many"):
-            routed = tables[0].route_many(tables, ids_list)
-        else:
-            routed = [table(ids) for table, ids in zip(tables, ids_list)]
-        for layer_id, values in zip(config.engram_layer_ids, routed):
-            lookups[layer_id] = values.flatten(1)
-        return lookups, mask.to(positions.device)
+        for slot, layer_id in enumerate(config.engram_layer_ids):
+            lookups[layer_id] = self.layers[layer_id].engram.lookup(hashes[:, slot])
+        return lookups, mask
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+    def prepare_engram_inputs(
+        self,
+        input_ids,
+        positions,
+        padded_tokens=None,
+        query_start_loc=None,
+        lookback_token_ids=None,
+        lookback_dead_mask=None,
+        current_dead_mask=None,
+    ):
         """Refresh persistent inputs before main-model capture or replay."""
-        lookups, mask = self.prepare_engram(input_ids, positions)
+        engram_enabled = get_ascend_config().enable_engram
+        num_requests = 0 if query_start_loc is None else query_start_loc.numel() - 1
+        try:
+            lookups, mask = self.prepare_engram(
+                input_ids,
+                positions,
+                query_start_loc=query_start_loc,
+                lookback_token_ids=lookback_token_ids,
+                lookback_dead_mask=lookback_dead_mask,
+                current_dead_mask=current_dead_mask,
+            )
+        except BaseException:
+            if engram_enabled:
+                logger.exception(
+                    "FOR-ENGRAM synchronous hash/fetch failed: requests=%d",
+                    num_requests,
+                )
+            raise
         num_tokens = positions.shape[0]
         # The compiled V4.1 backbone uses the scheduler's static token
         # capacity for decode graphs (typically max_num_batched_tokens), even
@@ -629,14 +675,9 @@ class DeepseekV41Model(DeepseekV4Model):
                 # model's actual token dimension remains scheduler-dynamic.
                 lookup = lookups[layer.layer_idx][:n]
                 active_mask = token_mask[:n]
-                kv = layer.engram.wkv(lookup)
-                key, value = kv.split([self.hc_mult * self.config.hidden_size, self.config.hidden_size], -1)
-                hidden_states[:n] = engram_gate(
+                hidden_states[:n] = layer.engram.apply_lookup(
                     hidden_states[:n],
-                    key.view(n, self.hc_mult, self.config.hidden_size),
-                    value,
-                    layer.engram.q_weight.float() * layer.engram.k_weight.float(),
-                    self.engram_rotation,
+                    lookup,
                     active_mask,
                     self.config.rms_norm_eps,
                 )
@@ -648,6 +689,65 @@ class DeepseekV41Model(DeepseekV4Model):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def offload_weights(self, checkpoint_keys: dict[int, str]):
+        if self.engram_hash is None:
+            return
+        logger.info(
+            "FOR-ENGRAM model offload started: layers=%s",
+            self.config.engram_layer_ids,
+        )
+        try:
+            for layer_id in self.config.engram_layer_ids:
+                embedding = self.layers[layer_id].engram.embed
+                if embedding.state is EngramTableState.READY:
+                    continue
+                if embedding.state is EngramTableState.EMPTY:
+                    try:
+                        checkpoint_key = checkpoint_keys[layer_id]
+                    except KeyError as exc:
+                        raise ValueError(f"Missing Engram checkpoint key for layer {layer_id}") from exc
+                    embedding.load_checkpoint(self.engram_root, checkpoint_key)
+                embedding.offload_weights()
+        except BaseException:
+            logger.exception("FOR-ENGRAM model offload failed; destroying initialized resources")
+            try:
+                self.destroy_engram()
+            except BaseException:
+                logger.exception(
+                    "FOR-ENGRAM model offload cleanup also failed; preserving "
+                    "the original offload error"
+                )
+            raise
+        logger.info(
+            "FOR-ENGRAM model offload completed: layers=%s",
+            self.config.engram_layer_ids,
+        )
+
+    def destroy_engram(self):
+        if self.engram_hash is None:
+            return
+        logger.debug(
+            "FOR-ENGRAM model destroy started: layers=%s",
+            self.config.engram_layer_ids,
+        )
+        first_error = None
+        for layer_id in reversed(self.config.engram_layer_ids):
+            try:
+                self.layers[layer_id].engram.embed.destroy()
+            except BaseException as exc:
+                logger.exception(
+                    "FOR-ENGRAM table destroy failed during model cleanup: layer=%d",
+                    layer_id,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            logger.error("FOR-ENGRAM model destroy completed with errors")
+            raise RuntimeError(
+                "One or more Engram tables failed to destroy"
+            ) from first_error
+        logger.debug("FOR-ENGRAM model destroy completed")
+
 
 class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     model_cls = DeepseekV41Model
@@ -655,8 +755,34 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     _DEFERRED_WEIGHT_MARKERS = ()
     _DEFERRED_WEIGHT_PREFIXES = ("aligner.", "vision.", "image_", "mtp.")
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
-        return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens)
+    def prepare_engram_inputs(
+        self,
+        input_ids,
+        positions,
+        padded_tokens=None,
+        query_start_loc=None,
+        lookback_token_ids=None,
+        lookback_dead_mask=None,
+        current_dead_mask=None,
+    ):
+        return self.model.prepare_engram_inputs(
+            input_ids,
+            positions,
+            padded_tokens,
+            query_start_loc=query_start_loc,
+            lookback_token_ids=lookback_token_ids,
+            lookback_dead_mask=lookback_dead_mask,
+            current_dead_mask=current_dead_mask,
+        )
+
+    def offload_weights(self):
+        checkpoint_keys = getattr(self, "_engram_checkpoint_keys", None)
+        if checkpoint_keys is None:
+            raise RuntimeError("Engram checkpoint keys were not registered before offload")
+        self.model.offload_weights(checkpoint_keys)
+
+    def destroy_engram(self):
+        self.model.destroy_engram()
 
     def forward(
         self,
@@ -685,33 +811,55 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if not get_ascend_config().enable_engram:
             return super().load_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
-        engram_loaded = set()
+        logger.info(
+            "FOR-ENGRAM checkpoint weight loading started: expected_layers=%s",
+            self.model.config.engram_layer_ids,
+        )
+        checkpoint_keys: dict[int, str] = {}
 
         def milestone_weights() -> Iterator[tuple[str, torch.Tensor]]:
             for name, tensor in weights:
-                if ".engram." in name:
-                    # Bypass V4's generic embed -> embed_tokens remapping and TP loader.
-                    local_name = name.removeprefix("model.")
-                    # FP8/MXFP8 Engram scales are consumed by the CPU loader.
-                    if local_name.endswith(".engram.embed.scale"):
-                        continue
-                    parameter_name = "model." + local_name
-                    if parameter_name.endswith(".scale"):
-                       parameter_name = parameter_name.replace(".scale", ".weight_scale")
-                    if local_name.endswith(".engram.embed.weight"):
-                        layer_id = int(local_name.split(".")[1])
-                        self.model.layers[layer_id].engram.embed.load_checkpoint(self.model.engram_root, local_name)
-                    else:
-                        param = self.get_parameter(parameter_name)
-                        if tensor.shape != param.shape:
-                            raise ValueError(f"Unexpected BF16 Engram parameter: {name}")
-                        param.data.copy_(tensor)
-                    engram_loaded.add(parameter_name)
-                elif self._is_milestone_weight(name):
+                if name.endswith(".engram.embed.scale"):
+                    # Consumed together with the FP8 table by load_checkpoint.
+                    continue
+                if name.endswith(".engram.embed.weight"):
+                    parts = name.split(".")
+                    try:
+                        layer_id = int(parts[parts.index("layers") + 1])
+                    except (ValueError, IndexError) as exc:
+                        raise ValueError(f"Cannot determine Engram layer from {name}") from exc
+                    if layer_id in checkpoint_keys:
+                        raise ValueError(f"Duplicate Engram embedding table for layer {layer_id}")
+                    checkpoint_keys[layer_id] = name
+                    continue
+                if self._is_milestone_weight(name):
                     yield name, tensor
 
-        loaded = super().load_weights(milestone_weights())
-        expected = {name for name, _ in self.named_parameters() if ".engram." in name}
-        if engram_loaded != expected:
-            raise ValueError(f"Missing Engram weights: {expected - engram_loaded}")
-        return loaded | engram_loaded
+        try:
+            loaded = super().load_weights(milestone_weights())
+            expected_tables = set(self.model.config.engram_layer_ids)
+            loaded_tables = set(checkpoint_keys)
+            if loaded_tables != expected_tables:
+                logger.error(
+                    "FOR-ENGRAM checkpoint weight loading incomplete: missing_layers=%s unexpected_layers=%s",
+                    expected_tables - loaded_tables,
+                    loaded_tables - expected_tables,
+                )
+                raise ValueError(
+                    "Engram embedding table mismatch: "
+                    f"missing={expected_tables - loaded_tables}, "
+                    f"unexpected={loaded_tables - expected_tables}"
+                )
+            self._engram_checkpoint_keys = checkpoint_keys
+        except BaseException:
+            logger.exception("FOR-ENGRAM checkpoint loading failed; destroying table resources")
+            try:
+                self.model.destroy_engram()
+            except BaseException:
+                logger.exception("FOR-ENGRAM checkpoint failure cleanup also failed")
+            raise
+        logger.info(
+            "FOR-ENGRAM checkpoint weight loading completed: layers=%s",
+            sorted(loaded_tables),
+        )
+        return loaded

@@ -219,12 +219,31 @@ class AscendDeepseekV41ForConditionalGeneration(
             is_multimodal=is_multimodal,
         )
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+    def prepare_engram_inputs(
+        self,
+        input_ids,
+        positions,
+        padded_tokens=None,
+        query_start_loc=None,
+        lookback_token_ids=None,
+        lookback_dead_mask=None,
+        current_dead_mask=None,
+    ):
         return self.language_model.prepare_engram_inputs(
             input_ids,
             positions,
             padded_tokens,
+            query_start_loc=query_start_loc,
+            lookback_token_ids=lookback_token_ids,
+            lookback_dead_mask=lookback_dead_mask,
+            current_dead_mask=current_dead_mask,
         )
+
+    def offload_weights(self):
+        self.language_model.offload_weights()
+
+    def destroy_engram(self):
+        self.language_model.destroy_engram()
 
     def forward(
         self,

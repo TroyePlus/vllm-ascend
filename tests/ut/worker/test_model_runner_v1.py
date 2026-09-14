@@ -1376,6 +1376,100 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
 
         self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 33, -1])
 
+    def test_engram_snapshots_current_placeholder_mask_before_sanitization(self):
+        class _Buffer:
+            def __init__(self, shape, dtype):
+                self.np = np.empty(shape, dtype=dtype)
+                torch_dtype = (
+                    torch.bool
+                    if np.dtype(dtype) == np.dtype(np.bool_)
+                    else torch.int64
+                )
+                self.gpu = torch.empty(shape, dtype=torch_dtype)
+
+            def copy_to_gpu(self, size):
+                self.gpu[:size].copy_(torch.from_numpy(self.np[:size]))
+
+        runner = self._build_runner()
+        runner.engram_lookback_depth = 3
+        runner.engram_lookback_token_ids = _Buffer((1, 3), np.int64)
+        runner.engram_lookback_dead_mask = _Buffer((1, 3), np.bool_)
+        runner.engram_current_dead_mask = _Buffer((4,), np.bool_)
+        runner.input_ids = SimpleNamespace(
+            cpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
+            gpu=torch.tensor([11, -1, 33, -1], dtype=torch.int32),
+        )
+        runner.input_batch = SimpleNamespace(
+            req_ids=["req0"],
+            token_ids_cpu=np.array([[99, 99, 99, 99]], dtype=np.int32),
+            num_computed_tokens_cpu=np.array([2], dtype=np.int32),
+        )
+        runner.requests = {
+            "req0": SimpleNamespace(
+                prompt_token_ids=[7, 8, 11],
+                output_token_ids=[],
+                mm_features=[],
+            )
+        }
+        runner.model_config.hf_config = SimpleNamespace(
+            image_token_id=4,
+            image_pad_token_id=5,
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_spec_decode_tokens={"req0": [-1]},
+        )
+
+        runner._prepare_engram_history(num_reqs=1, num_tokens=4)
+        runner._sanitize_placeholder_input_ids_for_forward(
+            scheduler_output,
+            num_forward_tokens=4,
+        )
+
+        self.assertEqual(
+            runner.engram_current_dead_mask.gpu.tolist(),
+            [False, True, False, True],
+        )
+        self.assertEqual(
+            runner.engram_lookback_token_ids.gpu.tolist(),
+            [[8, 7, -1]],
+        )
+        self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 33, 0])
+        self.assertEqual(runner._engram_num_tokens, 4)
+
+    def test_engram_history_rejects_prompt_embeddings_without_token_ids(self):
+        class _Buffer:
+            def __init__(self, shape, dtype):
+                self.np = np.empty(shape, dtype=dtype)
+                self.gpu = torch.empty(shape)
+
+            def copy_to_gpu(self, size):
+                del size
+
+        runner = self._build_runner()
+        runner.engram_lookback_depth = 3
+        runner.engram_lookback_token_ids = _Buffer((1, 3), np.int64)
+        runner.engram_lookback_dead_mask = _Buffer((1, 3), np.bool_)
+        runner.engram_current_dead_mask = _Buffer((1,), np.bool_)
+        runner.input_ids = SimpleNamespace(cpu=torch.tensor([11]))
+        runner.input_batch = SimpleNamespace(
+            req_ids=["req0"],
+            num_computed_tokens_cpu=np.array([0], dtype=np.int32),
+        )
+        runner.requests = {
+            "req0": SimpleNamespace(
+                prompt_token_ids=None,
+                output_token_ids=[],
+                mm_features=[],
+            )
+        }
+        runner.model_config.hf_config = SimpleNamespace(
+            image_token_id=4,
+            image_pad_token_id=5,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires original token IDs"):
+            runner._prepare_engram_history(num_reqs=1, num_tokens=1)
+
     def test_mtp3_placeholder_metadata_is_preserved_before_sanitizing_forward(self):
         runner = self._build_runner()
         runner.arange_np = np.arange(8, dtype=np.int32)

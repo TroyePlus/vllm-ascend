@@ -368,6 +368,70 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.engram_enabled = self.ascend_config.enable_engram
+        self.engram_lookback_depth = 0
+        self.engram_lookback_token_ids = None
+        self.engram_lookback_dead_mask = None
+        self.engram_current_dead_mask = None
+        self._engram_num_reqs = 0
+        self._engram_num_tokens = 0
+        if self.engram_enabled:
+            from vllm_ascend.device.device_config import is_950
+
+            if self.enable_prompt_embeds:
+                logger.error(
+                    "FOR-ENGRAM runner initialization failed: prompt embeddings "
+                    "do not provide authoritative token IDs"
+                )
+                raise NotImplementedError(
+                    "Synchronous Engram does not support --enable-prompt-embeds"
+                )
+            if self.use_async_scheduling or self.use_async_spec_decode:
+                raise NotImplementedError(
+                    "Engram async scheduling/spec decode requires the Phase 2 slot cache"
+                )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_dspark()
+            ):
+                raise NotImplementedError("Engram with DSpark is not supported yet")
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method != "mtp"
+            ):
+                raise NotImplementedError(
+                    "Synchronous Engram currently supports only MTP speculative decoding"
+                )
+            if not is_950():
+                raise NotImplementedError("ElasticBuffer Engram offload requires Ascend 950")
+            self.engram_lookback_depth = int(hf_config.engram_max_ngram_size) - 1
+            if self.engram_lookback_depth < 1:
+                raise ValueError("Engram max_ngram_size must be at least 2")
+            self.engram_lookback_token_ids = self._make_buffer(
+                self.max_num_reqs,
+                self.engram_lookback_depth,
+                dtype=torch.int64,
+            )
+            self.engram_lookback_dead_mask = self._make_buffer(
+                self.max_num_reqs,
+                self.engram_lookback_depth,
+                dtype=torch.bool,
+            )
+            self.engram_current_dead_mask = self._make_buffer(
+                max(
+                    self.max_num_tokens,
+                    self.compilation_config.max_cudagraph_capture_size or 0,
+                ),
+                dtype=torch.bool,
+            )
+            logger.info(
+                "FOR-ENGRAM runner initialized: lookback_depth=%d "
+                "max_requests=%d max_tokens=%d engram_tp_size=%d",
+                self.engram_lookback_depth,
+                self.max_num_reqs,
+                self.engram_current_dead_mask.gpu.shape[0],
+                self.ascend_config.engram_tp_size,
+            )
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -1583,11 +1647,112 @@ class NPUModelRunner(GPUModelRunner):
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
+        if self.engram_enabled:
+            self._prepare_engram_history(num_reqs, total_num_scheduled_tokens)
+
         return (
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
         )
+
+    def _prepare_engram_history(self, num_reqs: int, num_tokens: int) -> None:
+        """Stage raw lookback tokens and current placeholder barriers."""
+        token_buffer = self.engram_lookback_token_ids
+        dead_buffer = self.engram_lookback_dead_mask
+        current_dead_buffer = self.engram_current_dead_mask
+        assert (
+            token_buffer is not None
+            and dead_buffer is not None
+            and current_dead_buffer is not None
+        )
+        tokens = token_buffer.np[:num_reqs]
+        dead = dead_buffer.np[:num_reqs]
+        from vllm_ascend.models.deepseek_v41.engram_hash import (
+            EngramTokenSequence,
+            build_lookback_token_ids,
+        )
+
+        config = self.model_config.hf_config
+        image_token_id = int(config.image_token_id)
+        image_pad_token_id = int(
+            getattr(config, "image_pad_token_id", image_token_id + 1)
+        )
+        histories = []
+        image_spans = []
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            request = self.requests[req_id]
+            if request.prompt_token_ids is None:
+                logger.error(
+                    "FOR-ENGRAM request has prompt embeddings without original "
+                    "token IDs: request_id=%s",
+                    req_id,
+                )
+                raise ValueError(
+                    "Engram requires original token IDs alongside prompt embeddings"
+                )
+            histories.append(
+                EngramTokenSequence(
+                    request.prompt_token_ids,
+                    request.output_token_ids,
+                )
+            )
+            image_spans.append(
+                [
+                    (feature.mm_position.offset, feature.mm_position.length)
+                    for feature in (request.mm_features or ())
+                ]
+            )
+
+        staged_tokens, staged_dead = build_lookback_token_ids(
+            histories,
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            self.engram_lookback_depth,
+            image_token_id,
+            image_pad_token_id,
+            image_spans=image_spans,
+        )
+        tokens[:] = staged_tokens
+        dead[:] = staged_dead
+        token_buffer.copy_to_gpu(num_reqs)
+        dead_buffer.copy_to_gpu(num_reqs)
+        np.equal(
+            self.input_ids.cpu[:num_tokens].numpy(),
+            PLACEHOLDER_TOKEN_ID,
+            out=current_dead_buffer.np[:num_tokens],
+        )
+        current_dead_buffer.copy_to_gpu(num_tokens)
+        self._engram_num_reqs = num_reqs
+        self._engram_num_tokens = num_tokens
+
+    def _prepare_dummy_engram_history(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        num_tokens_padded: int,
+    ) -> None:
+        token_buffer = self.engram_lookback_token_ids
+        dead_buffer = self.engram_lookback_dead_mask
+        current_dead_buffer = self.engram_current_dead_mask
+        assert (
+            token_buffer is not None
+            and dead_buffer is not None
+            and current_dead_buffer is not None
+        )
+        token_buffer.np[:num_reqs].fill(-1)
+        dead_buffer.np[:num_reqs].fill(True)
+        token_buffer.copy_to_gpu(num_reqs)
+        dead_buffer.copy_to_gpu(num_reqs)
+        current_dead_buffer.np[:num_tokens_padded].fill(False)
+        current_dead_buffer.copy_to_gpu(num_tokens_padded)
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = np.cumsum(
+            num_scheduled_tokens[:num_reqs],
+            dtype=np.int32,
+        )
+        self.input_ids.gpu[:num_tokens_padded].zero_()
+        self._engram_num_reqs = num_reqs
+        self._engram_num_tokens = num_tokens_padded
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
@@ -3028,7 +3193,28 @@ class NPUModelRunner(GPUModelRunner):
         # or replay; only its persistent BF16 inputs enter the model graph.
         prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
         if prepare_engram is not None:
-            model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded))
+            engram_kwargs = {}
+            if self.engram_enabled:
+                num_reqs = self._engram_num_reqs
+                assert self.engram_lookback_token_ids is not None
+                assert self.engram_lookback_dead_mask is not None
+                assert self.engram_current_dead_mask is not None
+                engram_kwargs = {
+                    "query_start_loc": self.query_start_loc.cpu[: num_reqs + 1],
+                    "lookback_token_ids": self.engram_lookback_token_ids.gpu[:num_reqs],
+                    "lookback_dead_mask": self.engram_lookback_dead_mask.gpu[:num_reqs],
+                    "current_dead_mask": self.engram_current_dead_mask.gpu[
+                        : self._engram_num_tokens
+                    ],
+                }
+            model_inputs.update(
+                prepare_engram(
+                    input_ids,
+                    positions,
+                    num_tokens_padded,
+                    **engram_kwargs,
+                )
+            )
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
@@ -3922,6 +4108,13 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            if self.engram_enabled:
+                self._prepare_dummy_engram_history(
+                    num_reqs,
+                    num_scheduled_tokens,
+                    num_tokens_padded,
+                )
+
             active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_runtime_mode)
             with set_ascend_forward_context(
                 attn_metadata,
@@ -4032,6 +4225,11 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
+        if self.engram_enabled:
+            logger.info(
+                "FOR-ENGRAM runner model loading started: model=%s",
+                self.model_config.model,
+            )
 
         if self.ascend_config.mix_placement:
             # TODO: Enabling the mix placement in deepseek_v2.py
@@ -4047,7 +4245,29 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            try:
+                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            except BaseException:
+                if self.engram_enabled:
+                    logger.exception(
+                        "FOR-ENGRAM runner model construction or checkpoint loading failed"
+                    )
+                raise
+            if self.engram_enabled:
+                offload_weights = getattr(self.model, "offload_weights", None)
+                if not callable(offload_weights):
+                    logger.error(
+                        "FOR-ENGRAM runner model loading failed: "
+                        "offload_weights is not implemented"
+                    )
+                    raise RuntimeError("Engram model does not implement offload_weights()")
+                logger.info("FOR-ENGRAM runner ElasticBuffer offload started")
+                try:
+                    offload_weights()
+                except BaseException:
+                    logger.exception("FOR-ENGRAM runner ElasticBuffer offload failed")
+                    raise
+                logger.info("FOR-ENGRAM runner ElasticBuffer offload completed")
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
@@ -4175,6 +4395,30 @@ class NPUModelRunner(GPUModelRunner):
             "Model runner load_model total time: %.2f seconds",
             load_model_total_time,
         )
+        if self.engram_enabled:
+            logger.info(
+                "FOR-ENGRAM runner model loading completed: elapsed_seconds=%.2f",
+                load_model_total_time,
+            )
+
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        engram_enabled = getattr(self, "engram_enabled", False)
+        if engram_enabled:
+            logger.info("FOR-ENGRAM runner shutdown started")
+        if model is not None:
+            destroy_engram = getattr(self.get_model(), "destroy_engram", None)
+            if callable(destroy_engram):
+                try:
+                    destroy_engram()
+                except BaseException:
+                    logger.exception("FOR-ENGRAM runner shutdown failed")
+                    raise
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if callable(parent_shutdown):
+            parent_shutdown()
+        if engram_enabled:
+            logger.info("FOR-ENGRAM runner shutdown completed")
 
     def _start_dump_data(self, **kwargs) -> None:
         if self.debugger is None or self._debugger_started:

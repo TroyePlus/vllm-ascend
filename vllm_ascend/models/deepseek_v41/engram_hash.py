@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Adapted from the DeepSeek V4.1 reference inference/engram.py.
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from sympy import isprime
-
-_HISTORY_SLAB_MIN_TOKENS = 16
-_PAGE_WRITE_NUMPY_MIN_TOKENS = 16
+from torch import nn
+from vllm.logger import logger
 
 
 def valid_engram_token_mask(
@@ -17,6 +17,70 @@ def valid_engram_token_mask(
 ) -> torch.Tensor:
     """Exclude the complete V4.1 image region from n-gram history."""
     return (input_ids != image_token_id) & (input_ids != image_pad_token_id)
+
+
+def build_lookback_token_ids(
+    histories: Sequence[Sequence[int]],
+    chunk_starts: np.ndarray,
+    depth: int,
+    image_token_id: int,
+    image_pad_token_id: int,
+    image_spans: Sequence[Sequence[tuple[int, int]]] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build newest-first lookback from authoritative request histories."""
+    chunk_starts = np.asarray(chunk_starts)
+    if chunk_starts.shape != (len(histories),):
+        raise ValueError("Engram token history and chunk starts have incompatible shapes")
+    if depth < 1:
+        raise ValueError("Engram lookback depth must be positive")
+    if image_spans is not None and len(image_spans) != len(histories):
+        raise ValueError("Engram image spans and token histories have incompatible shapes")
+
+    lookback = np.full((len(histories), depth), -1, dtype=np.int64)
+    dead = np.ones((len(histories), depth), dtype=np.bool_)
+    for req_index, (history, chunk_start) in enumerate(zip(histories, chunk_starts, strict=True)):
+        chunk_start = int(chunk_start)
+        if chunk_start < 0 or chunk_start > len(history):
+            logger.warning(
+                "FOR-ENGRAM input history missing: request_index=%d history_length=%d chunk_start=%d",
+                req_index,
+                len(history),
+                chunk_start,
+            )
+            raise ValueError(f"Engram request {req_index} is missing authoritative text token history")
+        spans = () if image_spans is None else image_spans[req_index]
+        for offset in range(depth):
+            position = chunk_start - offset - 1
+            if position < 0:
+                continue
+            token_id = int(history[position])
+            lookback[req_index, offset] = token_id
+            in_image_span = any(start <= position < start + length for start, length in spans)
+            is_image_token = token_id in (image_token_id, image_pad_token_id)
+            dead[req_index, offset] = token_id < 0 or is_image_token or in_image_span
+    return lookback, dead
+
+
+class EngramTokenSequence(Sequence[int]):
+    """Zero-copy prompt plus accepted-output view used for Engram history."""
+
+    def __init__(self, prompt: Sequence[int], output: Sequence[int]):
+        self.prompt = prompt
+        self.output = output
+
+    def __len__(self) -> int:
+        return len(self.prompt) + len(self.output)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        if index < len(self.prompt):
+            return self.prompt[index]
+        return self.output[index - len(self.prompt)]
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
@@ -125,6 +189,11 @@ class EngramLayout:
         if not layer_ids:
             return None
         max_ngram_size, n_heads = args.engram_max_ngram_size, args.engram_n_heads
+        if max_ngram_size < 2 or n_heads < 1:
+            raise ValueError("Engram requires max_ngram_size >= 2 and n_heads >= 1")
+        num_embeddings = tuple(args.engram_num_embeddings)
+        if len(num_embeddings) != len(layer_ids):
+            raise ValueError("Engram num_embeddings must have one table size per layer")
         primes, seen = [], set()
         for _ in layer_ids:
             per_ngram = []
@@ -136,30 +205,61 @@ class EngramLayout:
                     sizes.append(current)
                 per_ngram.append(tuple(sizes))
             primes.append(tuple(per_ngram))
+        expected_rows = tuple(sum(size for ngram in layer for size in ngram) for layer in primes)
+        if any(actual < expected for actual, expected in zip(num_embeddings, expected_rows)):
+            raise ValueError(
+                "Engram table is smaller than its configured hash buckets: "
+                f"checkpoint={num_embeddings}, minimum={expected_rows}"
+            )
         return cls(
             max_ngram_size=max_ngram_size,
             layer_ids=layer_ids,
-            num_embeddings=tuple(args.engram_num_embeddings),
+            num_embeddings=num_embeddings,
             primes=tuple(primes),
             n_heads=n_heads,
             head_dim=args.engram_head_dim,
         )
 
 
-class PagedNgramHistory:
-    """Mirror token IDs in the scheduler's physical pages, including prefixes.
+class NgramHashState(nn.Module):
+    """Stateless Engram hash over the current chunks and explicit history.
 
-    A speculative suffix can be overwritten without rolling back a mutable
-    per-request tail. Hashes read only positions at or before the current query.
-    CPU residency supplies routing metadata without a device synchronization.
+    ``lookback_token_ids`` is newest-first and contains the tokens immediately
+    before each request's current chunk. This is the same contract for prefill,
+    decode, prefix-cache hits, and P/D recovery, so no KV-page state is needed.
     """
 
+    DEAD = -1
+
     def __init__(self, config, tokenizer):
+        super().__init__()
         layout = EngramLayout.from_args(config)
+        if layout is None:
+            raise ValueError("Engram requires at least one configured layer")
         token_map, vocab_size = build_compressed_token_map(tokenizer)
         if vocab_size != config.engram_compressed_vocab_size:
-            raise ValueError(f"Engram compressed vocabulary mismatch: {vocab_size}")
-        self.token_map = torch.tensor(token_map, dtype=torch.int64)
+            raise ValueError(
+                "Engram compressed vocabulary mismatch: "
+                f"checkpoint={config.engram_compressed_vocab_size}, tokenizer={vocab_size}"
+            )
+
+        primes = torch.tensor(layout.primes, dtype=torch.int64)
+        sizes = primes.flatten(1)
+        self.register_buffer(
+            "token_map",
+            torch.tensor(token_map, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer("primes", primes, persistent=False)
+        self.register_buffer("offsets", sizes.cumsum(-1) - sizes, persistent=False)
+        self.register_buffer(
+            "multipliers",
+            compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size),
+            persistent=False,
+        )
+        self.max_ngram_size = layout.max_ngram_size
+        self.lookback_depth = layout.max_ngram_size - 1
+        self.required_num_embeddings = tuple(sum(size for ngram in layer for size in ngram) for layer in layout.primes)
         self.pad_id = token_map[config.engram_pad_id]
         self.image_token_id = config.image_token_id
         self.image_pad_token_id = getattr(
@@ -167,89 +267,110 @@ class PagedNgramHistory:
             "image_pad_token_id",
             self.image_token_id + 1,
         )
-        self.primes = torch.tensor(layout.primes)
-        sizes = self.primes.flatten(1)
-        self.offsets = sizes.cumsum(-1) - sizes
-        self.multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
-        self.lookback = layout.max_ngram_size
-        self.pages = {}
+        logger.info(
+            "FOR-ENGRAM hash state initialized: layers=%s max_ngram_size=%d "
+            "heads=%d tokenizer_vocab=%d compressed_vocab=%d",
+            layout.layer_ids,
+            self.max_ngram_size,
+            layout.n_heads,
+            len(token_map),
+            vocab_size,
+        )
 
-    def update(self, input_ids, positions, request_ids, block_table, block_size):
-        """All arguments are CPU tensors; page numbers come from full SWA KV."""
-        if input_ids.numel() == 0:
-            # Idle DP and empty prefill still follow the collective contract,
-            # but there is no page or hash state to update.
-            columns = (self.lookback - 1) * self.primes.shape[-1]
-            return (
-                torch.empty((0, self.primes.shape[0], columns), dtype=torch.int64, device="cpu"),
-                torch.empty(0, dtype=torch.bool, device="cpu"),
-            )
-        compressed = self.token_map[input_ids]
-        mask = valid_engram_token_mask(
-            input_ids,
+    def _dead_mask(self, token_ids: torch.Tensor) -> torch.Tensor:
+        valid_ids = (token_ids >= 0) & (token_ids < self.token_map.numel())
+        text = valid_engram_token_mask(
+            token_ids,
             self.image_token_id,
             self.image_pad_token_id,
         )
-        compressed = compressed.masked_fill(~mask, -1)
-        # Materialize CPU lists once for sequential page writes and small-batch
-        # history reads.
-        compressed_list = compressed.tolist()
-        position_list = positions.tolist()
-        page_indices = block_table[request_ids, positions // block_size].tolist()
-        if len(input_ids) < _PAGE_WRITE_NUMPY_MIN_TOKENS:
-            for token, position, page in zip(compressed_list, position_list, page_indices):
-                if page not in self.pages:
-                    self.pages[page] = torch.full((block_size,), -1, dtype=torch.int64, device="cpu")
-                self.pages[page][position % block_size] = token
+        return ~valid_ids | ~text
+
+    def _compress(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # Clamp sentinels before indexing. Missing history and image tokens are
+        # replaced with pad below, after their barrier semantics are recorded.
+        safe_ids = token_ids.clamp(0, self.token_map.numel() - 1)
+        return self.token_map[safe_ids]
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        dead_mask: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        lookback_dead_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``[tokens, layers, hash_columns]`` IDs and active-token mask."""
+        input_ids = input_ids.long()
+        positions = positions.long()
+        query_start_loc = query_start_loc.to(device=input_ids.device, dtype=torch.long)
+        num_tokens = input_ids.numel()
+        num_requests = query_start_loc.numel() - 1
+        columns = (self.max_ngram_size - 1) * self.primes.shape[-1]
+        if num_tokens == 0:
+            return (
+                input_ids.new_empty((0, self.primes.shape[0], columns)),
+                input_ids.new_empty((0,), dtype=torch.bool),
+            )
+        if positions.shape != input_ids.shape or num_requests < 1:
+            raise ValueError("Engram positions and query_start_loc do not match input_ids")
+
+        request_ids = torch.repeat_interleave(
+            torch.arange(num_requests, device=input_ids.device),
+            query_start_loc[1:] - query_start_loc[:-1],
+        )
+        if request_ids.numel() != num_tokens:
+            raise ValueError("Engram query_start_loc does not cover input_ids")
+        local_positions = torch.arange(num_tokens, device=input_ids.device) - query_start_loc[request_ids]
+
+        current_dead = self._dead_mask(input_ids)
+        if dead_mask is not None:
+            if dead_mask.shape != input_ids.shape:
+                raise ValueError("Engram dead_mask must have one entry per input token")
+            current_dead |= dead_mask.to(device=input_ids.device, dtype=torch.bool)
+
+        if lookback_token_ids is None:
+            lookback_token_ids = input_ids.new_full((num_requests, self.lookback_depth), self.DEAD)
         else:
-            page_views = {}
-            for token, position, page in zip(compressed_list, position_list, page_indices):
-                view = page_views.get(page)
-                if view is None:
-                    if page not in self.pages:
-                        self.pages[page] = torch.full((block_size,), -1, dtype=torch.int64, device="cpu")
-                    view = self.pages[page].numpy()
-                    page_views[page] = view
-                # Zero-copy CPU view avoids Torch dispatch per scalar write. Keep
-                # input order so repeated physical slots retain last-write wins.
-                view[position % block_size] = token
-        history = torch.full((len(input_ids), self.lookback), self.pad_id, dtype=torch.int64, device="cpu")
-        if len(input_ids) < _HISTORY_SLAB_MIN_TOKENS:
-            # Slab construction dominates decode and small batches; retain the
-            # page-row loop for this latency-sensitive path.
-            for row, (position, request) in enumerate(zip(position_list, request_ids.tolist())):
-                for shift in range(self.lookback):
-                    previous = position - shift
-                    if previous < 0:
-                        break
-                    page = block_table[request, previous // block_size].item()
-                    token = self.pages[page][previous % block_size]
-                    if token < 0:
-                        break
-                    history[row, shift] = token
-        else:
-            active = torch.ones(len(input_ids), dtype=torch.bool, device="cpu")
-            for shift in range(self.lookback):
-                previous = positions - shift
-                valid = active & (previous >= 0)
-                if not bool(valid.any()):
-                    break
-                with torch.device("cpu"):
-                    rows = torch.nonzero(valid, as_tuple=False).flatten()
-                page_ids = block_table[request_ids[rows], previous[rows] // block_size]
-                offsets = previous[rows] % block_size
-                with torch.device("cpu"):
-                    unique_pages, slab_indices = torch.unique(page_ids, return_inverse=True)
-                # Reachable pages must exist, just as in the row path. Inactive
-                # rows never read past an image or unwritten-token barrier.
-                slab = torch.stack([self.pages[page] for page in unique_pages.tolist()])
-                values = slab[slab_indices, offsets]
-                present = values >= 0
-                history[rows[present], shift] = values[present]
-                active[rows] = present
-        products = history[:, None] * self.multipliers
-        rolling, hashes = products[..., 0], []
-        for shift in range(1, self.lookback):
+            lookback_token_ids = lookback_token_ids.to(device=input_ids.device, dtype=torch.long)
+        expected_lookback_shape = (num_requests, self.lookback_depth)
+        if tuple(lookback_token_ids.shape) != expected_lookback_shape:
+            raise ValueError(
+                "Engram lookback_token_ids shape mismatch: "
+                f"got {tuple(lookback_token_ids.shape)}, expected {expected_lookback_shape}"
+            )
+        history_dead = self._dead_mask(lookback_token_ids)
+        if lookback_dead_mask is not None:
+            if tuple(lookback_dead_mask.shape) != expected_lookback_shape:
+                raise ValueError("Engram lookback_dead_mask shape does not match lookback_token_ids")
+            history_dead |= lookback_dead_mask.to(device=input_ids.device, dtype=torch.bool)
+
+        window = input_ids.new_full((num_tokens, self.max_ngram_size), self.pad_id)
+        blocked = torch.zeros(num_tokens, dtype=torch.bool, device=input_ids.device)
+        token_rows = torch.arange(num_tokens, device=input_ids.device)
+        for shift in range(self.max_ngram_size):
+            from_current = local_positions >= shift
+            current_indices = (token_rows - shift).clamp_min(0)
+            history_indices = (shift - local_positions - 1).clamp(0, self.lookback_depth - 1)
+            source_ids = torch.where(
+                from_current,
+                input_ids[current_indices],
+                lookback_token_ids[request_ids, history_indices],
+            )
+            source_dead = torch.where(
+                from_current,
+                current_dead[current_indices],
+                history_dead[request_ids, history_indices],
+            )
+            blocked |= source_dead | (positions < shift)
+            compressed = self._compress(source_ids)
+            window[:, shift] = torch.where(blocked, self.pad_id, compressed)
+
+        products = window[:, None, :] * self.multipliers[None, :, :]
+        rolling = products[..., 0]
+        hashes = []
+        for shift in range(1, self.max_ngram_size):
             rolling = torch.bitwise_xor(rolling, products[..., shift])
-            hashes.append(rolling[..., None] % self.primes[:, shift - 1])
-        return torch.cat(hashes, -1) + self.offsets, mask
+            hashes.append(rolling.unsqueeze(-1) % self.primes[:, shift - 1])
+        return torch.cat(hashes, dim=-1) + self.offsets, ~current_dead

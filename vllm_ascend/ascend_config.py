@@ -273,6 +273,10 @@ class AscendConfig:
         {
             "refresh": false,
             "enable_cpu_binding": true,
+            "enable_engram": false,
+            "enable_engram_offload": false,
+            "engram_tp_size": 1,
+            "engram_storage": "bf16",
             "multistream_dsv4_dsa_overlap": true,
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
@@ -408,9 +412,14 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
-    # Enable the V4.1 node-sharded Engram path.
-    enable_engram: bool = True
-    # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
+    # Enable the V4.1 Engram path. It remains opt-in until async history exists.
+    enable_engram: bool = False
+    # Store row-sharded tables in CANN ElasticBuffer.
+    enable_engram_offload: bool = False
+    # Match cann-recipes: one rank unless the deployment overrides the TP group.
+    engram_tp_size: int = 8
+    # ElasticBuffer storage format. Quantized aliases currently fall back to
+    # BF16 because the deployed Engram ABI has no scale-tensor argument.
     engram_storage: Literal["bf16", "int8", "fp8", "mxfp8"] = "bf16"
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
@@ -508,6 +517,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_engram_config(vc)
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb
@@ -710,6 +720,150 @@ class AscendConfig:
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
         return self
+
+    def _validate_engram_config(self, vllm_config: VllmConfig) -> None:
+        if self.engram_tp_size <= 0:
+            logger.error(
+                "FOR-ENGRAM config validation failed: engram_tp_size=%d must be positive",
+                self.engram_tp_size,
+            )
+            raise ValueError("engram_tp_size must be positive")
+        if self.enable_engram_offload and not self.enable_engram:
+            logger.error("FOR-ENGRAM config validation failed: offload requires enable_engram")
+            raise ValueError("enable_engram_offload=True requires enable_engram=True")
+        if not self.enable_engram:
+            return
+        logger.info(
+            "FOR-ENGRAM config validation started: offload=%s storage=%s engram_tp_size=%d",
+            self.enable_engram_offload,
+            self.engram_storage,
+            self.engram_tp_size,
+        )
+        if not self.enable_engram_offload:
+            logger.error("FOR-ENGRAM config validation failed: synchronous mode requires offload")
+            raise NotImplementedError("The synchronous Engram milestone requires enable_engram_offload=True")
+        if self.engram_storage in ("fp8", "mxfp8"):
+            logger.warning(
+                "FOR-ENGRAM engram_storage=%s requested, but the current "
+                "ElasticBuffer ABI has no MXFP8 scale-tensor interface; "
+                "checkpoint rows will be decoded on CPU and stored as BF16",
+                self.engram_storage,
+            )
+            self.engram_storage = "bf16"
+        if self.engram_storage != "bf16":
+            logger.error(
+                "FOR-ENGRAM config validation failed: unsupported storage=%s",
+                self.engram_storage,
+            )
+            raise ValueError("The current ElasticBuffer Engram ABI supports only bf16 storage")
+        logger.info(
+            "FOR-ENGRAM ElasticBuffer compatibility ABI selected: "
+            "write=single-bf16-tensor fetch=single-bf16-tensor scale_tensor=false"
+        )
+
+        load_config = getattr(vllm_config, "load_config", None)
+        loader_extra = getattr(load_config, "model_loader_extra_config", None) or {}
+        if loader_extra.get("enable_multithread_load", False):
+            logger.warning(
+                "FOR-ENGRAM disabling multithread checkpoint loading because it "
+                "materializes complete shards before Engram table filtering"
+            )
+            loader_extra["enable_multithread_load"] = False
+
+        model_config = vllm_config.model_config
+        if getattr(model_config, "enable_prompt_embeds", False):
+            logger.error(
+                "FOR-ENGRAM config validation failed: prompt embeddings do not provide authoritative token IDs"
+            )
+            raise NotImplementedError("Synchronous Engram does not support --enable-prompt-embeds")
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None or not hasattr(hf_config, "engram_layer_ids"):
+            logger.error("FOR-ENGRAM config validation failed: model has no Engram layout")
+            raise ValueError("enable_engram is only valid for a DeepSeek V4.1 Engram model")
+
+        parallel = vllm_config.parallel_config
+        if getattr(parallel, "enable_elastic_ep", False):
+            logger.error(
+                "FOR-ENGRAM config validation failed: elastic EP uses a "
+                "distributed world that cannot be passed to ElasticBuffer"
+            )
+            raise NotImplementedError("Synchronous Engram does not support elastic expert parallelism")
+        if parallel.pipeline_parallel_size != 1:
+            logger.error(
+                "FOR-ENGRAM config validation failed: pipeline_parallel_size=%d",
+                parallel.pipeline_parallel_size,
+            )
+            raise NotImplementedError("Synchronous Engram currently requires pipeline_parallel_size=1")
+        if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+            logger.error(
+                "FOR-ENGRAM config validation failed: pcp=%d dcp=%d",
+                parallel.prefill_context_parallel_size,
+                parallel.decode_context_parallel_size,
+            )
+            raise NotImplementedError("Synchronous Engram currently requires PCP=DCP=1")
+        world_size = int(getattr(parallel, "world_size_across_dp", getattr(parallel, "world_size", 1)))
+        if self.engram_tp_size > world_size:
+            logger.error(
+                "FOR-ENGRAM config validation failed: engram_tp_size=%d world_size=%d",
+                self.engram_tp_size,
+                world_size,
+            )
+            raise ValueError(f"engram_tp_size={self.engram_tp_size} cannot be greater than world_size={world_size}")
+        if world_size % self.engram_tp_size:
+            logger.error(
+                "FOR-ENGRAM config validation failed: world_size=%d is not divisible by engram_tp_size=%d",
+                world_size,
+                self.engram_tp_size,
+            )
+            raise ValueError(f"engram_tp_size={self.engram_tp_size} must divide world_size={world_size}")
+        local_world_size = int(getattr(parallel, "local_world_size", world_size))
+        data_parallel_size_local = int(getattr(parallel, "data_parallel_size_local", 1))
+        device_count = local_world_size * data_parallel_size_local
+        if world_size > 1 and self.engram_tp_size < min(world_size, device_count):
+            logger.error(
+                "FOR-ENGRAM config validation failed: engram_tp_size=%d world_size=%d device_count=%d",
+                self.engram_tp_size,
+                world_size,
+                device_count,
+            )
+            raise ValueError(
+                f"Got engram_tp_size={self.engram_tp_size}, world_size={world_size}, "
+                f"device_count={device_count}; set engram_tp_size to at least "
+                "the number of ranks on this host so host storage remains non-redundant"
+            )
+
+        if getattr(vllm_config.scheduler_config, "async_scheduling", False):
+            # vLLM enables async scheduling by default when the selected
+            # executor supports it. Phase 1 Engram intentionally uses the
+            # authoritative synchronous request history, so keep the Engram
+            # path usable by falling back to synchronous scheduling.
+            logger.warning(
+                "FOR-ENGRAM async scheduling is not implemented; "
+                "falling back to synchronous scheduling"
+            )
+            vllm_config.scheduler_config.async_scheduling = False
+        speculative = vllm_config.speculative_config
+        if speculative is not None and speculative.use_dspark():
+            logger.error("FOR-ENGRAM config validation failed: DSpark is unsupported")
+            raise NotImplementedError("Engram with DSpark is not supported in the synchronous milestone")
+        if speculative is not None and speculative.method != "mtp":
+            logger.error(
+                "FOR-ENGRAM config validation failed: speculative_method=%s",
+                speculative.method,
+            )
+            raise NotImplementedError("Synchronous Engram currently supports only MTP speculative decoding")
+        logger.info(
+            "FOR-ENGRAM config validation completed: world_size=%d "
+            "device_count=%d pp=%d pcp=%d dcp=%d storage=%s "
+            "speculative_method=%s",
+            world_size,
+            device_count,
+            parallel.pipeline_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+            self.engram_storage,
+            getattr(speculative, "method", None),
+        )
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
