@@ -135,7 +135,7 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
                 input_ids=moe_input_ids,
             )
         assert last_layer is not None
-        return last_layer.hc_collapse(hidden_states, pre_mix)
+        return last_layer.hc_pre_mix(hidden_states, pre_mix)
 
 
 @support_torch_compile
