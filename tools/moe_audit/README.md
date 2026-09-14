@@ -34,15 +34,15 @@ eager/opaque 的 layout 适配是明确保留的旧对照修复，不是日志�
 git status --short                 # 有本地修改先保存，不要覆盖
 git fetch https://github.com/TroyePlus/vllm-ascend.git \
   'refs/heads/audit/7323-*:refs/remotes/audit7323/*'
-git switch -c run-7323-eager refs/remotes/audit7323/eager
+git switch -c run-7323-eager refs/remotes/audit7323/audit/7323-eager
 ```
 
 依次测试完再切到另外两个分支（先停止前一个服务，确认 NPU 释放）：
 
 ```bash
-git switch -c run-7323-opaque refs/remotes/audit7323/fxrt-opaque
+git switch -c run-7323-opaque refs/remotes/audit7323/audit/7323-fxrt-opaque
 # 或
-git switch -c run-7323-split refs/remotes/audit7323/fxrt-split
+git switch -c run-7323-split refs/remotes/audit7323/audit/7323-fxrt-split
 ```
 
 每个分支的 `tools/moe_audit/mode` 已写好默认模式；**仅 checkout 不会自动改变原来的 P.sh**，
@@ -56,6 +56,24 @@ wrapper 只替换 compile/eager 参数和诊断环境；不替换上述模型/�
 
 ## 3. 拉起并记录 prefill.log
 
+脚本不要求固定目录。`run.sh` 参数和环境变量如下：
+
+| 参数/变量 | 含义 | 默认值 |
+| --- | --- | --- |
+| 第1个参数 | 现网 P 启动脚本绝对路径 | 必填 |
+| `MOE_AUDIT_REPO` | 当前分支 checkout 根目录 | wrapper 的上两级目录 |
+| `MOE_AUDIT_TOOL_DIR` | wrapper 所在目录 | `run.sh` 所在目录 |
+| `MOE_AUDIT_DUMP` | 当前模式 FX 图目录 | 当前工作目录下 `fx_dump_7323/模式` |
+| `VLLM_ASCEND_MOE_AUDIT_LIMIT` | 每 worker 最多不同签名数（每签名采样2次） | 16 |
+
+自动验证脚本 `validate_131.py` 也支持 `MOE_AUDIT_VARIANT_ROOT`、
+`MOE_AUDIT_LOG_ROOT`、`MOE_AUDIT_SERVER`、`MOE_AUDIT_HTTP_PORT`、
+`MOE_AUDIT_RPC_PORT`、`MOE_AUDIT_BIND_HOST` 和 `MOE_AUDIT_DEVICES`；
+前两个根目录参数必填；SERVER默认指向该分支自带的参数化 P 模板（7个位置参数），
+不再使用旧的 `server_ep8_opaque.sh` 的4参数接口。
+其中 `MOE_AUDIT_DEVICES` 是以分号分隔的每个 DP rank 可见卡列表，
+例如 `0,1,2,3;4,5,6,7`。这样容器路径、卡号、HTTP/RPC 端口均可替换。
+
 确认所有待用卡空闲；在两个终端分别启动 DP0/DP1。下面 IP/端口请换成现网当前值，
 原始 P.sh 位置也要替换；RPC 端口两边相同，HTTP 端口不同。
 
@@ -66,14 +84,20 @@ export MOE_AUDIT_DUMP=/workspace/fx_dump_7323/eager  # 每种模式换独立目�
 
 # 终端一：DP0，参数顺序沿用原始 P.sh
 bash tools/moe_audit/run.sh /workspace/P.sh \
-  0,1,2,3 8900 2 0 7.150.1.10 13345 4 >>prefill.log 2>&1
+  0,1,2,3 8900 2 0 7.150.1.10 13345 4 >prefill.dp0.log 2>&1
 
 # 终端二：同一个分支、相同的诊断环境和 P.sh
 bash tools/moe_audit/run.sh /workspace/P.sh \
-  4,5,6,7 8901 2 1 7.150.1.10 13345 4 >>prefill.log 2>&1
+  4,5,6,7 8901 2 1 7.150.1.10 13345 4 >prefill.dp1.log 2>&1
+
+python tools/moe_audit/filter.py prefill.dp0.log prefill.dp1.log > prefill.audit.txt
 ```
 
-两终端要使用相同工作目录，保证写入同一个 prefill.log；也可使用绝对日志路径。
+两个 rank 不要并发写同一个 `prefill.log`：虽然 `>>` 通常是追加，但多进程输出可能交错，
+不便于按 rank 审计。使用独立的 `prefill.dp0.log`/`prefill.dp1.log`，最后由过滤器合并；
+不同模式使用不同文件名或目录，因此不会相互覆盖。
+P.sh 内模型路径、网卡、IP、RPC 地址等属于部署参数，保持现网脚本原值；
+不要把示例中的 `/workspace/P.sh`、设备号、端口当作固定值。
 每种模式测试前将上一份日志改名留档，不要混合三次运行：
 `mv prefill.log prefill.eager.log`（确认服务已停止后）。
 不拆分/拆分模式的 JSON 仍写 `backend=inductor`，这是此基线外部 backend 入口的匹配条件；
