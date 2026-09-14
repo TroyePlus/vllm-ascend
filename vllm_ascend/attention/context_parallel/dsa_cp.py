@@ -119,6 +119,7 @@ class AscendDSAReqMetadata:
     qli_metadata: torch.Tensor = None
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
+    fxrt_compressor_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -642,8 +643,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         if self.compressor_ratio > 1:
             layer_name = f"c{self.compressor_ratio}"
-            # Keep only graph inputs here. The compressor metadata op itself is
-            # launched in forward at the real compressor consumer.
+            # FXRT precomputes the metadata below to keep per-request Python
+            # counts out of the compiled forward's guards.
             num_compressed_tokens = self._num_compressor_metadata_rows(common_attn_metadata)
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             slot_mapping = None
@@ -702,6 +703,22 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_prefill[:num_reqs],
             num_compressed_tokens=num_compressed_tokens,
             num_reqs_actual=num_reqs_actual,
+            fxrt_compressor_metadata=(
+                torch.ops._C_ascend.compressor_metadata(
+                    full_compress_cos.view(full_compress_cos.shape[0], full_compress_cos.shape[-1]),
+                    full_compress_sin.view(full_compress_sin.shape[0], full_compress_sin.shape[-1]),
+                    query_start_loc,
+                    self.start_pos_prefill[:num_reqs],
+                    self.block_table[:num_reqs, ...],
+                    self.block_size,
+                    DeviceOperator.get_dsa_compressor_slot_mapping_format(),
+                    self.compressor_ratio,
+                    num_compressed_tokens,
+                    num_reqs_actual,
+                )
+                if fxrt_prefill_decompose_enabled() and self.compressor_ratio > 1
+                else None
+            ),
             sas_metadata=sas_metadata,
             qli_metadata=qli_metadata,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
@@ -1048,6 +1065,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self,
         metadata: AscendDSAReqMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._fxrt_prefill_decompose and metadata.fxrt_compressor_metadata is not None:
+            return metadata.fxrt_compressor_metadata
         assert metadata.full_compress_cos is not None
         assert metadata.full_compress_sin is not None
         assert metadata.num_compressed_tokens is not None
@@ -1354,7 +1373,12 @@ class AscendDSACPImpl(DSAAttentionImpl):
             if self._fxrt_prefill_decompose
             else _has_prefill(common_attn_metadata.attn_state)
         )
-        hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
+        cache_tokens = (
+            swa_metadata.req_metadata.slot_mapping.shape[0]
+            if self._fxrt_prefill_decompose
+            else common_attn_metadata.num_actual_tokens
+        )
+        hidden_states_cache = hidden_states[:cache_tokens]
 
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
             self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod

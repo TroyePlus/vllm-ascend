@@ -461,6 +461,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 dtype=torch.int32,
                 device=torch.npu.current_device(),
             )
+        else:
+            self.expert_ids_per_ep_rank = torch.empty(
+                (0,), dtype=torch.int32, device=torch.npu.current_device()
+            )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
 
@@ -500,18 +504,27 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
         dynamic_scale_after_all2all = None
+        routing_capacity = permutated_local_input_tokens.shape[0] * self.ep_size
         if with_quant:
             permutated_local_input_tokens, dynamic_scale = DeviceOperator.npu_dynamic_quant(
                 permutated_local_input_tokens, act_quant_type=dst_type, use_mxfp_quant=use_mxfp_quant
             )
             _, dynamic_scale_after_all2all, permute2_ep_all_to_all_handle = async_all_to_all(
-                dynamic_scale, output_splits, input_splits, self.ep_group
+                dynamic_scale,
+                output_splits,
+                input_splits,
+                self.ep_group,
+                output_capacity=routing_capacity,
             )
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
-            permutated_local_input_tokens, output_splits, input_splits, self.ep_group
+            permutated_local_input_tokens,
+            output_splits,
+            input_splits,
+            self.ep_group,
+            output_capacity=routing_capacity,
         )
         permute1_ep_all_to_all_handle.wait()
         permutated_local_input_tokens.untyped_storage().resize_(0)
@@ -556,6 +569,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             combine_metadata.input_splits,
             combine_metadata.output_splits,
             self.ep_group,
+            output_capacity=combine_metadata.reversed_local_input_permutation_mapping.shape[0],
         )
         handle.wait()
         hidden_states.untyped_storage().resize_(0)
@@ -595,17 +609,38 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
+        if torch.compiler.is_compiling() and fxrt_prefill_decompose_enabled():
+            from vllm_ascend.ops.fused_moe.comm_utils import fxrt_alltoall_preprocess
+
+            (
+                num_tokens_per_local_expert,
+                input_splits,
+                output_splits,
+                global_input_tokens_local_experts_indices,
+            ) = fxrt_alltoall_preprocess(
+                topk_ids,
+                self.expert_ids_per_ep_rank,
+                self.num_experts,
+                self.num_local_experts,
+                self.local_expert_indices[0],
+                self.ep_size,
+                topk_ids.numel() * self.ep_size,
+                self.ep_group.group_name,
+            )
+            return (
+                num_tokens_per_local_expert,
+                input_splits,
+                output_splits,
+                global_input_tokens_local_experts_indices,
+                topk_ids.numel(),
+            )
+
         num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts)
 
         ep_size = self.ep_size
         num_out_tokens = topk_ids.numel()
 
-        input_splits = (
-            num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
-            .sum(axis=1)
-            .to(torch.device("cpu"), non_blocking=True)
-            .numpy()
-        )
+        input_splits_tensor = num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts).sum(dim=1)
 
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
@@ -616,10 +651,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         if num_global_tokens_per_local_expert is None:
             raise ValueError("num_global_tokens_per_local_expert must be set before sum.")
 
-        output_splits = (
-            num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
-        )
-        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
+        output_splits_tensor = num_global_tokens_per_local_expert.sum(dim=-1)
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+
+        input_splits = input_splits_tensor.to(torch.device("cpu"), non_blocking=True).numpy()
+        output_splits = output_splits_tensor.to(torch.device("cpu"), non_blocking=True).numpy()
 
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
@@ -694,6 +730,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
     ) -> torch.Tensor:
         # Unpermutation 2: expert output to AlltoAll input
         rev_global = combine_metadata.reversed_global_input_permutation_mapping
+        if torch.compiler.is_compiling() and fxrt_prefill_decompose_enabled():
+            if self.num_local_experts > 1 and rev_global is not None:
+                from vllm_ascend.ops.fused_moe.comm_utils import fxrt_unpermute_nonempty
+
+                return fxrt_unpermute_nonempty(hidden_states, rev_global)
+            return hidden_states
         if hidden_states.shape[0] > 0 and self.num_local_experts > 1 and rev_global is not None:
             hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, rev_global)
         return hidden_states

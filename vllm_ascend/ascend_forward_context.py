@@ -174,6 +174,10 @@ def set_ascend_forward_context(
             max_tokens_across_dp = num_tokens
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp
+        forward_context.fxrt_dp_token_extent = (
+            torch.empty((max_tokens_across_dp,), device="cpu", dtype=torch.uint8)
+            if max_tokens_across_dp is not None else None
+        )
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
@@ -242,6 +246,13 @@ def _select_a2_moe_comm_method(
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
 ) -> MoECommType:
+    # Test-only switch used to exercise the A2 AllToAllV FXRT path.
+    import os
+
+    if os.environ.get("DSV4_TEST_FORCE_ALLTOALL") == "1":
+        logger.info_once("[TEST_ONLY_ALLTOALL] A2 native All2AllV dispatcher selected")
+        return MoECommType.ALLTOALL
+
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = (
         vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
@@ -389,6 +400,7 @@ class _ExtraForwardContextProxy:
         "model_instance",
         "layer_idx",
         "max_tokens_across_dp",
+        "fxrt_dp_token_extent",
         "max_tokens_across_pcp",
         "num_accept_tokens",
         "in_profile_run",

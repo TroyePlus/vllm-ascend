@@ -34,7 +34,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
+from vllm_ascend.utils import enable_sp, enable_sp_by_pass, fxrt_prefill_decompose_enabled, npu_stream_switch
 
 
 class PrepareAndFinalize(ABC):
@@ -444,7 +444,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         """
         self.enable_shared_expert_dp = enable_shared_expert_dp
         if self.moe_config.dp_size > 1:
-            max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+            max_tokens_across_dp = (
+                _EXTRA_CTX.fxrt_dp_token_extent.shape[0]
+                if fxrt_prefill_decompose_enabled()
+                else _EXTRA_CTX.max_tokens_across_dp
+            )
 
             self.num_tokens = hidden_states.shape[0]
             pad_size = max_tokens_across_dp - self.num_tokens
@@ -484,7 +488,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.moe_config.dp_size > 1:
-            max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+            max_tokens_across_dp = (
+                _EXTRA_CTX.fxrt_dp_token_extent.shape[0]
+                if fxrt_prefill_decompose_enabled()
+                else _EXTRA_CTX.max_tokens_across_dp
+            )
             pad_size = max_tokens_across_dp - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))

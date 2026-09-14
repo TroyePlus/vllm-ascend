@@ -1077,6 +1077,10 @@ class NPUPlatform(Platform):
             "pad_size": pad_size,
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
+            "fxrt_dp_token_extent": (
+                torch.empty((max_tokens_across_dp,), device="cpu", dtype=torch.uint8)
+                if max_tokens_across_dp is not None else None
+            ),
             "mc2_mask": mc2_mask,
             "is_draft_model": is_draft_model,
             "is_draft_model_prefill": is_draft_model_prefill,
