@@ -189,10 +189,11 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
-        try:
+        from vllm_ascend.moe_route_audit import audit_forward
+
+        with audit_forward(vllm_config, forward_context, max_num_tokens,
+                           num_actual_tokens, attn_metadata, skip_compiled):
             yield
-        finally:
-            pass
 
 
 _mc2_tokens_capacity: int | None = None
@@ -215,6 +216,14 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     # NOTE: To save memory, we cap the max number of tokens to 512.
     num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
     _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    from vllm_ascend import envs
+    if envs.VLLM_ASCEND_MOE_AUDIT:
+        from vllm_ascend.moe_route_audit import _emit
+        _emit("CAPACITY", raw_max=max_num_tokens, tp=tp_size,
+              max_reqs=max_num_reqs, uniform_decode_query_len=uniform_decode_query_len,
+              prefill_mc2=get_ascend_config().enable_prefill_mc2,
+              capture_sizes=bool(vllm_config.compilation_config.cudagraph_capture_sizes),
+              per_tp_limit=512, capacity=_mc2_tokens_capacity)
 
 
 def get_mc2_tokens_capacity():
