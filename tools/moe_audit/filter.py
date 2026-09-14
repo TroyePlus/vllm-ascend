@@ -1,4 +1,5 @@
 """Compact all-rank audit; stdlib only. Usage: python filter.py prefill.log."""
+
 import argparse
 import json
 from collections import Counter, defaultdict
@@ -28,10 +29,16 @@ def summarize(paths):
     events = Counter()
     for row in records:
         events[row["event"]] += 1
-        rank = f'{row.get("dp", "?")}/{row.get("tp", "?")}/{row.get("ep", "?")}'
+        rank = f"{row.get('dp', '?')}/{row.get('tp', '?')}/{row.get('ep', '?')}"
         if row["event"] in ("CONFIG", "CAPACITY"):
-            key = json.dumps({k: v for k, v in row.items() if k not in ("pid", "dp", "ep")
-                              and not (row["event"] == "CONFIG" and k == "tp")}, sort_keys=True)
+            key = json.dumps(
+                {
+                    k: v
+                    for k, v in row.items()
+                    if k not in ("pid", "dp", "ep") and not (row["event"] == "CONFIG" and k == "tp")
+                },
+                sort_keys=True,
+            )
             configs[key].add(rank)
         else:
             step = steps.setdefault((row["pid"], row["seq"]), {})
@@ -42,14 +49,17 @@ def summarize(paths):
     grouped = defaultdict(list)
     for step in steps.values():
         select = step.get("SELECT", {})
-        key = json.dumps({k: v for k, v in select.items()
-                          if k not in ("pid", "seq", "dp", "tp", "ep", "event")}, sort_keys=True)
+        key = json.dumps(
+            {k: v for k, v in select.items() if k not in ("pid", "seq", "dp", "tp", "ep", "event")}, sort_keys=True
+        )
         grouped[key].append(step)
     op_sets = {}
-    print("FIELDS: sel=selector_tokens p=profile m=metadata d=draft pre=num_prefills dec=num_decode_tokens s=sample; ranks=dp/tp/ep")
+    print(
+        "FIELDS: sel=selector_tokens p=profile m=metadata d=draft "
+        "pre=num_prefills dec=num_decode_tokens s=sample; ranks=dp/tp/ep"
+    )
     for key, group in grouped.items():
-        ranks = sorted({f'{s["SELECT"]["dp"]}/{s["SELECT"]["tp"]}/{s["SELECT"]["ep"]}'
-                        for s in group if "SELECT" in s})
+        ranks = sorted({f"{s['SELECT']['dp']}/{s['SELECT']['tp']}/{s['SELECT']['ep']}" for s in group if "SELECT" in s})
         results = Counter(s.get("END", {}).get("result", "missing_END") for s in group)
         counts = defaultdict(list)
         for step in group:
@@ -58,12 +68,27 @@ def summarize(paths):
         op_key = json.dumps({name: [min(ns), max(ns), len(ns)] for name, ns in sorted(counts.items())})
         op_id = op_sets.setdefault(op_key, "O" + str(len(op_sets) + 1)) if counts else "none"
         fields = json.loads(key)
-        aliases = dict(sel="selector_tokens", local="local", act="actual", maxdp="max_dp",
-                       pad="pad", padded="padded", cap="capacity", route="route", p="profile",
-                       m="metadata", d="draft", pre="num_prefills", dec="num_decode_tokens",
-                       skip="skip_compiled", s="sample")
-        display = " ".join(f"{alias}={int(fields[name]) if isinstance(fields.get(name), bool) else fields.get(name)}"
-                           for alias, name in aliases.items())
+        aliases = dict(
+            sel="selector_tokens",
+            local="local",
+            act="actual",
+            maxdp="max_dp",
+            pad="pad",
+            padded="padded",
+            cap="capacity",
+            route="route",
+            p="profile",
+            m="metadata",
+            d="draft",
+            pre="num_prefills",
+            dec="num_decode_tokens",
+            skip="skip_compiled",
+            s="sample",
+        )
+        display = " ".join(
+            f"{alias}={int(fields[name]) if isinstance(fields.get(name), bool) else fields.get(name)}"
+            for alias, name in aliases.items()
+        )
         print("STEP", display, "ranks=" + ",".join(ranks), "end=" + json.dumps(results), "ops=" + op_id)
         for error in sorted({s["ERROR"]["message"] for s in group if "ERROR" in s}):
             print("  ERROR", error.replace("\n", " ")[:700])
