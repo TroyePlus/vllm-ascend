@@ -734,18 +734,11 @@ class DeepseekV41EagerAttentionImpl:
         token_pos = global_indices - query_start_loc[token_req_idx].to(torch.int32)
         token_sp = start_pos[token_req_idx].to(torch.int32)
         cols = torch.arange(window_size, device=device, dtype=torch.int32)
-        lo = torch.clamp(token_pos - window_size + 1, min=0)
-        slots_sp0 = lo.unsqueeze(1) + cols.unsqueeze(0)
-        slots_sp0 = slots_sp0.masked_fill(
-            slots_sp0 > token_pos.unsqueeze(1), -1
-        )
-        valid_len = torch.clamp(token_sp + token_pos + 1, max=window_size)
-        slots_nz = cols.unsqueeze(0).expand_as(slots_sp0)
-        slots_nz = slots_nz.masked_fill(
-            cols.unsqueeze(0) >= valid_len.unsqueeze(1), -1
-        )
-        win_indices = torch.where(
-            (token_sp == 0).unsqueeze(1), slots_sp0, slots_nz
+        token_abs_pos = token_sp + token_pos
+        window_start = torch.clamp(token_abs_pos - window_size + 1, min=0)
+        win_indices = window_start.unsqueeze(1) + cols.unsqueeze(0)
+        win_indices = win_indices.masked_fill(
+            win_indices > token_abs_pos.unsqueeze(1), -1
         )
         return win_indices.unsqueeze(1).to(torch.int32)
 
