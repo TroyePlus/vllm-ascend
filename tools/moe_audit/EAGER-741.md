@@ -78,17 +78,32 @@ claimed equivalent to resetting to the parent.
 
 A detached worktree `/vllm-workspace/vllm-ascend-before-decompose` at `d20ac15e7`
 was created for the historical control, without resetting the active branch.
-Its two extension libraries are symlinks to the current container's libraries;
-this compares old Python code with the available binary environment, not a
-reconstruction of an old wheel.
+Its extension libraries and vendor resources are symlinked from the container's
+existing `/workspace/variants/opaque`, whose clean checkout is also `d20ac15e7`.
+No library was rebuilt for the historical control. The extension SHA256 is
+`7c6e4b62c000730928e5463b9dd4dce9b6313de68215da02f02913bedd19b658`.
 
-The historical control failed during startup profiling, before accepting any
-requests: `aclnnHcPre or aclnnHcPreGetWorkspaceSize not in libopapi.so, or
-libopapi.sonot found.` The stack points into this worktree's original `hc_pre`
-implementation. No valid historical TTFT is available. Replacing that kernel
-or copying newer dummy compatibility into it would cease to be an unmodified
-parent-commit control. This limitation remains open; only the two PR-mode
-measurements above are complete.
+The initial historical control failed during startup profiling:
+`aclnnHcPre or aclnnHcPreGetWorkspaceSize not in libopapi.so, or libopapi.sonot found.`
+Follow-up inspection found both symbols in the current package's
+`_cann_ops_custom/vendors/custom_transformer/op_api/lib/libcust_opapi.so`.
+The initial worktree setup had omitted that vendor directory: this was an
+incomplete runtime-resource setup, not proof that the container lacked HcPre.
+A retry with current vendor resources (`eager741-before-vendors`) got past
+HcPre but failed because the current extension did not register
+`_C_ascend.npu_moe_init_routing_custom`. The matching opaque variant's extension
+does contain that registration. The final retry uses the opaque variant's
+extension and vendor resources at `eager741-before-opaque-free`, with devices
+2,3 and 4,7 because device 6 became occupied. Old Python code is unchanged.
+
+That retry completed model loading but failed in startup profile with
+`507034 Vector core execution timed out` / `ACL stream synchronize failed`.
+The rank0 plog records stream 7, task 4329, pendingNum 323 and a three-minute
+timeout, preceded by HCCL STUCK reports for all ranks. This does not yet identify
+the first faulty kernel; no historical TTFT is available. Python stack sampling
+was attempted but the worker aborted while the sampler was attaching.
+The test processes were then cleaned up without restarting the user's container.
+Further work is needed for a successful unmodified-parent benchmark.
 
 ## Evidence locations
 
@@ -97,6 +112,9 @@ measurements above are complete.
 - Each successful run includes rank logs, `bench/samples.log`, detailed
   `bench/samples.json`, and `bench/result.txt`.
 - Historical failure logs: `/home/liyizhan/dsv4/eager-before` on 127.
+- Latest historical retry: `/home/liyizhan/dsv4/eager-before-opaque-free`,
+  including `plog-rank0.log`. `py-spy` was installed only into
+  `/workspace/dsv4/ttft741/diagnostics`, not into site-packages.
 - Test worker processes were released after each run. PID1 retains defunct
   children, which do not hold NPU allocations; the user's shell/editor was
   preserved, so the container was not restarted.
