@@ -1019,6 +1019,23 @@ class NPUModelRunner(GPUModelRunner):
                 self._private_circle_metadata_by_req.pop(req_id, None)
 
             num_reqs = self.input_batch.num_reqs
+            # Every live input-batch row is scheduled every step. A row that
+            # was not scheduled is a leftover (e.g. a request the scheduler
+            # dropped without a finished event) whose stale metadata would
+            # otherwise feed the ring table silently.
+            scheduled_ids = set(scheduler_output.num_scheduled_tokens.keys())
+            unscheduled_rows = [
+                req_id
+                for req_id in self.input_batch.req_ids[:num_reqs]
+                if req_id not in scheduled_ids
+            ]
+            if unscheduled_rows:
+                logger.warning(
+                    "PRIVATE_CIRCLE_POOL unscheduled_batch_rows count=%d "
+                    "request_ids=%s",
+                    len(unscheduled_rows),
+                    unscheduled_rows[:8],
+                )
             allocations = np.full(num_reqs, -1, dtype=np.int64)
             window_starts = np.zeros(num_reqs, dtype=np.int64)
             valid_lengths = np.zeros(num_reqs, dtype=np.int64)
@@ -1447,9 +1464,23 @@ class NPUModelRunner(GPUModelRunner):
         with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]
         self.with_prefill = with_prefill
         # The prefill workspace runs data-dependent host logic; capture would
-        # bake stale indices.
+        # bake stale indices. Only a multi-token prefill row triggers the
+        # plan: single-token rows (a PD request's last-token recompute) run as
+        # decodes on the imported ring and stay graph-capturable.
+        has_real_prefill_row = False
+        if num_reqs:
+            starts = getattr(self, "_private_circle_compute_starts_np", None)
+            if starts is None:
+                starts = self.input_batch.num_computed_tokens_cpu
+            has_real_prefill_row = bool(
+                np.any(
+                    (starts[:num_reqs] < self.input_batch.num_prompt_tokens[:num_reqs])
+                    & (num_scheduled_tokens[:num_reqs] > 1)
+                )
+            )
         self._private_circle_prefill_workspace = (
-            self._private_circle_active and with_prefill
+            self._private_circle_active
+            and (with_prefill or has_real_prefill_row)
         )
 
         # Get positions.
@@ -3823,6 +3854,15 @@ class NPUModelRunner(GPUModelRunner):
                     )
             cm_base.private_circle_bounded_replay_start = bounded_replay_start
             cm_base.private_circle_persistent_start = persistent_start
+            # Host-side row identity for the decode-first violation log.
+            cm_base.private_circle_req_ids = list(self.input_batch.req_ids[:num_reqs])
+            if num_computed_tokens_cpu is not None:
+                cm_base.private_circle_num_computed = (
+                    num_computed_tokens_cpu[:num_reqs].tolist()
+                )
+                cm_base.private_circle_num_prompt = (
+                    num_prompt_tokens_cpu[:num_reqs].tolist()
+                )
             # Host mirror of the tensors above; skips async device tasks on
             # bounded replay steps and all GPU read-backs otherwise.
             cm_base.private_circle_has_bounded_replay = self._private_circle_has_bounded_replay

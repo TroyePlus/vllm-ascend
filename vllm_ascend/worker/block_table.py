@@ -177,6 +177,10 @@ class BlockTable:
         ring_block = torch.remainder(torch.div(pos, block_size, rounding_mode="floor"), blocks_per_allocation)
         slots = (1 + alloc * blocks_per_allocation + ring_block) * block_size + torch.remainder(pos, block_size)
         self.slot_mapping.gpu[: slots.numel()].copy_(slots.to(dtype=torch.int32))
+        # Mirror the triton kernel's tail pad so padded (graph-replay) tokens
+        # never write through stale ring slots.
+        if slots.numel() < self.slot_mapping.gpu.numel():
+            self.slot_mapping.gpu[slots.numel():].fill_(PAD_SLOT_ID)
 
     def compute_slot_mapping(
         self,

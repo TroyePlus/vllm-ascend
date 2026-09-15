@@ -25,6 +25,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.logger import logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -95,6 +96,34 @@ def _format_private_circle_slots(flat: torch.Tensor, block_size: int) -> torch.T
     return slots
 
 
+def _private_circle_batch_rows(
+    common: Any, num_reqs: int, flags: torch.Tensor
+) -> list[str]:
+    """Describe every batch row for the decode-first violation log."""
+    req_ids = getattr(common, "private_circle_req_ids", None) or []
+    num_computed = getattr(common, "private_circle_num_computed", None)
+    num_prompt = getattr(common, "private_circle_num_prompt", None)
+    qsl = getattr(common, "query_start_loc_cpu", None)
+    if qsl is None:
+        qsl = getattr(common, "query_start_loc", None)
+    qsl_values = qsl.tolist() if qsl is not None else None
+    desc = []
+    for i in range(num_reqs):
+        parts = [
+            f"row={i}",
+            f"req={req_ids[i] if i < len(req_ids) else '?'}",
+            f"prefill={bool(flags[i])}",
+        ]
+        if qsl_values is not None and i + 1 < len(qsl_values):
+            parts.append(f"q={qsl_values[i + 1] - qsl_values[i]}")
+        if num_computed is not None and i < len(num_computed):
+            parts.append(f"c={num_computed[i]}")
+        if num_prompt is not None and i < len(num_prompt):
+            parts.append(f"p={num_prompt[i]}")
+        desc.append(":".join(parts))
+    return desc
+
+
 def _assert_decode_rows_first(common: Any, num_reqs: int, num_decodes: int) -> None:
     """The positional split assumes decode rows precede prefill rows.
 
@@ -112,11 +141,21 @@ def _assert_decode_rows_first(common: Any, num_reqs: int, num_decodes: int) -> N
     flags = is_prefilling[:num_reqs].bool()
     if bool(flags[:num_decodes].any()):
         rows = [i for i in range(num_decodes) if bool(flags[i])]
+        logger.error(
+            "PRIVATE_CIRCLE_POOL batch_composition num_reqs=%d num_decodes=%d "
+            "rows=[%s]",
+            num_reqs,
+            num_decodes,
+            ", ".join(_private_circle_batch_rows(common, num_reqs, flags)),
+        )
         raise RuntimeError(
             "V4.1 private circle pool requires decode rows before prefill "
-            f"rows in the batch; prefill rows {rows[:8]} precede decode rows. "
-            "Disable long_prefill_token_threshold and the reordering "
-            "schedulers (short_request_first / dyntra_lb / batch_job_aware / "
+            f"rows in the batch; prefill rows {rows[:8]} precede decode rows "
+            "(see PRIVATE_CIRCLE_POOL batch_composition above; q=1 marks "
+            "last-token-recompute rows, large q marks multi-step local "
+            "prefill, '?' rows lack runner metadata). Disable "
+            "long_prefill_token_threshold and the reordering schedulers "
+            "(short_request_first / dyntra_lb / batch_job_aware / "
             "profiling_chunk / recompute) when the private circle pool is "
             "enabled."
         )
@@ -128,6 +167,7 @@ def _prepare_private_circle_plan(
     vllm_config: VllmConfig,
     storage_block_size: int,
     blocks_per_allocation: int,
+    num_real_reqs: int | None = None,
 ) -> dict:
     """Step-local compact workspace plan for private-circle Prefill.
 
@@ -147,6 +187,10 @@ def _prepare_private_circle_plan(
     qsl_values = qsl.tolist()
     seq_values = common.seq_lens.tolist()
     num_reqs = len(seq_values)
+    if num_real_reqs is not None:
+        # common.seq_lens carries padded rows on graph/DP-aligned steps;
+        # padding rows hold no allocations and must not enter the plan.
+        num_reqs = min(num_reqs, int(num_real_reqs))
     query_lens = [qsl_values[i + 1] - qsl_values[i] for i in range(num_reqs)]
     num_decodes, num_decode_tokens, _num_prefills, _num_prefill_tokens = _request_counts(common, num_reqs)
     _assert_decode_rows_first(common, num_reqs, num_decodes)
@@ -1293,6 +1337,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self._start_pos = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cmp_residual = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._smla_metadata = torch.zeros(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
@@ -1480,6 +1525,12 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._seq_lens[:num_reqs].copy_(coordinates["seq_lens"])
         if num_actual_reqs < num_reqs:
             self._seq_lens[num_actual_reqs:num_reqs].zero_()
+        # start_pos must live in a persistent buffer: the attention forward
+        # reads it inside the ACLGraph capture, and a per-step allocation
+        # would bake a stale address into the replayed graph.
+        self._start_pos[:num_reqs].copy_(coordinates["start_pos"])
+        if num_actual_reqs < num_reqs:
+            self._start_pos[num_actual_reqs:num_reqs].zero_()
         plane_ratio = ratio if compressed else 1
         self._cache_seq_lens[:num_reqs].copy_(
             torch.div(
@@ -1489,6 +1540,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             )
         )
         coordinates["seq_lens"] = self._seq_lens[:num_reqs]
+        coordinates["start_pos"] = self._start_pos[:num_reqs]
         coordinates["cache_seq_lens"] = self._cache_seq_lens[:num_reqs]
         cmp_residual_buffer = None
         if compressed and ratio == 2:
@@ -1503,7 +1555,21 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_decode_tokens,
             num_prefills,
             num_prefill_tokens,
-        ) = _request_counts(common, num_reqs)
+        ) = _request_counts(common, num_actual_reqs)
+        if (
+            cache_kind == "swa"
+            and num_prefills > 0
+            and num_prefill_tokens == num_prefills
+            and getattr(common, "private_circle_blocks_per_allocation", None)
+        ):
+            # Every prefill row schedules exactly one token: a PD request's
+            # last-token recompute, whose window the imported ring already
+            # covers. Run those rows as decodes so the step needs no plan and
+            # stays graph-capturable.
+            num_decodes += num_prefills
+            num_decode_tokens += num_prefill_tokens
+            num_prefills = 0
+            num_prefill_tokens = 0
         if cache_kind == "swa" and positions is not None:
             cos, sin = get_cos_and_sin_dsa(
                 positions,
@@ -1530,9 +1596,11 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     self.vllm_config,
                     spec.storage_block_size,
                     int(blocks_per_allocation),
+                    num_real_reqs=num_actual_reqs,
                 )
                 # Prefill tokens scatter into the shared compact workspace;
                 # decode tokens keep the ring slots from the group table.
+                # Padding rows beyond the real requests contribute no slots.
                 self._private_circle_slots_2d = torch.empty(
                     (num_input_tokens, 2), dtype=torch.int32, device=self.device
                 )
@@ -1542,9 +1610,11 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                         spec.storage_block_size,
                     )
                     self._private_circle_slots_2d[:num_decode_tokens].copy_(ring_slots)
-                self._private_circle_slots_2d[num_decode_tokens:].copy_(
+                prefill_end = num_decode_tokens + num_prefill_tokens
+                self._private_circle_slots_2d[num_decode_tokens:prefill_end].copy_(
                     private_circle_plan["prefill_slots"]
                 )
+                self._private_circle_slots_2d[prefill_end:].fill_(-1)
                 slots = self._private_circle_slots_2d[:num_input_tokens]
 # TODO kezong
         # if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:

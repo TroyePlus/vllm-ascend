@@ -14,7 +14,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSl
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 
-STATE_RING_ROWS = 32
+STATE_RING_ROWS = 16
 
 
 @dataclass(frozen=True, kw_only=True)
