@@ -28,7 +28,7 @@ def flag(k, default):
         raise ValueError(k + " must be true/false/1/0")
     return s in ("true", "1")
 data = {
-    "compile": dict(mode=1, backend="inductor", cudagraph_mode="NONE",
+    "compile": dict(mode=0 if e.get("P_EAGER") == "1" else 1, backend="inductor", cudagraph_mode="NONE",
                     debug_dump_path=e.get("MOE_AUDIT_DUMP", os.path.abspath("fx_dump"))),
     "additional": dict(enable_cpu_binding=flag("P_CPU_BINDING", "true"),
                        enable_shared_expert_dp=True, enable_dsa_cp=True,
@@ -45,6 +45,16 @@ print(json.dumps(data[sys.argv[1]]))
 PY
 }
 p_extra=()
+entry=(vllm)
+if [[ "${P_EAGER:-0}" == 1 ]]; then
+    p_extra+=(--enforce-eager)
+    entry=(python -m tools.moe_audit.eager_entry)
+    [[ "${P_EAGER_RAW:-0}" != 1 ]] || entry=(vllm)
+    export VLLM_ASCEND_ENABLE_FXRT_BACKEND=0
+    export VLLM_ASCEND_ENABLE_INDUCTOR_FXRT=0
+    export VLLM_ASCEND_ENABLE_INDUCTOR_ASCENDC=0
+    unset VLLM_EXTERNAL_FX_BACKEND
+fi
 [[ -z "${P_LOAD_FORMAT:-}" ]] || p_extra+=(--load-format "$P_LOAD_FORMAT")
 if [[ "${P_LOAD_FORMAT:-}" == "dummy" ]]; then
     loader_extra=()
@@ -55,7 +65,7 @@ kv_extra=(--kv-transfer-config "$(p_json kv)")
 if [[ "${P_DISABLE_KV:-0}" == 1 ]]; then
     kv_extra=()
 fi
-vllm serve "$P_MODEL" --host "${P_LISTEN_HOST:-0.0.0.0}" --port "$2" \
+"${entry[@]}" serve "$P_MODEL" --host "${P_LISTEN_HOST:-0.0.0.0}" --port "$2" \
     --data-parallel-size "$3" --data-parallel-rank "$4" \
     --data-parallel-address "$5" --data-parallel-rpc-port "$6" --tensor-parallel-size "$7" \
     --enable-expert-parallel --seed 1024 --served-model-name "${P_MODEL_NAME:-dsv4}" \

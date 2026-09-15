@@ -7,7 +7,7 @@ mode=${1:?full|split}
 devices=${2:-"0,1;2,3"}
 log_root=${3:-/workspace/dsv4/logs/ttft-$mode}
 [[ "$mode" == full || "$mode" == split ]]
-export PYTHONPATH=/vllm-workspace/vllm-ascend:/vllm-workspace/vllm:${PYTHONPATH:-}
+export PYTHONPATH=${P_ASCEND_SOURCE:-/vllm-workspace/vllm-ascend}:/vllm-workspace/vllm:${PYTHONPATH:-}
 export P_NIC=${P_NIC:-lo} P_LOCAL_IP=${P_LOCAL_IP:-127.0.0.1}
 export P_MODEL=${P_MODEL:-/workspace/models/DeepSeek-V4-Flash-w8a8-mtp}
 export P_LOAD_FORMAT=${P_LOAD_FORMAT:-dummy} P_MEMORY_UTIL=${P_MEMORY_UTIL:-0.45}
