@@ -387,7 +387,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.engram = AscendEngram(config, quant_config, prefix)
         else:
             self.engram = None
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
+        # self.ffn_norm = RMSNorm(config.hidden_size, eps=self.norm_eps)
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor,
                hc_scale: torch.Tensor, hc_base: torch.Tensor):
@@ -433,7 +433,8 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
             hidden_states, attn_pre, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        x = self.ffn_norm(x)
+        # x = self.ffn_norm(x)
+        x = self.post_attention_layernorm(x)
         x_fp32 = x.to(torch.float32)
         x = self.mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
