@@ -106,7 +106,10 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        slot_mapping = slots[:, 0] * k_cache.shape[1] + slots[:, 1]
+        # slot_mapping = slots[:, 0] * k_cache.shape[1] + slots[:, 1]
+        slot_mapping = slots[:, 1] + 1
+        invalid = (slots[:, 0] == -1) & (slots[:, 1] == -1)
+        slot_mapping = torch.where(invalid, torch.full_like(slot_mapping, -1), slot_mapping)
         slots = slot_mapping.to(torch.int32)
         key = key.squeeze(1)
 
