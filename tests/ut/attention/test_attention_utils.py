@@ -17,7 +17,10 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_ascend.attention.utils import filter_chunked_req_indices, get_or_register_attention_buffer
+from vllm_ascend.attention.utils import (
+    filter_chunked_req_indices,
+    get_or_register_attention_buffer,
+)
 
 
 def test_get_or_register_attention_buffer() -> None:

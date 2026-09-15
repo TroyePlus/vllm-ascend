@@ -1,0 +1,577 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Ported from vllm-ascend swa_private_pool (v0.23-era) via the v0.27.1rc
+# private SWA pool; adapted for DSV4.1 on V27-dsv4.1 (PrivateCirclePool).
+# vLLM v0.27 already tracks Request.num_in_flight_tokens, applies the
+# in-flight adjustment inside remove_skipped_blocks(), and owns the
+# admission-cap/max_memory_usage_bytes plumbing; only the request-private
+# circle pool lifecycle is patched here.
+from functools import wraps
+from typing import Any
+
+from vllm.config import VllmConfig
+from vllm.logger import logger
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.request import Request
+
+from vllm_ascend import envs
+from vllm_ascend.core.deepseek_v41 import DeepseekV41SWASpec
+from vllm_ascend.core.private_circle_pool import (
+    PRIVATE_CIRCLE_TRANSFER_FAILED,
+    PRIVATE_CIRCLE_TRANSFER_NONE,
+    PRIVATE_CIRCLE_TRANSFER_READY,
+    PRIVATE_CIRCLE_TRANSFER_RECEIVING,
+    PrivateCirclePool,
+    PrivateCircleConfig,
+    compute_prefix_bounded_replay_start,
+    detect_new_prefix_hit_length,
+)
+
+
+def _find_private_circle_spec(spec: Any) -> SlidingWindowSpec | None:
+    if isinstance(spec, DeepseekV41SWASpec):
+        return spec
+    nested = getattr(spec, "kv_cache_specs", None)
+    if isinstance(nested, dict):
+        nested = list(nested.values())
+    if isinstance(nested, (list, tuple, set)):
+        for child in nested:
+            found = _find_private_circle_spec(child)
+            if found is not None:
+                return found
+    return None
+
+
+_original_request_init = Request.__init__
+
+
+@wraps(_original_request_init)
+def _patched_request_init(self: Request, *args: Any, **kwargs: Any) -> None:
+    _original_request_init(self, *args, **kwargs)
+    self.private_circle_allocation = None
+    self.private_circle_confirmed_length = 0
+    self.private_circle_valid_length = 0
+    self.private_circle_window_start = 0
+    self.private_circle_pool_type = "private"
+    # First prefix-cache hit only; None means no bounded replay is due.
+    self.private_circle_original_hit_length = None
+    self.private_circle_effective_start = None
+    self.private_circle_transfer_allocation = None
+    self.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
+    self.private_circle_imported_window_start = None
+    self.private_circle_imported_valid_length = None
+    self.private_circle_transfer_shared_block_ids = frozenset()
+
+
+def _record_private_circle_prefix_hit(
+    request: Request,
+    hit_length: int,
+    private_pool: PrivateCirclePool,
+) -> None:
+    """Record one-shot SWA bounded replay boundaries for a cache hit."""
+    if not envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL or hit_length <= 0:
+        return
+    previous_hit_length = getattr(request, "private_circle_original_hit_length", None)
+    request.private_circle_original_hit_length = int(hit_length)
+    request.private_circle_effective_start = compute_prefix_bounded_replay_start(
+        int(hit_length), private_pool.config.window_size
+    )
+    # Log only the first observation.
+    if previous_hit_length != int(hit_length):
+        total_prompt_tokens = int(getattr(request, "num_prompt_tokens", 0))
+        bounded_replay_start = int(request.private_circle_effective_start)
+        logger.info(
+            "PRIVATE_CIRCLE_POOL prefix_hit request_id=%s total_prompt_tokens=%d "
+            "hit_tokens=%d bounded_replay_start=%d bounded_replay_tokens=%d",
+            request.request_id,
+            total_prompt_tokens,
+            int(hit_length),
+            bounded_replay_start,
+            int(hit_length) - bounded_replay_start,
+        )
+
+
+def _private_circle_import_covers(
+    request: Request,
+    confirmed_length: int,
+    window_size: int,
+) -> bool:
+    imported_start = getattr(
+        request, "private_circle_imported_window_start", None
+    )
+    imported_end = getattr(
+        request, "private_circle_imported_valid_length", None
+    )
+    if imported_start is None or imported_end is None:
+        return False
+    required_start = max(0, confirmed_length - window_size + 1)
+    return int(imported_start) <= required_start and int(imported_end) >= confirmed_length
+
+
+_original_get_computed_blocks = KVCacheManager.get_computed_blocks
+
+
+@wraps(_original_get_computed_blocks)
+def _patched_get_computed_blocks(self: KVCacheManager, request: Request):
+    """Record local prefix hits; v0.27 returns a 3-tuple here."""
+    was_uncomputed = int(request.num_computed_tokens) == 0
+    result = _original_get_computed_blocks(self, request)
+    if was_uncomputed:
+        private_pool = None
+        if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL:
+            private_pool = getattr(self.coordinator, "private_circle_pool", None)
+        if private_pool is not None:
+            _, hit_length, _ = result
+            _record_private_circle_prefix_hit(request, int(hit_length), private_pool)
+        else:
+            # Keep prefix-cache observability when the private circle pool is
+            # absent (feature disabled, or a non-V4.1 model with the env set).
+            # No bounded replay state is created on this compatibility path.
+            _, hit_length, _ = result
+            if int(hit_length) > 0:
+                total_prompt_tokens = int(getattr(request, "num_prompt_tokens", 0))
+                logger.info(
+                    "PREFIX_CACHE hit request_id=%s total_prompt_tokens=%d "
+                    "hit_tokens=%d private_circle_pool_enabled=False",
+                    request.request_id,
+                    total_prompt_tokens,
+                    int(hit_length),
+                )
+    return result
+
+
+KVCacheManager.get_computed_blocks = _patched_get_computed_blocks
+
+
+_original_update_after_schedule = Scheduler._update_after_schedule
+
+
+@wraps(_original_update_after_schedule)
+def _patched_update_after_schedule(
+    self: Scheduler, scheduler_output: SchedulerOutput
+) -> None:
+    private_pool = getattr(
+        self.kv_cache_manager.coordinator, "private_circle_pool", None
+    )
+    computed_before_schedule: dict[str, int] = {}
+    if private_pool is not None:
+        # Scheduler-visible positions before upstream advances them; zero
+        # identifies newly admitted requests whose prefix may come from an
+        # external connector.
+        computed_before_schedule = {
+            request_id: int(request.num_computed_tokens)
+            for request_id, request in self.requests.items()
+        }
+    _original_update_after_schedule(self, scheduler_output)
+    private_metadata: dict[str, dict[str, Any]] = {}
+    if private_pool is not None:
+        # Reconcile the final hit after local and external matching; async
+        # loads may have no scheduled tokens (WAITING_FOR_REMOTE_KVS).
+        for request_id, computed_before in computed_before_schedule.items():
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            status = getattr(request, "status", None)
+            status_name = getattr(status, "name", str(status))
+            num_scheduled = int(
+                scheduler_output.num_scheduled_tokens.get(request_id, 0)
+            )
+            confirmed_length = max(
+                0, int(request.num_computed_tokens) - num_scheduled
+            )
+            transfer_state = getattr(
+                request, "private_circle_transfer_state",
+                PRIVATE_CIRCLE_TRANSFER_NONE,
+            )
+            if transfer_state == PRIVATE_CIRCLE_TRANSFER_RECEIVING:
+                continue
+            if transfer_state == PRIVATE_CIRCLE_TRANSFER_FAILED:
+                continue
+            if transfer_state == PRIVATE_CIRCLE_TRANSFER_READY:
+                if not _private_circle_import_covers(
+                    request, confirmed_length, private_pool.config.window_size
+                ):
+                    request.private_circle_transfer_state = (
+                        PRIVATE_CIRCLE_TRANSFER_FAILED
+                    )
+                    raise RuntimeError(
+                        "imported private circle does not cover the confirmed "
+                        f"prefix for request {request_id}"
+                    )
+                # The D node consumes P-generated SWA directly.
+                request.private_circle_original_hit_length = None
+                request.private_circle_effective_start = None
+                continue
+            confirmed_from_schedule = detect_new_prefix_hit_length(
+                computed_before,
+                int(request.num_computed_tokens),
+                num_scheduled,
+                waiting_for_remote_kvs=status_name == "WAITING_FOR_REMOTE_KVS",
+            )
+            if confirmed_from_schedule is not None:
+                _record_private_circle_prefix_hit(
+                    request, confirmed_from_schedule, private_pool
+                )
+    for request_id, num_scheduled_tokens in (
+        scheduler_output.num_scheduled_tokens.items()
+    ):
+        request = self.requests.get(request_id)
+        if request is None:
+            # Upstream may drop an immediately finished request.
+            continue
+        if private_pool is None:
+            continue
+        allocation = private_pool.get_allocation(request_id)
+        if allocation is None:
+            raise RuntimeError(f"request {request_id} has no private circle allocation")
+        # _update_after_schedule has already advanced num_computed_tokens to P.
+        # Private metadata must describe the scheduler-visible prefix H.
+        confirmed = max(
+            0, int(request.num_computed_tokens) - int(num_scheduled_tokens)
+        )
+        original_hit = getattr(request, "private_circle_original_hit_length", None)
+        effective_start = getattr(request, "private_circle_effective_start", None)
+        valid = confirmed + int(num_scheduled_tokens)
+        window = private_pool.config.window_size
+        window_start = max(0, valid - window)
+        request.private_circle_allocation = allocation
+        request.private_circle_confirmed_length = confirmed
+        request.private_circle_valid_length = valid
+        request.private_circle_window_start = window_start
+        private_metadata[request_id] = {
+            "layout_version": 1,
+            "pool_type": "private",
+            "allocation_handle": allocation,
+            "confirmed_length": confirmed,
+            "shared_cache_length": confirmed,
+            "circle_compute_start": (
+                effective_start if effective_start is not None else confirmed
+            ),
+            "bounded_replay_length": (
+                confirmed - effective_start
+                if effective_start is not None else 0
+            ),
+            # Compatibility aliases for the model metadata path.
+            "original_prefix_hit_length": original_hit,
+            "effective_compute_start": (
+                effective_start if effective_start is not None else confirmed
+            ),
+            "valid_length": valid,
+            "window_start": window_start,
+            "physical_block_size": private_pool.config.block_size,
+            "window_size": window,
+            "in_flight_tokens": private_pool.config.in_flight_tokens,
+            "blocks_per_allocation": private_pool.config.blocks_per_allocation,
+            "num_allocations": private_pool.config.num_allocations,
+            "private_num_blocks": private_pool.config.num_blocks,
+        }
+        # Bounded replay metadata and imported-SWA readiness are one-shot: later
+        # chunks use the local ring as ordinary history.
+        if (
+            getattr(request, "private_circle_transfer_state", None)
+            == PRIVATE_CIRCLE_TRANSFER_READY
+        ):
+            request.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
+        request.private_circle_original_hit_length = None
+        request.private_circle_effective_start = None
+    setattr(scheduler_output, "private_circle_metadata", private_metadata)
+
+
+_original_handle_invalid_blocks = Scheduler._handle_invalid_blocks
+
+
+@wraps(_original_handle_invalid_blocks)
+def _patched_handle_invalid_blocks(
+    self: Scheduler,
+    invalid_block_ids: set[int],
+    num_scheduled_tokens: dict[str, int],
+) -> set[str]:
+    """Map private-circle load failures without recomputation.
+
+    The connector records one scheduler-visible shared group per receiving
+    request and reports IDs from that group; a failed private-circle import is
+    never eligible for recomputation.
+    """
+    private_pool = getattr(
+        self.kv_cache_manager.coordinator, "private_circle_pool", None
+    )
+    if private_pool is None:
+        return _original_handle_invalid_blocks(
+            self, invalid_block_ids, num_scheduled_tokens
+        )
+
+    receiving_requests = [
+        request
+        for request in (*self.skipped_waiting, *self.running)
+        if (
+            getattr(request, "private_circle_transfer_state", None)
+            == PRIVATE_CIRCLE_TRANSFER_RECEIVING
+        )
+    ]
+    failed_request_ids = {
+        request.request_id
+        for request in receiving_requests
+        if invalid_block_ids.intersection(
+            getattr(
+                request,
+                "private_circle_transfer_shared_block_ids",
+                (),
+            )
+        )
+    }
+    if failed_request_ids:
+        return failed_request_ids
+
+    if receiving_requests:
+        # A private-circle load failure cannot be recovered safely. If a worker
+        # reports IDs that cannot be mapped (for example due to a connector
+        # version mismatch), fail all in-flight private imports rather than
+        # accidentally promoting one with incomplete SWA.
+        failed_request_ids = {
+            request.request_id for request in receiving_requests
+        }
+        logger.error(
+            "Private circle load errors %s did not match request block IDs; "
+            "failing all receiving private-circle requests: %s",
+            sorted(invalid_block_ids),
+            sorted(failed_request_ids),
+        )
+        return failed_request_ids
+
+    return _original_handle_invalid_blocks(
+        self, invalid_block_ids, num_scheduled_tokens
+    )
+
+
+_original_allocate_slots = KVCacheManager.allocate_slots
+
+
+@wraps(_original_allocate_slots)
+def _patched_allocate_slots(self: KVCacheManager, request: Request, *args: Any, **kwargs: Any) -> Any:
+    private_pool: PrivateCirclePool | None = getattr(
+        self.coordinator, "private_circle_pool", None
+    )
+    reserved_here = False
+    if private_pool is not None and not private_pool.contains(request.request_id):
+        allocation = private_pool.reserve(request.request_id)
+        if allocation is None:
+            return None
+        request.private_circle_allocation = allocation
+        reserved_here = True
+    if not reserved_here:
+        return _original_allocate_slots(self, request, *args, **kwargs)
+    try:
+        result = _original_allocate_slots(self, request, *args, **kwargs)
+        if result is None and private_pool is not None:
+            private_pool.release(request.request_id)
+            request.private_circle_allocation = None
+        return result
+    except Exception:
+        if private_pool is not None:
+            private_pool.release(request.request_id)
+            request.private_circle_allocation = None
+        raise
+
+
+_original_kv_cache_manager_free = KVCacheManager.free
+
+
+@wraps(_original_kv_cache_manager_free)
+def _patched_kv_cache_manager_free(self: KVCacheManager, request: Request) -> None:
+    try:
+        _original_kv_cache_manager_free(self, request)
+    finally:
+        private_pool: PrivateCirclePool | None = getattr(
+            self.coordinator, "private_circle_pool", None
+        )
+        if private_pool is not None:
+            private_pool.release(request.request_id)
+        request.private_circle_allocation = None
+        request.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
+        request.private_circle_imported_window_start = None
+        request.private_circle_imported_valid_length = None
+
+
+_original_free_request_blocks = Scheduler._free_request_blocks
+
+
+@wraps(_original_free_request_blocks)
+def _patched_free_request_blocks(self: Scheduler, request: Request) -> None:
+    """Release private allocations safely on the deferred-free path.
+
+    Requests freed while their last step is in flight go through
+    pop_blocks_for_free, not KVCacheManager.free, so the usual release hook
+    never runs. Mirror the shared-block fence: detach ownership now, return
+    the slot only after the owning step completes (an in-flight step may
+    still write the ring pages, and a transfer-engine load into a recycled
+    slot is not ordered against those writes).
+    """
+    private_pool = getattr(
+        self.kv_cache_manager.coordinator, "private_circle_pool", None
+    )
+    if (
+        private_pool is not None
+        and self.defer_block_free
+        and getattr(request, "last_sched_seq", 0) > self.processed_step_seq
+    ):
+        allocation = private_pool.detach(request.request_id)
+        if allocation is not None:
+            deferred_releases = getattr(
+                self, "_private_circle_deferred_releases", None
+            )
+            if deferred_releases is None:
+                deferred_releases = []
+                self._private_circle_deferred_releases = deferred_releases
+            deferred_releases.append(
+                (getattr(request, "last_sched_seq", 0), request.request_id, allocation)
+            )
+            request.private_circle_allocation = None
+            request.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
+            request.private_circle_imported_window_start = None
+            request.private_circle_imported_valid_length = None
+    _original_free_request_blocks(self, request)
+
+
+_original_update_from_output = Scheduler.update_from_output
+
+
+@wraps(_original_update_from_output)
+def _patched_update_from_output(
+    self: Scheduler,
+    scheduler_output: SchedulerOutput,
+    model_runner_output: Any,
+) -> Any:
+    result = _original_update_from_output(self, scheduler_output, model_runner_output)
+    deferred_releases = getattr(self, "_private_circle_deferred_releases", None)
+    if deferred_releases:
+        private_pool = getattr(
+            self.kv_cache_manager.coordinator, "private_circle_pool", None
+        )
+        if private_pool is not None:
+            remaining = []
+            for fence, request_id, allocation in deferred_releases:
+                if fence <= self.processed_step_seq:
+                    # Every device write enqueued by the owning step has
+                    # completed; the ring pages can be recycled safely.
+                    private_pool.return_detached_allocation(allocation, request_id)
+                else:
+                    remaining.append((fence, request_id, allocation))
+            self._private_circle_deferred_releases = remaining
+    return result
+
+
+_original_connector_finished = Scheduler._connector_finished
+
+
+@wraps(_original_connector_finished)
+def _patched_connector_finished(self: Scheduler, request: Request) -> tuple[bool, dict[str, Any] | None]:
+    result = _original_connector_finished(self, request)
+    delay_free, _ = result
+    private_pool = getattr(
+        self.kv_cache_manager.coordinator, "private_circle_pool", None
+    )
+    allocation = getattr(request, "private_circle_allocation", None)
+    if (
+        delay_free
+        and private_pool is not None
+        and allocation is not None
+        and request.private_circle_transfer_allocation is None
+    ):
+        private_pool.acquire_ref(int(allocation))
+        request.private_circle_transfer_allocation = int(allocation)
+    return result
+
+
+_original_free_blocks = Scheduler._free_blocks
+
+
+@wraps(_original_free_blocks)
+def _patched_free_blocks(self: Scheduler, request: Request) -> None:
+    allocation = getattr(request, "private_circle_transfer_allocation", None)
+    private_pool = getattr(
+        self.kv_cache_manager.coordinator, "private_circle_pool", None
+    )
+    try:
+        _original_free_blocks(self, request)
+    finally:
+        if allocation is not None and private_pool is not None:
+            private_pool.release_ref(int(allocation))
+        request.private_circle_transfer_allocation = None
+
+
+_original_scheduler_init = Scheduler.__init__
+
+
+@wraps(_original_scheduler_init)
+def _patched_scheduler_init(self: Scheduler, vllm_config: VllmConfig, *args: Any, **kwargs: Any) -> None:
+    _original_scheduler_init(self, vllm_config, *args, **kwargs)
+    coordinator = self.kv_cache_manager.coordinator
+    private_group_ids = (list(getattr(coordinator, "private_circle_group_ids", ()))
+                           if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL else [])
+    if private_group_ids:
+        # Context-parallel variants route to their own impl classes and
+        # bypass the private pool entirely (silent corruption); fail fast.
+        from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.utils import enable_dsa_cp
+
+        # The scheduler-side process initializes AscendConfig later than
+        # Scheduler.__init__; ensure it exists before reading the CP flag
+        # (idempotent: cached when already initialized with this config).
+        init_ascend_config(vllm_config)
+
+        parallel_config = vllm_config.parallel_config
+        if (
+            enable_dsa_cp()
+            or parallel_config.prefill_context_parallel_size > 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4.1 private circle pool does not support context "
+                "parallelism (DSA-CP / PCP / DCP). Disable "
+                "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL or the context-parallel "
+                "configuration."
+            )
+        private_spec = _find_private_circle_spec(
+            coordinator.single_type_managers[private_group_ids[0]].kv_cache_spec)
+        if private_spec is None:
+            raise RuntimeError("DeepSeek-V4.1 private circle group has no SWA spec")
+        speculative_config = vllm_config.speculative_config
+        draft_tokens = (
+            getattr(speculative_config, "num_speculative_tokens", 0)
+            if speculative_config is not None
+            else 0
+        )
+        private_config = PrivateCircleConfig(
+            block_size=private_spec.block_size,
+            window_size=private_spec.sliding_window,
+            in_flight_tokens=1 + draft_tokens,
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+        )
+        coordinator.private_circle_group_ids = frozenset(private_group_ids)
+        coordinator.private_circle_config = private_config
+        coordinator.private_circle_pool = PrivateCirclePool(private_config)
+        # A failed private-circle import is terminal: recomputing the prefix
+        # would recreate the overwrite bug this protocol prevents.
+        self.recompute_kv_load_failures = False
+
+
+Request.__init__ = _patched_request_init
+Scheduler.__init__ = _patched_scheduler_init
+Scheduler._update_after_schedule = _patched_update_after_schedule
+Scheduler._handle_invalid_blocks = _patched_handle_invalid_blocks
+Scheduler._connector_finished = _patched_connector_finished
+Scheduler._free_blocks = _patched_free_blocks
+Scheduler._free_request_blocks = _patched_free_request_blocks
+Scheduler.update_from_output = _patched_update_from_output
+KVCacheManager.allocate_slots = _patched_allocate_slots
+KVCacheManager.free = _patched_kv_cache_manager_free
+KVCacheManager.get_computed_blocks = _patched_get_computed_blocks
+
+# Unused in the v0.27 port: vLLM core now owns num_in_flight_tokens
+# bookkeeping, the in-flight-aware remove_skipped_blocks() signature, and the
+# admission-cap/max_memory_usage_bytes plumbing that the v0.23-era patch had
+# to install manually.

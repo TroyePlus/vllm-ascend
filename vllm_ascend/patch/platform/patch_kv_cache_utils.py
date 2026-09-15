@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.core.deepseek_v41 import (
     allocate_cache_config as allocate_v41_cache_config,
@@ -43,6 +44,11 @@ from vllm_ascend.core.deepseek_v41 import (
 from vllm_ascend.core.deepseek_v41 import (
     request_blocks as v41_request_blocks,
 )
+from vllm_ascend.core.private_circle_pool import (
+    PrivateCircleConfig,
+    compute_private_circle_prefill_workspace_blocks,
+    is_private_circle_kv_cache_spec,
+)
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
@@ -51,6 +57,7 @@ _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_k
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 _orig_max_memory_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_max_concurrency = vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config
+_ORIGINAL_GET_KV_CACHE_CONFIGS = vllm.v1.core.kv_cache_utils.get_kv_cache_configs
 
 
 def _ascend_pool_bytes_per_block(vllm_config, groups):
@@ -373,6 +380,90 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
 
 
+def _iter_private_circle_specs(kv_cache_groups: list[KVCacheGroupSpec]) -> list[KVCacheSpec]:
+    return [
+        spec
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for spec in group.kv_cache_spec.kv_cache_specs.values()
+        if is_private_circle_kv_cache_spec(spec)
+    ]
+
+
+def _private_circle_config_for(vllm_config: VllmConfig, spec: KVCacheSpec) -> PrivateCircleConfig:
+    draft_tokens = (
+        getattr(vllm_config.speculative_config, "num_speculative_tokens", 0)
+        if vllm_config.speculative_config is not None
+        else 0
+    )
+    return PrivateCircleConfig(
+        block_size=spec.block_size,
+        window_size=spec.sliding_window,
+        in_flight_tokens=1 + draft_tokens,
+        max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+    )
+
+
+def _get_kv_cache_config_v41(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan V4.1 shared slots, diverting SWA to the private circle ring.
+
+    Ring and prefill-workspace bytes are carved out of the profiled budget so
+    the shared global block-ID pool never backs the diverted SWA layers.
+    """
+    divert = envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and bool(
+        _iter_private_circle_specs(kv_cache_groups)
+    )
+    reserved_private_bytes = 0
+    if divert:
+        private_specs = _iter_private_circle_specs(kv_cache_groups)
+        first = private_specs[0]
+        private_config = _private_circle_config_for(vllm_config, first)
+        if any(
+            (s.block_size, s.sliding_window, s.unpadded_page_size_bytes)
+            != (first.block_size, first.sliding_window, first.unpadded_page_size_bytes)
+            for s in private_specs
+        ):
+            raise RuntimeError("all V4.1 private circle layers must share one layout")
+        ring_bytes = len(private_specs) * private_config.num_blocks * first.unpadded_page_size_bytes
+        workspace_blocks = compute_private_circle_prefill_workspace_blocks(
+            max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=private_config.max_num_seqs,
+            window_size=private_config.window_size,
+            block_size=private_config.block_size,
+        )
+        workspace_bytes = workspace_blocks * first.unpadded_page_size_bytes
+        reserved_private_bytes = ring_bytes + workspace_bytes
+        if reserved_private_bytes >= available_memory:
+            raise ValueError(
+                "Insufficient KV memory for the V4.1 private circle pool and "
+                f"Prefill workspace: ring={ring_bytes}, workspace={workspace_bytes}, "
+                f"available={available_memory}"
+            )
+        logger.info(
+            "V4.1 private circle pool: layers=%d allocations=%d "
+            "blocks_per_allocation=%d blocks=%d ring_bytes=%d "
+            "workspace_blocks=%d workspace_bytes=%d",
+            len(private_specs),
+            private_config.num_allocations,
+            private_config.blocks_per_allocation,
+            private_config.num_blocks,
+            ring_bytes,
+            workspace_blocks,
+            workspace_bytes,
+        )
+    return allocate_v41_cache_config(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+        divert_swa=divert,
+        reserved_private_bytes=reserved_private_bytes,
+    )
+
+
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -396,7 +487,7 @@ def _get_kv_cache_config_deepseek_v4(
         if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
         for s in g.kv_cache_spec.kv_cache_specs.values()
     ):
-        return allocate_v41_cache_config(vllm_config, kv_cache_groups, available_memory)
+        return _get_kv_cache_config_v41(vllm_config, kv_cache_groups, available_memory)
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
@@ -443,6 +534,67 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+_PRIVATE_CIRCLE_TENSOR_ATTR = "_vllm_ascend_private_circle"
+
+
+def _iter_private_circle_layers(
+    kv_cache_config: KVCacheConfig,
+) -> list[tuple[str, KVCacheSpec]]:
+    private_layers: list[tuple[str, KVCacheSpec]] = []
+    for group in kv_cache_config.kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        specs = getattr(group_spec, "kv_cache_specs", None)
+        for layer_name in group.layer_names:
+            layer_spec = specs[layer_name] if isinstance(specs, dict) else group_spec
+            if is_private_circle_kv_cache_spec(layer_spec):
+                private_layers.append((layer_name, layer_spec))
+    return private_layers
+
+
+def _append_private_circle_tensors(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Append fixed-size ring tensors after shared-pool rank alignment."""
+    private_layers = _iter_private_circle_layers(kv_cache_config)
+    if not private_layers:
+        return
+    existing_layers = {
+        layer_name
+        for tensor in kv_cache_config.kv_cache_tensors
+        for layer_name in tensor.shared_by
+    }
+    first_config = _private_circle_config_for(vllm_config, private_layers[0][1])
+    for layer_name, layer_spec in private_layers:
+        if layer_name in existing_layers:
+            continue
+        private_config = _private_circle_config_for(vllm_config, layer_spec)
+        if private_config != first_config:
+            raise RuntimeError("all V4.1 private circle layers must share one layout")
+        tensor = KVCacheTensor(
+            size=layer_spec.unpadded_page_size_bytes * private_config.num_blocks,
+            shared_by=[layer_name],
+        )
+        # The dynamic marker survives normal Python process transfer. Workers
+        # also derive private membership from the layer spec as a safe fallback.
+        setattr(tensor, _PRIVATE_CIRCLE_TENSOR_ATTR, True)
+        kv_cache_config.kv_cache_tensors.append(tensor)
+
+
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Keep private-circle ring sizes out of shared rank-size normalization."""
+    kv_cache_configs = _ORIGINAL_GET_KV_CACHE_CONFIGS(
+        vllm_config, kv_cache_specs, available_memory
+    )
+    if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL:
+        for kv_cache_config in kv_cache_configs:
+            _append_private_circle_tensors(vllm_config, kv_cache_config)
+    return kv_cache_configs
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_from_groups
@@ -450,6 +602,7 @@ vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config = _ascend_ma
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _ascend_get_kv_cache_configs
 # vLLM v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
 # get_kv_cache_config_from_groups now calls _get_kv_cache_config_packed directly, bypassing
 # the alias patch above. Patch the canonical name so Ascend's non-packed layout is used.
@@ -462,3 +615,4 @@ KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs
