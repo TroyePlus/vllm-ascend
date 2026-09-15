@@ -105,6 +105,18 @@ was attempted but the worker aborted while the sampler was attaching.
 The test processes were then cleaned up without restarting the user's container.
 Further work is needed for a successful unmodified-parent benchmark.
 
+A subsequent retry on the fully free contiguous group `0,1;2,3`
+(`eager741-before-contiguous`) completed startup and returned HTTP 200 for
+health. The same benchmark then failed: 0/100 measured requests completed.
+The first request failed at the old `attention/context_parallel/dsa_cp.py:1262`
+call to `torch_npu.npu_transpose_batchmatmul`, with `IndexError: Dimension out
+of range (expected to be in range of [-2, 1], but got 2)`. The benchmark's
+success assertion correctly rejected the output rather than reporting zero
+TTFT. The earlier AIV timeout is therefore not a deterministic startup failure
+of the old code; card grouping/runtime state remain candidate causes.
+The old model's request-path compatibility with the reduced dummy setup
+remains unresolved, and no successful historical TTFT should be inferred.
+
 ## Evidence locations
 
 - Container: `/workspace/dsv4/logs/eager741-{full,split,before}`.
@@ -115,6 +127,8 @@ Further work is needed for a successful unmodified-parent benchmark.
 - Latest historical retry: `/home/liyizhan/dsv4/eager-before-opaque-free`,
   including `plog-rank0.log`. `py-spy` was installed only into
   `/workspace/dsv4/ttft741/diagnostics`, not into site-packages.
+- Request-path retry: `/home/liyizhan/dsv4/eager-before-contiguous`, including
+  the failed detailed benchmark JSON and server stack traces.
 - Test worker processes were released after each run. PID1 retains defunct
   children, which do not hold NPU allocations; the user's shell/editor was
   preserved, so the container was not restarted.
