@@ -451,7 +451,7 @@ class DeepseekV41EagerAttentionImpl:
         slots = torch.arange(x.shape[0], dtype=torch.int64, device=x.device)
         torch.ops.custom.kv_compress_epilog_v2(
             rows,
-            self._to_attention_cache_order(x).contiguous(),
+            x,
             slots,
             quant_group_size=group_size,
             quant_mode=quant_mode,
