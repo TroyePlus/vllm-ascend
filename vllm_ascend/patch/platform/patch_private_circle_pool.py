@@ -64,6 +64,7 @@ def _patched_request_init(self: Request, *args: Any, **kwargs: Any) -> None:
     self.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
     self.private_circle_imported_window_start = None
     self.private_circle_imported_valid_length = None
+    self.private_circle_remote_local_hit = None
     self.private_circle_transfer_shared_block_ids = frozenset()
 
 
@@ -202,6 +203,16 @@ def _patched_update_after_schedule(
                         "imported private circle does not cover the confirmed "
                         f"prefix for request {request_id}"
                     )
+                logger.info(
+                    "PRIVATE_CIRCLE_POOL import_cover request_id=%s "
+                    "confirmed_length=%d imported_window=[%d, %d) "
+                    "replay_cancelled=%s",
+                    request_id,
+                    confirmed_length,
+                    int(request.private_circle_imported_window_start),
+                    int(request.private_circle_imported_valid_length),
+                    request.private_circle_effective_start is not None,
+                )
                 # The D node consumes P-generated SWA directly.
                 request.private_circle_original_hit_length = None
                 request.private_circle_effective_start = None
@@ -394,6 +405,7 @@ def _patched_kv_cache_manager_free(self: KVCacheManager, request: Request) -> No
         request.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
         request.private_circle_imported_window_start = None
         request.private_circle_imported_valid_length = None
+        request.private_circle_remote_local_hit = None
 
 
 _original_free_request_blocks = Scheduler._free_request_blocks
@@ -433,6 +445,7 @@ def _patched_free_request_blocks(self: Scheduler, request: Request) -> None:
             request.private_circle_transfer_state = PRIVATE_CIRCLE_TRANSFER_NONE
             request.private_circle_imported_window_start = None
             request.private_circle_imported_valid_length = None
+            request.private_circle_remote_local_hit = None
     _original_free_request_blocks(self, request)
 
 

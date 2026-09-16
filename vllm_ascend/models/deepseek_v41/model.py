@@ -657,7 +657,8 @@ class DeepseekV41Model(DeepseekV4Model):
             lookups, token_mask = engram_lookups, engram_mask
         self.shared_attention_state.reset()
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
+        # pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
+        pre_mix = torch.zeros_like(hidden_states[..., 0], dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
         aux_hidden_states = []

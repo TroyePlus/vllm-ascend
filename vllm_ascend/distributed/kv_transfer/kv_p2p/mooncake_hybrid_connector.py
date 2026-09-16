@@ -1618,6 +1618,11 @@ class MooncakeConnectorScheduler:
             actual = self._state_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
             if count > 0:
+                if self.private_circle_group_ids:
+                    # Stash the block-aligned local hit; it is the absolute
+                    # base that update_state_after_alloc must add the
+                    # external tokens to.
+                    request.private_circle_remote_local_hit = num_computed_tokens
                 return count, True
 
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
@@ -1655,10 +1660,18 @@ class MooncakeConnectorScheduler:
                         for group_id in self.private_circle_group_ids:
                             local_groups[group_id] = local_pages
                         local_block_ids = tuple(local_groups)
-                        expected_length = (
-                            int(request.num_computed_tokens)
-                            + int(num_external_tokens)
+                        # request.num_computed_tokens is still 0 for a fresh
+                        # remote request; the absolute confirmed length after
+                        # the transfer is local prefix hit + external tokens.
+                        remote_local_hit = getattr(
+                            request, "private_circle_remote_local_hit", None
                         )
+                        base_length = (
+                            int(remote_local_hit)
+                            if remote_local_hit is not None
+                            else int(request.num_computed_tokens)
+                        )
+                        expected_length = base_length + int(num_external_tokens)
                         imported_start = int(private_layout["window_start"])
                         imported_end = int(private_layout["valid_length"])
                         required_start = max(

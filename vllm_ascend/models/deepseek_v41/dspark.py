@@ -119,7 +119,8 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids).unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
+        # pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
+        pre_mix = torch.zeros_like(hidden_states[..., 0], dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
         moe_input_ids = input_ids

@@ -32,8 +32,15 @@ def _compact_to_token_aligned(
     rank = complete.long().cumsum(0) - 1
     rank = rank.clamp_(min=0, max=compact.shape[0] - 1)
     gathered = compact[rank]
-    out.zero_()
-    out[complete] = gathered[complete].to(out.dtype)
+    # Masked boolean indexing lowers to dynamic Nonzero and cannot be
+    # captured by ACLGraph; broadcast the mask instead.
+    out.copy_(
+        torch.where(
+            complete.unsqueeze(-1),
+            gathered,
+            torch.zeros_like(gathered),
+        ).to(out.dtype)
+    )
     return out
 
 
