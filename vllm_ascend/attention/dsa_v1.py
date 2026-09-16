@@ -1465,9 +1465,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         ascend_config = get_ascend_config()
         self._fxrt_prefill_decompose = fxrt_prefill_decompose_enabled()
+        self._use_cv_prefill_prolog = (
+            ascend_config.multistream_dsv4_dsa_overlap and not is_a5_bf16_kv_enabled(self.vllm_config)
+        )
         # Python Stream objects and context managers are not valid fullgraph
-        # FX inputs. Use the equivalent serial DSA path for decomposed FXRT
-        # prefill; eager/opaque execution keeps the configured overlap path.
+        # FX inputs. Serialize the configured prolog for decomposed prefill
+        # without changing its operators or intermediate dtypes.
         self.multistream_dsv4_dsa_overlap = (
             ascend_config.multistream_dsv4_dsa_overlap
             and not self._fxrt_prefill_decompose
@@ -1708,6 +1711,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if common_attn_metadata is None:
             common_attn_metadata = layer_metadata.swa
         actual_tokens = common_attn_metadata.num_actual_tokens
+        if self._fxrt_prefill_decompose:
+            actual_tokens = _require_req_metadata(common_attn_metadata).cos[layer_name].shape[0]
 
         o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
@@ -1866,8 +1871,12 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         Each stream's data is self-contained; no cross-stream sync is needed between blocks.
         Only the tail wait_stream ensures scatter is complete.
         """
-        main_stream = torch.npu.current_stream()
-        aux_stream = dsv4_dsa_overlap_stream()
+        # Preserve the configured prolog's operators and intermediate dtypes
+        # when serializing it for tracing. The other serial prolog uses fused
+        # RMS/quantization and is not numerically equivalent to this path.
+        overlap = self.multistream_dsv4_dsa_overlap
+        main_stream = torch.npu.current_stream() if overlap else None
+        aux_stream = dsv4_dsa_overlap_stream() if overlap else None
 
         is_w8a8 = _is_w8a8_dynamic(self.wq_b)
 
@@ -1889,23 +1898,29 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             kv_quant, kv_pertoken_scale = q_quant, q_pertoken_scale
         else:
             q_quant, q_pertoken_scale = self.cv_wq_a.quantize(hidden_states)
-            e_q_quant_done = main_stream.record_event()
-            with npu_stream_switch(aux_stream, enabled=True):
-                torch.npu.current_stream().wait_event(e_q_quant_done)
+            if overlap:
+                e_q_quant_done = main_stream.record_event()
+            with npu_stream_switch(aux_stream, enabled=overlap):
+                if overlap:
+                    torch.npu.current_stream().wait_event(e_q_quant_done)
                 kv_quant, kv_pertoken_scale = self.cv_wkv.quantize(hidden_states)
-                e_kv_quant_done = torch.npu.current_stream().record_event()
+                if overlap:
+                    e_kv_quant_done = torch.npu.current_stream().record_event()
 
         wq_a_result = self.cv_wq_a.matmul(q_quant, q_pertoken_scale)
 
         # Part2: q_norm[V] + q_b_quant[V]  ||  kv_matmul[C]
-        e_part2_start = main_stream.record_event()
+        if overlap:
+            e_part2_start = main_stream.record_event()
         if e_kv_quant_done is not None:
             main_stream.wait_event(e_kv_quant_done)
 
-        with npu_stream_switch(aux_stream, enabled=True):
-            _wait_dsa_event(e_part2_start, self._fxrt_prefill_decompose, aux_stream)
+        with npu_stream_switch(aux_stream, enabled=overlap):
+            if overlap:
+                _wait_dsa_event(e_part2_start, self._fxrt_prefill_decompose, aux_stream)
             kv = self.cv_wkv.matmul(kv_quant, kv_pertoken_scale)
-            e_kv_matmul_done = torch.npu.current_stream().record_event()
+            if overlap:
+                e_kv_matmul_done = torch.npu.current_stream().record_event()
 
         if is_prefill:
             qr = self.q_norm(wq_a_result)
@@ -1922,15 +1937,18 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             qr_pertoken_scale = None
 
         # Part3: q_b_matmul[C]  ||  kv_norm[V] + rope[V] + scatter[AIV]
-        e_part3_start = main_stream.record_event()
+        if overlap:
+            e_part3_start = main_stream.record_event()
         # kv_matmul and q_b_matmul are both Cube ops. Ensure kv_matmul (launched on
         # aux_stream) completes before q_b_matmul starts so they do not contend for
         # the Cube units. kv_norm (Vector) follows kv_matmul on aux_stream and is
         # unaffected as it overlaps with q_b_matmul.
-        main_stream.wait_event(e_kv_matmul_done)
+        if overlap:
+            main_stream.wait_event(e_kv_matmul_done)
 
-        with npu_stream_switch(aux_stream, enabled=True):
-            _wait_dsa_event(e_part3_start, self._fxrt_prefill_decompose, aux_stream)
+        with npu_stream_switch(aux_stream, enabled=overlap):
+            if overlap:
+                _wait_dsa_event(e_part3_start, self._fxrt_prefill_decompose, aux_stream)
             kv = self.kv_norm(kv)
             assert self.rope_head_dim is not None
             kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
@@ -1959,10 +1977,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         # Join the Q and SWA-KV branches, then reuse the auxiliary stream for
         # independent tail work while q_rms[V] + rope[V] run on the main stream.
-        main_stream.wait_stream(aux_stream)
+        if overlap:
+            main_stream.wait_stream(aux_stream)
 
         tail_overlap_output: CompressorOverlapOutput | None = None
-        if tail_overlap_fn is not None:
+        if overlap and tail_overlap_fn is not None:
             e_tail_start = main_stream.record_event()
             with npu_stream_switch(aux_stream, enabled=True):
                 torch.npu.current_stream().wait_event(e_tail_start)
@@ -2127,7 +2146,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     metadata=tail_compressor_metadata,
                 )
 
-        if self.multistream_dsv4_dsa_overlap:
+        if self.multistream_dsv4_dsa_overlap or (has_prefill and self._use_cv_prefill_prolog):
             q, qr, qr_pertoken_scale, compressor_overlap_output = self._mla_prolog_multistream(
                 hidden_states,
                 cos,

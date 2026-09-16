@@ -1,5 +1,3 @@
-import os
-
 import torch
 import torch_npu
 from vllm.distributed import (
@@ -13,7 +11,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
-from vllm_ascend.utils import is_vl_model
+from vllm_ascend.utils import fxrt_dummy_quant_enabled, is_vl_model
 
 
 def _get_ep_local_sizes(dp_metadata, ep_group) -> list[int] | None:
@@ -103,7 +101,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     dp_size = get_dp_group().world_size
     num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
     padded_x = x.new_zeros((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]))
-    if os.getenv("VLLM_ASCEND_FXRT_DUMMY_QUANT") == "1" and x.shape[0] != int(num_tokens_across_dp_cpu.sum()):
+    if fxrt_dummy_quant_enabled() and x.shape[0] != int(num_tokens_across_dp_cpu.sum()):
         # Preserve the reduced-dummy local-output compatibility path. The
         # sequence-parallel layout above takes precedence when available.
         padded_x[get_dp_group().rank_in_group, : x.shape[0]] = x
