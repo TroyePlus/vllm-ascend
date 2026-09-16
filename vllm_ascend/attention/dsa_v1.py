@@ -56,6 +56,7 @@ from vllm_ascend.ops.fxrt_side_effects import (
     get_npu_stream_index,
 )
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.ops.rms_quant_meta import register_rms_quant_meta
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
@@ -1465,6 +1466,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         ascend_config = get_ascend_config()
         self._fxrt_prefill_decompose = fxrt_prefill_decompose_enabled()
+        register_rms_quant_meta()
         self._use_cv_prefill_prolog = (
             ascend_config.multistream_dsv4_dsa_overlap and not is_a5_bf16_kv_enabled(self.vllm_config)
         )

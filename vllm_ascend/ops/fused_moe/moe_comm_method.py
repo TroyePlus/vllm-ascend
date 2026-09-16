@@ -45,20 +45,10 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
 )
-from vllm_ascend.ops.fxrt_side_effects import (
-    fxrt_record_event,
-    get_fxrt_event_index,
-)
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import AscendDeviceType, fxrt_prefill_decompose_enabled, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
-
-
-def _record_moe_event(name: str) -> int | torch.npu.Event | None:
-    if fxrt_prefill_decompose_enabled():
-        return None
-    return torch.npu.current_stream().record_event()
 
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
@@ -81,9 +71,9 @@ class FusedExpertsResult:
     # This field is for shared experts and should be set by the MoE
     # communication method that supports shared experts in parallel with routed
     # experts.
-    before_dispatch_evt: int | torch.npu.Event | None = None
-    before_gmm2_evt: int | torch.npu.Event | None = None
-    before_combine_evt: int | torch.npu.Event | None = None
+    before_dispatch_evt: torch.npu.Event | None = None
+    before_gmm2_evt: torch.npu.Event | None = None
+    before_combine_evt: torch.npu.Event | None = None
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
@@ -144,7 +134,7 @@ class MoECommMethod(ABC):
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
-        before_dispatch_evt = _record_moe_event("moe.before_dispatch")
+        before_dispatch_evt = torch.npu.current_stream().record_event()
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -159,7 +149,7 @@ class MoECommMethod(ABC):
 
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
 
-        before_combine_evt = _record_moe_event("moe.before_combine")
+        before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             combine_metadata=token_dispatch_output.combine_metadata,

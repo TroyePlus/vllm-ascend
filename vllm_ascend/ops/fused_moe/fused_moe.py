@@ -27,13 +27,13 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.ops.fused_moe.moe_comm_method import _record_moe_event, get_moe_comm_method, setup_moe_comm_method
+from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     SharedExpertParallelMode,
 )
-from vllm_ascend.utils import fxrt_prefill_decompose_enabled, vllm_version_is
+from vllm_ascend.utils import vllm_version_is
 
 
 class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
@@ -66,9 +66,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         )
         self._gate = gate
         self.hidden_size = moe_config.hidden_dim
-        self._fxrt_prefill_decompose = fxrt_prefill_decompose_enabled()
-        if self._fxrt_prefill_decompose:
-            self.enable_decomposed_forward()
 
         self.quant_type = routed_experts.quant_type
         self.routed_experts.router = router
@@ -295,12 +292,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     # linear is unquantized so that we the weight is pre-casted in
                     # process_weights_after_loading of AscendUnquantizedLinearMethod.
                     hidden_states_fp32 = shared_hidden_states.float()
-                    before_routed_experts = _record_moe_event("moe.before_routed_experts")
+                    before_routed_experts = torch.npu.current_stream().record_event()
                     # v0.27.1: weight_fp32 is guaranteed by is_internal_router.
                     router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
-                    after_routed_experts = _record_moe_event("moe.after_routed_experts")
+                    after_routed_experts = torch.npu.current_stream().record_event()
                 else:
-                    before_routed_experts = _record_moe_event("moe.before_routed_experts")
+                    before_routed_experts = torch.npu.current_stream().record_event()
                     after_routed_experts = None
 
                 if shared_input_all_gather_done is not None:
@@ -313,7 +310,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 fused_moe_events.before_routed_experts = before_routed_experts
                 fused_moe_events.after_routed_experts = after_routed_experts
                 if shared_input_all_gather_done is not None:
-                    fused_moe_events.after_routed_finalize = _record_moe_event("moe.after_routed_finalize")
+                    fused_moe_events.after_routed_finalize = torch.npu.current_stream().record_event()
 
                 shared_out = self.ascend_shared_experts.forward(
                     shared_expert_input,
@@ -366,16 +363,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     # linear is unquantized so that we the weight is pre-casted in
                     # process_weights_after_loading of AscendUnquantizedLinearMethod.
                     hidden_states_fp32 = shared_hidden_states.float()
-                    before_routed_experts = _record_moe_event("moe.before_routed_experts")
+                    before_routed_experts = torch.npu.current_stream().record_event()
                     # main (cdc4824a21): is_internal_router only checks self.gate,
                     # weight_fp32 may be absent, fall back to gate.weight.
                     router_logits = F.linear(
                         hidden_states_fp32,
                         gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
                     )
-                    after_routed_experts = _record_moe_event("moe.after_routed_experts")
+                    after_routed_experts = torch.npu.current_stream().record_event()
                 else:
-                    before_routed_experts = _record_moe_event("moe.before_routed_experts")
+                    before_routed_experts = torch.npu.current_stream().record_event()
                     after_routed_experts = None
 
                 if shared_input_all_gather_done is not None:
@@ -388,7 +385,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 fused_moe_events.before_routed_experts = before_routed_experts
                 fused_moe_events.after_routed_experts = after_routed_experts
                 if shared_input_all_gather_done is not None:
-                    fused_moe_events.after_routed_finalize = _record_moe_event("moe.after_routed_finalize")
+                    fused_moe_events.after_routed_finalize = torch.npu.current_stream().record_event()
 
                 shared_out = self.ascend_shared_experts.forward(
                     shared_expert_input,
