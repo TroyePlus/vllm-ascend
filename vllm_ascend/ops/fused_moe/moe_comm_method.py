@@ -48,6 +48,15 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+from vllm_ascend.utils import fxrt_moe_prefill_decompose_enabled
+
+
+def _record_moe_event(name: str) -> torch.npu.Event | None:
+    if fxrt_moe_prefill_decompose_enabled():
+        return None
+    return torch.npu.current_stream().record_event()
+
+
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
@@ -134,7 +143,7 @@ class MoECommMethod(ABC):
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
-        before_dispatch_evt = torch.npu.current_stream().record_event()
+        before_dispatch_evt = _record_moe_event("moe.comm")
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -149,7 +158,7 @@ class MoECommMethod(ABC):
 
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
 
-        before_combine_evt = torch.npu.current_stream().record_event()
+        before_combine_evt = _record_moe_event("moe.comm")
         routed_out = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             combine_metadata=token_dispatch_output.combine_metadata,
@@ -235,6 +244,13 @@ class AlltoAllCommImpl(MoECommMethod):
     between data parallel ranks before and after the MLP computation. It should
     have better performance than AllGatherCommImpl when DP size > 1.
     """
+
+    def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):
+        if fxrt_moe_prefill_decompose_enabled():
+            from vllm_ascend.ops.fused_moe.alltoall_region import run_alltoall_routed_region
+
+            return run_alltoall_routed_region(self, fused_experts_input)
+        return super().fused_experts(fused_experts_input)
 
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]

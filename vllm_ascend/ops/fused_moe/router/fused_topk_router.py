@@ -17,6 +17,9 @@
 from collections.abc import Callable
 
 import torch
+
+from vllm_ascend.ops.fxrt_moe import moe_gating_top_k_hash
+from vllm_ascend.utils import fxrt_moe_prefill_decompose_enabled
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
@@ -275,7 +278,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 return topk_weights.to(torch.float32), topk_ids.to(
                     torch.int32 if indices_type is None else indices_type
                 )
-            topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+            hash_op = (
+                moe_gating_top_k_hash if fxrt_moe_prefill_decompose_enabled()
+                else torch.ops._C_ascend.moe_gating_top_k_hash
+            )
+            topk_weights, topk_ids, _ = hash_op(
                 x=router_logits,
                 k=self.top_k,
                 bias=text_bias,

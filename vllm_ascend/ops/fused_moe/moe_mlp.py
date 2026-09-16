@@ -38,6 +38,15 @@ ASCEND_DEVICE_TYPE = get_ascend_device_type()
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
+from vllm_ascend.utils import fxrt_moe_prefill_decompose_enabled
+
+
+def _record_moe_event(name: str) -> torch.npu.Event | None:
+    if fxrt_moe_prefill_decompose_enabled():
+        return None
+    return torch.npu.current_stream().record_event()
+
+
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation=None):
     activation_name = getattr(activation, "value", activation)
     return fusion and dynamic_eplb and activation_name not in ("situ", "swigluoai_uninterleave") and enable_custom_op()
@@ -379,7 +388,7 @@ def quant_apply_mlp(
                         }
                     )
                 hidden_states, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(**dequant_swiglu_kwargs)
-        before_gmm2_evt = torch.npu.current_stream().record_event()
+        before_gmm2_evt = _record_moe_event("moe.mlp")
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
             hidden_states=hidden_states,
@@ -435,7 +444,7 @@ def quant_apply_mlp(
             )
         else:
             hidden_states = torch_npu.npu_swiglu(hidden_states)
-        before_gmm2_evt = torch.npu.current_stream().record_event()
+        before_gmm2_evt = _record_moe_event("moe.mlp")
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -623,7 +632,7 @@ def quant_apply_mlp(
             else:
                 hidden_states = torch_npu.npu_swiglu(hidden_states)
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
-        before_gmm2_evt = torch.npu.current_stream().record_event()
+        before_gmm2_evt = _record_moe_event("moe.mlp")
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
             hidden_states=hidden_states,
