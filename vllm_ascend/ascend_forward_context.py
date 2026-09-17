@@ -175,6 +175,14 @@ def set_ascend_forward_context(
             max_tokens_across_dp = num_tokens
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp
+        # Scheduler metadata is already on CPU and known before tracing. Gate
+        # overlap's gathered tensors need the unpadded total as a shape, without
+        # introducing tensor-value-dependent slicing inside the FX graph.
+        forward_context.moe_total_num_tokens = (
+            int(forward_context.dp_metadata.num_tokens_across_dp_cpu.sum().item())
+            if forward_context.dp_metadata is not None
+            else num_tokens
+        )
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
@@ -345,12 +353,13 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         if envs.VLLM_ASCEND_FXRT_TEST_A3_ALLTOALL and num_tokens > mc2_tokens_capacity:
             # A2 validation of A3's unfused high-token path. Do not select A3
             # MC2 kernels on A2 or change the production/default selector.
-            moe_comm_type = _select_a3_moe_comm_method(
-                num_tokens, vllm_config, quant_type, mc2_tokens_capacity, 0
-            )
+            moe_comm_type = _select_a3_moe_comm_method(num_tokens, vllm_config, quant_type, mc2_tokens_capacity, 0)
             logger.info(
                 "FXRT_TEST_A3_ALLTOALL tokens=%d capacity=%d ep=%d method=%s",
-                num_tokens, mc2_tokens_capacity, get_ep_group().world_size, moe_comm_type.name,
+                num_tokens,
+                mc2_tokens_capacity,
+                get_ep_group().world_size,
+                moe_comm_type.name,
             )
         else:
             moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
@@ -401,6 +410,7 @@ class _ExtraForwardContextProxy:
         "model_instance",
         "layer_idx",
         "max_tokens_across_dp",
+        "moe_total_num_tokens",
         "max_tokens_across_pcp",
         "num_accept_tokens",
         "in_profile_run",

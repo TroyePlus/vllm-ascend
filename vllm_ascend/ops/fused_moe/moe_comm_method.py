@@ -56,7 +56,11 @@ _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 def _record_moe_event(name: str) -> int | torch.npu.Event | None:
     if fxrt_moe_prefill_decompose_enabled():
-        return None
+        if not get_ascend_config().multistream_overlap_shared_expert:
+            return None
+        event_index = get_fxrt_event_index(name)
+        fxrt_record_event(event_index, -1)
+        return event_index
     return torch.npu.current_stream().record_event()
 
 

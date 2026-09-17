@@ -44,6 +44,12 @@ def test_activation_roundtrip_and_explicit_tensor_inputs():
         get_moe_comm_method=lambda kind: method,
         build_fused_experts_input=lambda **kwargs: NS(**kwargs),
         FusedExpertsResult=NS,
+        get_ascend_config=lambda: NS(multistream_overlap_shared_expert=True),
+        get_fxrt_event_index=lambda name: {
+            "moe.before_dispatch": 1,
+            "moe.before_gmm2": 2,
+            "moe.before_combine": 3,
+        }[name],
     )
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
     implementation = namespace["alltoall_routed_experts"]
@@ -94,6 +100,7 @@ def test_activation_roundtrip_and_explicit_tensor_inputs():
         assert torch.equal(actual.routed_out, x + 1)
         assert actual.expert_tokens.dtype == torch.int64
         assert actual.expert_tokens.tolist() == [2, 1, 0]
+        assert (actual.before_dispatch_evt, actual.before_gmm2_evt, actual.before_combine_evt) == (1, 2, 3)
 
 
 if __name__ == "__main__":

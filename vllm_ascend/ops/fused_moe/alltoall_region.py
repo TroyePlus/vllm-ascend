@@ -104,7 +104,9 @@ def _alltoall_routed_experts_fake(
 
 def run_alltoall_routed_region(method, payload):
     """Flatten the supported DSV4 W8A8 contract, keeping weights as graph inputs."""
+    from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
+    from vllm_ascend.ops.fxrt_side_effects import get_fxrt_event_index
     from vllm_ascend.quantization.quant_type import QuantType
 
     weights = payload.weights
@@ -142,9 +144,15 @@ def run_alltoall_routed_region(method, payload):
         payload.swiglu_limit,
         method.moe_config.num_local_experts,
     )
+    # The runtime region records these preallocated slots at the original
+    # stages. Only handles cross the graph boundary, never NPU Event objects.
+    overlap = get_ascend_config().multistream_overlap_shared_expert
     return FusedExpertsResult(
         routed_out=routed,
         expert_tokens=counts,
         group_list_type=1,
         swiglu_limit=payload.swiglu_limit,
+        before_dispatch_evt=get_fxrt_event_index("moe.before_dispatch") if overlap else None,
+        before_gmm2_evt=get_fxrt_event_index("moe.before_gmm2") if overlap else None,
+        before_combine_evt=get_fxrt_event_index("moe.before_combine") if overlap else None,
     )

@@ -33,8 +33,10 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
+from vllm_ascend.ops.fused_moe.overlap_region import overlap_gather, overlap_reduce, overlap_wait
+from vllm_ascend.ops.fxrt_side_effects import get_npu_stream_index
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
+from vllm_ascend.utils import enable_sp, enable_sp_by_pass, fxrt_moe_prefill_decompose_enabled, npu_stream_switch
 
 
 class PrepareAndFinalize(ABC):
@@ -57,6 +59,8 @@ class PrepareAndFinalize(ABC):
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
         if self.multistream_overlap_gate and PrepareAndFinalize.quant_stream is None:
             PrepareAndFinalize.quant_stream = torch.npu.Stream()
+        if self.multistream_overlap_gate:
+            self._fxrt_quant_stream_index = get_npu_stream_index(PrepareAndFinalize.quant_stream)
 
     @abstractmethod
     def prepare(
@@ -363,6 +367,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     def _prepare_with_ep_group(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE
     ) -> MoEPrepareOutput:
+        # EP gather concatenates tokens across DP as well as TP. Preserve the
+        # local SP shape for its inverse; global rows // TP is not correct.
+        self._fxrt_overlap_local_rows = hidden_states.shape[0]
         pertoken_scale = None
         if quant_type == QuantType.W8A8:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
@@ -379,10 +386,16 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             )
 
         if self.multistream_overlap_gate:
-            assert PrepareAndFinalize.quant_stream is not None
-            PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
-            with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=self.multistream_overlap_gate):
-                hidden_states = fc3_all_gather_and_maybe_unpad_impl(hidden_states)
+            if fxrt_moe_prefill_decompose_enabled():
+                quant_stream_input = hidden_states
+                hidden_states = overlap_gather(
+                    hidden_states, _EXTRA_CTX.moe_total_num_tokens, self._fxrt_quant_stream_index
+                )
+            else:
+                assert PrepareAndFinalize.quant_stream is not None
+                PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
+                with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=self.multistream_overlap_gate):
+                    hidden_states = fc3_all_gather_and_maybe_unpad_impl(hidden_states)
         else:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
             router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
@@ -392,10 +405,16 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         self.num_tokens = hidden_states.shape[0]
 
         if pertoken_scale is not None:
-            pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
+            if self.multistream_overlap_gate and fxrt_moe_prefill_decompose_enabled():
+                pertoken_scale = overlap_gather(pertoken_scale, _EXTRA_CTX.moe_total_num_tokens, -1)
+            else:
+                pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
 
         if self.multistream_overlap_gate:
-            torch.npu.current_stream().wait_stream(PrepareAndFinalize.quant_stream)
+            if fxrt_moe_prefill_decompose_enabled():
+                overlap_wait([quant_stream_input], self._fxrt_quant_stream_index)
+            else:
+                torch.npu.current_stream().wait_stream(PrepareAndFinalize.quant_stream)
 
         if self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
@@ -524,7 +543,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
             hidden_states = hidden_states[: self.num_tokens_pcp]
 
-        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
+        if self.multistream_overlap_gate and fxrt_moe_prefill_decompose_enabled():
+            hidden_states = overlap_reduce(hidden_states, self._fxrt_overlap_local_rows)
+        else:
+            hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
 
         return hidden_states
 

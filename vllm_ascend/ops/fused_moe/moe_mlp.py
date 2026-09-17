@@ -21,24 +21,25 @@ from torch.nn.functional import pad
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_moe_available,
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
+from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.ops.fxrt_side_effects import (
     fxrt_record_event,
     get_fxrt_event_index,
 )
-from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
     enable_custom_op,
+    fxrt_moe_prefill_decompose_enabled,
     get_ascend_device_type,
     get_weight_prefetch_method,
-    fxrt_moe_prefill_decompose_enabled,
 )
 
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
@@ -46,7 +47,11 @@ ASCEND_DEVICE_TYPE = get_ascend_device_type()
 
 def _record_moe_event(name: str) -> int | torch.npu.Event | None:
     if fxrt_moe_prefill_decompose_enabled():
-        return None
+        if not get_ascend_config().multistream_overlap_shared_expert:
+            return None
+        event_index = get_fxrt_event_index(name)
+        fxrt_record_event(event_index, -1)
+        return event_index
     return torch.npu.current_stream().record_event()
 
 

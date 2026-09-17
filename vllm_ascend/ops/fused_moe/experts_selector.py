@@ -47,6 +47,7 @@ def select_experts(
     num_experts: int = -1,
     input_ids: torch.Tensor | None = None,
     tid2eid: torch.Tensor | None = None,
+    gate_before_prepare: bool = False,
 ):
     """
     Fused experts with select experts.
@@ -64,6 +65,7 @@ def select_experts(
         e_score_correction_bias: Correction bias to apply to expert scores.
         indices_type: dtype of indices
         num_experts: Number of experts.
+        gate_before_prepare: Route local tokens before MoE prepare/gather.
 
     Returns:
         topk_weights: router weights of shape (num_tokens, top_k).
@@ -97,6 +99,7 @@ def select_experts(
             routed_scaling_factor=routed_scaling_factor,
             tid2eid=tid2eid,
             input_ids=input_ids,
+            gate_before_prepare=gate_before_prepare,
         )
     else:
         topk_weights, topk_ids = _native_select_experts(
@@ -246,6 +249,7 @@ def _select_experts_with_fusion_ops(
     routed_scaling_factor=1.0,
     tid2eid=None,
     input_ids=None,
+    gate_before_prepare=False,
 ):
     topk_group = topk_group if topk_group is not None else 1
     num_expert_group = num_expert_group if num_expert_group is not None else 1
@@ -256,13 +260,20 @@ def _select_experts_with_fusion_ops(
             input_ids = forward_context.input_ids.to(torch.int64)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
-            if forward_context.moe_comm_type == MoECommType.ALLGATHER:
+            if gate_before_prepare:
+                # Gate overlap routes the local hidden-state shard. Gathering
+                # IDs here would pair global IDs with local router rows and
+                # also depend on prepare() state before it has been populated.
+                pass
+            elif forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
             else:
                 input_ids = forward_context.moe_comm_method.pad_and_split_input_ids(input_ids)
 
-            if forward_context.flash_comm_v1_enabled and forward_context.moe_comm_type != MoECommType.ALLGATHER:
+            if forward_context.flash_comm_v1_enabled and (
+                gate_before_prepare or forward_context.moe_comm_type != MoECommType.ALLGATHER
+            ):
                 # Process for Flash Comm V1
                 tp_size = get_tp_group().world_size
                 tp_rank = get_tp_group().rank_in_group
@@ -416,9 +427,7 @@ def zero_experts_compute(
         result = result.sum(dim=1)
 
     normal_expert_mask = expert_indices >= num_experts
-    expert_indices = torch.where(
-        normal_expert_mask, torch.zeros_like(expert_indices), expert_indices
-    )
+    expert_indices = torch.where(normal_expert_mask, torch.zeros_like(expert_indices), expert_indices)
     expert_scales = torch.where(normal_expert_mask, 0.0, expert_scales)
 
     return expert_indices, expert_scales, result
