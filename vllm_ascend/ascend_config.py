@@ -733,7 +733,7 @@ class AscendConfig:
             raise ValueError("enable_engram_offload=True requires enable_engram=True")
         if not self.enable_engram:
             return
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM config validation started: offload=%s storage=%s engram_tp_size=%d",
             self.enable_engram_offload,
             self.engram_storage,
@@ -756,7 +756,7 @@ class AscendConfig:
                 self.engram_storage,
             )
             raise ValueError("The current ElasticBuffer Engram ABI supports only bf16 storage")
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM ElasticBuffer compatibility ABI selected: "
             "write=single-bf16-tensor fetch=single-bf16-tensor scale_tensor=false"
         )
@@ -852,7 +852,7 @@ class AscendConfig:
                 speculative.method,
             )
             raise NotImplementedError("Synchronous Engram currently supports only MTP speculative decoding")
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM config validation completed: world_size=%d "
             "device_count=%d pp=%d pcp=%d dcp=%d storage=%s "
             "speculative_method=%s",

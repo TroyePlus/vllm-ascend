@@ -267,7 +267,7 @@ class NgramHashState(nn.Module):
             "image_pad_token_id",
             self.image_token_id + 1,
         )
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM hash state initialized: layers=%s max_ngram_size=%d "
             "heads=%d tokenizer_vocab=%d compressed_vocab=%d",
             layout.layer_ids,

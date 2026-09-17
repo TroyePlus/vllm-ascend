@@ -457,7 +457,7 @@ class KVCacheRecvingThread(threading.Thread):
         ] = defaultdict(  # type: ignore
             deque
         )
-        self.timeout = 1.0  # seconds
+        self.timeout = 5.0  # seconds
 
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -2498,7 +2498,7 @@ def ensure_zmq_send(
     socket: zmq.Socket,  # type: ignore
     data: bytes,
     path: str,
-    max_retries: int = 3,
+    max_retries: int = 5,
 ):
     retries_left = max_retries
     while True:
@@ -2509,7 +2509,7 @@ def ensure_zmq_send(
             retries_left -= 1
             if retries_left > 0:
                 logger.warning("Send failed. error=%s, attempts_left=%d. ", e, retries_left)
-                time.sleep(0.1)
+                time.sleep(0.5)
             else:
                 logger.error("Send failed after all retries. error=%s. ", e)
                 raise RuntimeError(f"Failed to send data to {path} after {max_retries} retries: {e}")
@@ -2518,7 +2518,7 @@ def ensure_zmq_send(
 def ensure_zmq_recv(
     socket: zmq.Socket,  # type: ignore
     path: str,
-    max_retries: int = 3,
+    max_retries: int = 5,
 ) -> bytes:
     retries_left = max_retries
     while True:
@@ -2528,7 +2528,7 @@ def ensure_zmq_recv(
             retries_left -= 1
             if retries_left > 0:
                 logger.warning("Receive failed. error=%s, attempts_left=%d. ", e, retries_left)
-                time.sleep(0.1)
+                time.sleep(0.5)
             else:
                 logger.error("Receive failed after all retries. source=%s, error=%s. ", path, e)
                 raise RuntimeError(f"Failed to receive data after {max_retries} retries: {e}")
