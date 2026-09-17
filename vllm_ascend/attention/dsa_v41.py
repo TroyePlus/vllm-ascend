@@ -398,16 +398,10 @@ class DeepseekV41Metadata(AttentionMetadata):
     logical_block_size: int = 0
     query_start_loc_cpu: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor | None = None
-    query_lens: torch.Tensor | None = None
     start_pos: torch.Tensor | None = None
     cache_seq_lens: torch.Tensor | None = None
-    cache_query_lens: torch.Tensor | None = None
-    cache_query_start_loc: torch.Tensor | None = None
-    cache_start_pos: torch.Tensor | None = None
     max_query_len: int = 0
     max_seq_len: int = 0
-    max_cache_seq_len: int = 0
-    num_cache_tokens: int = 0
     attn_state: Any = None
     is_prefilling: torch.Tensor | None = None
     causal: bool | torch.Tensor = True
@@ -475,49 +469,30 @@ def compressed_slot_mapping(slot_mapping: torch.Tensor, ratio: int) -> torch.Ten
 
 
 def _cache_coordinates(common: Any, ratio: int, compressed: bool):
-    """Build original/cache coordinate views without inspecting model state."""
+    """Build the two coordinate vectors consumed by V4.1 cache operators.
+
+    ``query_lens`` is derived locally only to compute ``start_pos``.  It is no
+    longer part of the metadata contract: Indexer kernels use the cumulative
+    query boundaries directly, avoiding a transient graph input tensor.
+    """
     query_start_loc = common.query_start_loc[: common.num_reqs + 1]
     seq_lens = common.seq_lens[: common.num_reqs]
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     start_pos = seq_lens - query_lens
     plane_ratio = ratio if compressed else 1
     cache_seq_lens = torch.div(seq_lens, plane_ratio, rounding_mode="floor")
-    cache_start_pos = torch.div(start_pos, plane_ratio, rounding_mode="floor")
-    cache_query_lens = cache_seq_lens - cache_start_pos
-    cache_query_start_loc = torch.cat((cache_query_lens.new_zeros(1), cache_query_lens.cumsum(0)))
     query_start_loc_cpu = getattr(common, "query_start_loc_cpu", None)
     seq_lens_cpu = getattr(common, "seq_lens_cpu", None)
     if seq_lens_cpu is None:
         seq_lens_cpu = getattr(common, "_seq_lens_cpu", None)
-    num_cache_tokens = 0
-    max_cache_seq_len = 0
-    if query_start_loc_cpu is not None and seq_lens_cpu is not None:
-        cpu_query_lens = query_start_loc_cpu[1 : common.num_reqs + 1] - query_start_loc_cpu[: common.num_reqs]
-        cpu_seq_lens = seq_lens_cpu[: common.num_reqs]
-        cpu_start_pos = cpu_seq_lens - cpu_query_lens
-        cpu_cache_seq_lens = torch.div(cpu_seq_lens, plane_ratio, rounding_mode="floor")
-        cpu_cache_start_pos = torch.div(cpu_start_pos, plane_ratio, rounding_mode="floor")
-        num_cache_tokens = int((cpu_cache_seq_lens - cpu_cache_start_pos).sum().item())
-        max_cache_seq_len = int(cpu_cache_seq_lens.max().item()) if common.num_reqs else 0
-    elif not compressed:
-        # Production always supplies CPU mirrors. This keeps lightweight unit
-        # fixtures useful without introducing a device-to-host synchronization.
-        num_cache_tokens = int(getattr(common, "num_actual_tokens", 0))
-        max_cache_seq_len = int(getattr(common, "max_seq_len", 0))
 
     return dict(
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens_cpu=seq_lens_cpu,
-        query_lens=query_lens,
         start_pos=start_pos,
         cache_seq_lens=cache_seq_lens,
-        cache_query_lens=cache_query_lens,
-        cache_query_start_loc=cache_query_start_loc,
-        cache_start_pos=cache_start_pos,
-        num_cache_tokens=num_cache_tokens,
-        max_cache_seq_len=max_cache_seq_len,
     )
 
 
@@ -539,6 +514,47 @@ def _request_counts(common: Any, num_reqs: int):
     num_prefill_tokens = int(query_lens_cpu[flags].sum().item())
     num_decode_tokens = int(query_lens_cpu[~flags].sum().item())
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
+
+
+def _validate_batch_layout(
+    common: Any,
+    *,
+    num_reqs: int,
+    num_actual_reqs: int,
+    num_input_tokens: int,
+    num_actual_tokens: int,
+) -> None:
+    """Validate the shape contract shared by every V4.1 cache plane.
+
+    The values themselves are device-side and must not be read back here. We
+    only validate static lengths, preventing one plane from silently receiving
+    a differently padded view of the same flattened batch.
+    """
+    if not 0 <= num_actual_reqs <= num_reqs:
+        raise ValueError(
+            "V4.1 metadata has invalid request counts: "
+            f"actual={num_actual_reqs}, padded={num_reqs}"
+        )
+    if not 0 <= num_actual_tokens <= num_input_tokens:
+        raise ValueError(
+            "V4.1 metadata has invalid token counts: "
+            f"actual={num_actual_tokens}, input={num_input_tokens}"
+        )
+    query_start_loc = getattr(common, "query_start_loc", None)
+    block_table = getattr(common, "block_table_tensor", None)
+    seq_lens = getattr(common, "seq_lens", None)
+    slot_mapping = getattr(common, "slot_mapping", None)
+    positions = getattr(common, "positions", None)
+    if query_start_loc is None or query_start_loc.ndim != 1 or query_start_loc.numel() < num_reqs + 1:
+        raise ValueError("V4.1 metadata requires query_start_loc with num_reqs + 1 entries")
+    if block_table is None or block_table.ndim != 2 or block_table.shape[0] < num_reqs:
+        raise ValueError("V4.1 metadata requires a block table row for every padded request")
+    if seq_lens is None or seq_lens.ndim != 1 or seq_lens.numel() < num_reqs:
+        raise ValueError("V4.1 metadata requires seq_lens for every padded request")
+    if slot_mapping is None or slot_mapping.ndim != 1 or slot_mapping.numel() < num_input_tokens:
+        raise ValueError("V4.1 metadata requires a slot for every input token")
+    if positions is not None and (positions.ndim != 1 or positions.numel() < num_input_tokens):
+        raise ValueError("V4.1 metadata requires a position for every input token")
 
 
 def scatter_cache_v2(
@@ -617,12 +633,20 @@ class DeepseekV41EagerAttentionImpl:
         )
 
     @staticmethod
+    def _reshape_query_heads(q: torch.Tensor, head_dim: int) -> torch.Tensor:
+        if head_dim <= 0 or q.shape[-1] % head_dim:
+            raise ValueError(
+                "V4.1 query projection width must be divisible by head_dim: "
+                f"width={q.shape[-1]}, head_dim={head_dim}"
+            )
+        return q.unflatten(-1, (q.shape[-1] // head_dim, head_dim))
+
+    @staticmethod
     def _project_q_kv(attn, hidden_states, cos, sin):
         q_a = attn.wq_a(hidden_states)
         qr = attn.q_norm(q_a)
         q = attn.wq_b(qr)
-        n_q_heads = q.shape[-1]
-        q = q.unflatten(-1, (n_q_heads, attn.head_dim))
+        q = DeepseekV41EagerAttentionImpl._reshape_query_heads(q, attn.head_dim)
         kv = attn.kv_norm(attn.wkv(hidden_states))
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
@@ -883,8 +907,7 @@ class DeepseekV41EagerAttentionImpl:
             )
             self._scatter_swa_kv(attn, kv.squeeze(1), swa_metadata)
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias)
-        n_q_heads = q.shape[-1] // attn.head_dim
-        q = q.unflatten(-1, (n_q_heads, attn.head_dim))
+        q = self._reshape_query_heads(q, attn.head_dim)
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
@@ -1334,6 +1357,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         max_tokens = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 4096)
         max_reqs = getattr(vllm_config.scheduler_config, "max_num_seqs", 256)
         self._supports_device_ops = getattr(device, "type", "cpu") != "cpu"
+        # Metadata consumed from inside an ACLGraph must not point at a
+        # per-step cast/advanced-index result. Keep positions in a stable
+        # builder-owned buffer just like the cache coordinates below.
+        self._positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
@@ -1384,6 +1411,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common_attn_metadata,
         **kwargs,
     ) -> DeepseekV41Metadata:
+        # Direct callers of the capture hook do not necessarily pass the
+        # runtime-mode keyword used by model_runner. Capture must nevertheless
+        # receive stable RoPE buffers, exactly like FULL replay.
+        kwargs.setdefault("full_graph_mode", True)
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
@@ -1455,9 +1486,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
 
         num_reqs = int(getattr(common, "num_reqs", common.seq_lens.shape[0]))
         num_actual_reqs = int(kwargs.get("num_actual_reqs", num_reqs))
-        num_actual_reqs = min(num_actual_reqs, num_reqs)
         num_input_tokens = int(getattr(common, "num_input_tokens", common.slot_mapping.shape[0]))
         num_actual_tokens = int(getattr(common, "num_actual_tokens", num_input_tokens))
+        _validate_batch_layout(
+            common,
+            num_reqs=num_reqs,
+            num_actual_reqs=num_actual_reqs,
+            num_input_tokens=num_input_tokens,
+            num_actual_tokens=num_actual_tokens,
+        )
         shared = kwargs.get("common_v41_metadata")
         if shared is None:
             shared = {}
@@ -1484,7 +1521,8 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             # runner. Long KV and Indexer builders with the same physical
             # layout then share one persistent [T, 2] mapping, while every SWA
             # group owns a distinct mapping buffer.
-            slot_key = f"slot:c{ratio}:b{spec.storage_block_size}"
+            mapping_scope = "swa" if cache_kind == "swa" else "compressed"
+            slot_key = f"slot:{mapping_scope}:c{ratio}:b{spec.storage_block_size}"
             prepared_slots = shared.get(slot_key)
             if prepared_slots is None:
                 active_slots = raw_slots[:num_input_tokens]
@@ -1549,7 +1587,8 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         positions = getattr(common, "positions", None)
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
-            positions = positions[:num_input_tokens].long()
+            self._positions[:num_input_tokens].copy_(positions[:num_input_tokens].to(torch.int64))
+            positions = self._positions[:num_input_tokens]
         (
             num_decodes,
             num_decode_tokens,
@@ -1573,7 +1612,11 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         if cache_kind == "swa" and positions is not None:
             cos, sin = get_cos_and_sin_dsa(
                 positions,
-                use_cache=num_prefills == 0,
+                # FULL_DECODE_ONLY replay requires stable RoPE addresses even
+                # when a PD handoff row is still classified as prefill by the
+                # scheduler (for example, one recomputed token).  Eager mode
+                # may retain the cheaper indexed result for true prefills.
+                use_cache=bool(kwargs.get("full_graph_mode", False)) or num_prefills == 0,
             )
         text_config = self.vllm_config.model_config.hf_text_config
         window_size = int(_config_value(text_config, "sliding_window", 0))
@@ -1634,7 +1677,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         #             batch_size=num_reqs,
         #             max_seqlen_q=int(getattr(common, "max_query_len", 0)),
         #             max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
-        #             max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
+        #             max_seqlen_cmp_kv=0,
         #             ori_topk=0,
         #             cmp_topk=index_topk if has_compressed else 0,
         #             cmp_ratio=operator_ratio,
