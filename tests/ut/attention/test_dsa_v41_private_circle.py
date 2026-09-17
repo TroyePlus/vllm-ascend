@@ -101,10 +101,22 @@ def test_batch_layout_requires_all_padded_request_rows():
         _validate_batch_layout(
             common,
             num_reqs=2,
-            num_actual_reqs=1,
+            num_actual_reqs=0,
             num_input_tokens=2,
             num_actual_tokens=1,
         )
+
+
+def test_batch_layout_allows_one_synthetic_padding_row():
+    common = _batch_layout_common(num_reqs=2)
+    common.block_table_tensor = common.block_table_tensor[:1]
+    _validate_batch_layout(
+        common,
+        num_reqs=2,
+        num_actual_reqs=1,
+        num_input_tokens=2,
+        num_actual_tokens=1,
+    )
 
 
 def test_query_projection_is_split_into_heads_consistently():

@@ -547,7 +547,10 @@ def _validate_batch_layout(
     positions = getattr(common, "positions", None)
     if query_start_loc is None or query_start_loc.ndim != 1 or query_start_loc.numel() < num_reqs + 1:
         raise ValueError("V4.1 metadata requires query_start_loc with num_reqs + 1 entries")
-    if block_table is None or block_table.ndim != 2 or block_table.shape[0] < num_reqs:
+    if block_table is None or block_table.ndim != 2:
+        raise ValueError("V4.1 metadata requires a rank-2 block table")
+    missing_block_rows = num_reqs - block_table.shape[0]
+    if missing_block_rows > 1 or (missing_block_rows == 1 and num_actual_reqs != num_reqs - 1):
         raise ValueError("V4.1 metadata requires a block table row for every padded request")
     if seq_lens is None or seq_lens.ndim != 1 or seq_lens.numel() < num_reqs:
         raise ValueError("V4.1 metadata requires seq_lens for every padded request")
@@ -1363,6 +1366,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
+        self._block_table: torch.Tensor | None = None
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._start_pos = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
@@ -1499,6 +1503,27 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         shared = kwargs.get("common_v41_metadata")
         if shared is None:
             shared = {}
+
+        # Keep a complete request-dimension table at a stable address. A
+        # mixed full-graph batch can contain one synthetic padding request
+        # whose row is not present in the runner-owned table.
+        source_block_table = common.block_table_tensor
+        if self._block_table is None or self._block_table.shape[1] != source_block_table.shape[1]:
+            self._block_table = torch.zeros(
+                (self._seq_lens.shape[0] + 1, source_block_table.shape[1]),
+                dtype=source_block_table.dtype,
+                device=source_block_table.device,
+            )
+        if num_reqs > self._block_table.shape[0]:
+            raise ValueError(
+                "V4.1 block-table buffer is smaller than the padded request count: "
+                f"{num_reqs} > {self._block_table.shape[0]}"
+            )
+        self._block_table[:num_reqs].zero_()
+        rows_to_copy = min(num_reqs, source_block_table.shape[0])
+        if rows_to_copy:
+            self._block_table[:rows_to_copy].copy_(source_block_table[:rows_to_copy])
+        block_table = self._block_table[:num_reqs]
 
         # SWA uses original-token coordinates; circular state has no token slots.
         # Long KV and index K are addressed in completed compression groups.
@@ -1734,7 +1759,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 ring_meta[1].copy_(used)
                 ring_meta[2].copy_(starts)
                 ring_meta[3].copy_(starts)
-                ring_meta[4].copy_(torch.where(used > 0, common.block_table_tensor[:num_reqs, 0], 0))
+                ring_meta[4].copy_(torch.where(used > 0, block_table[:num_reqs, 0], 0))
                 valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
                 valid = torch.arange(num_input_tokens, device=input_positions.device) < valid_end
                 complete = (input_positions.remainder(2) == 1) & valid
@@ -1792,7 +1817,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         if cache_kind == "long_kv" and isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
             block_stride_rows = (getattr(spec, "page_size_padded", None) or 0) // spec.head_size
         return DeepseekV41Metadata(
-            block_table=common.block_table_tensor[:num_reqs],
+            block_table=block_table,
             slot_mapping=slots,
             compress_ratio=ratio,
             storage_block_size=spec.storage_block_size,
