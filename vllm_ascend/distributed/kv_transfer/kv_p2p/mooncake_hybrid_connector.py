@@ -1616,13 +1616,21 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
-            count = actual - num_computed_tokens
+            local_hit = num_computed_tokens
+            if self.private_circle_group_ids:
+                # The scheduler reports the rolled-back bounded-replay start;
+                # the transfer math needs the true local hit the shared planes
+                # actually adopt.
+                stashed_hit = getattr(request, "private_circle_hit_length", None)
+                if stashed_hit is not None:
+                    local_hit = int(stashed_hit)
+            count = actual - local_hit
             if count > 0:
                 if self.private_circle_group_ids:
                     # Stash the block-aligned local hit; it is the absolute
                     # base that update_state_after_alloc must add the
                     # external tokens to.
-                    request.private_circle_remote_local_hit = num_computed_tokens
+                    request.private_circle_remote_local_hit = local_hit
                 return count, True
 
         if params is not None and params.get("do_remote_decode") and self.need_truncate:

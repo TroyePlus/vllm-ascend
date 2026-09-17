@@ -131,6 +131,15 @@ def test_prefix_bounded_replay_start_is_exact_and_bounded():
     assert compute_prefix_bounded_replay_start(513, 0) == 513
 
 
+def test_prefix_bounded_replay_start_floors_to_alignment():
+    # Scheduler-level rollback: the reported hit must stay block-aligned.
+    assert compute_prefix_bounded_replay_start(512, 128, alignment=128) == 384
+    assert compute_prefix_bounded_replay_start(511, 128, alignment=128) == 384
+    assert compute_prefix_bounded_replay_start(513, 128, alignment=128) == 384
+    assert compute_prefix_bounded_replay_start(100, 128, alignment=128) == 0
+    assert compute_prefix_bounded_replay_start(300, 128, alignment=64) == 192
+
+
 def test_compact_ring_wraps_at_absolute_block_boundary():
     config = PrivateCircleConfig(
         block_size=32, window_size=128, in_flight_tokens=5, max_num_seqs=1

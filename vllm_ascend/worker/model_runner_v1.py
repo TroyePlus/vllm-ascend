@@ -337,18 +337,6 @@ class NPUModelRunner(GPUModelRunner):
         private_circle_window_size = int(
             getattr(hf_text_config, "sliding_window", 0) or 0
         )
-        max_private_circle_bounded_replay_tokens = (
-            private_circle_window_size
-            * vllm_config.scheduler_config.max_num_seqs
-            if self._private_circle_active
-            else 0
-        )
-        # Inflate the token budget around super().__init__() so every
-        # parent-allocated execution buffer covers bounded replay warm-up rows;
-        # scheduler-visible accounting stays at the original budget.
-        vllm_config.scheduler_config.max_num_batched_tokens += (
-            max_private_circle_bounded_replay_tokens
-        )
 
         # Must be set before super().__init__() because parent init may call
         # _allocate_kv_cache_tensors which accesses self.use_compress.
@@ -361,12 +349,8 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
-        vllm_config.scheduler_config.max_num_batched_tokens -= (
-            max_private_circle_bounded_replay_tokens
-        )
-        self._private_circle_bounded_replay_capacity_tokens = (
-            max_private_circle_bounded_replay_tokens
-        )
+        # Bounded replay rows are scheduled inside the token budget by the
+        # scheduler patch, so every execution buffer stays at the budget size.
         self._private_circle_window_size = private_circle_window_size
         self._private_circle_prefill_workspace = False
         self._private_circle_has_bounded_replay = False
@@ -544,12 +528,7 @@ class NPUModelRunner(GPUModelRunner):
         except Exception:
             self.dcp_size = 1
             self.dcp_rank = 0
-        max_buffer_num_tokens = (
-            self.max_num_tokens + self._private_circle_bounded_replay_capacity_tokens
-        )
-        # Execution-buffer capacity incl. bounded replay padding; scheduler
-        # accounting stays at max_num_tokens.
-        self._max_input_batch_tokens = max_buffer_num_tokens
+        max_buffer_num_tokens = self.max_num_tokens
         if self.dcp_size > 1:
             self.dcp_manager = DCPManager(
                 self.dcp_size,
@@ -655,7 +634,7 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self._max_input_batch_tokens,
+            max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
@@ -1378,10 +1357,12 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # Execution view expands to [R, P) for the one-shot bounded replay warm-up.
+        # Bounded replay rows are scheduled by the scheduler inside the token
+        # budget; the runner only consumes the one-shot hit boundary to mask
+        # shared-plane writes on the warm-up rows.
         compute_starts = self.input_batch.num_computed_tokens_cpu[:num_reqs].copy()
-        bounded_replay_lengths = np.zeros(num_reqs, dtype=np.int32)
         persistent_starts = np.full(num_reqs, -1, dtype=np.int64)
+        has_private_circle_bounded_replay = False
         metadata_by_req = getattr(self, "_private_circle_metadata_by_req", {})
         if self._private_circle_active:
             for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
@@ -1391,43 +1372,32 @@ class NPUModelRunner(GPUModelRunner):
                 shared_cache_length = int(
                     item.get("shared_cache_length", compute_starts[row])
                 )
-                circle_compute_start = int(
-                    item.get("circle_compute_start", shared_cache_length)
-                )
                 if shared_cache_length != int(compute_starts[row]):
                     raise RuntimeError(
                         "private circle shared-cache length is inconsistent with "
                         f"runner state for {req_id}: {shared_cache_length} != "
                         f"{int(compute_starts[row])}"
                     )
-                if not 0 <= circle_compute_start <= shared_cache_length:
-                    raise ValueError(
-                        f"invalid private circle compute interval for {req_id}: "
-                        f"[{circle_compute_start}, {shared_cache_length})"
-                    )
-                bounded_replay_length = shared_cache_length - circle_compute_start
+                original_hit = item.get("original_prefix_hit_length")
+                if original_hit is None or int(original_hit) <= shared_cache_length:
+                    continue
+                replay_tokens = int(original_hit) - shared_cache_length
                 metadata_window_size = int(
                     item.get("window_size", self._private_circle_window_size)
                 )
-                if bounded_replay_length > metadata_window_size:
+                metadata_block_size = int(
+                    item.get("physical_block_size", metadata_window_size)
+                )
+                if replay_tokens > metadata_window_size + metadata_block_size:
                     raise ValueError(
                         f"private circle bounded replay for {req_id} exceeds configured "
-                        f"window: {bounded_replay_length} > {metadata_window_size}"
+                        f"window: {replay_tokens} > {metadata_window_size} + "
+                        f"{metadata_block_size}"
                     )
-                if bounded_replay_length == 0:
-                    continue
-                bounded_replay_lengths[row] = bounded_replay_length
-                persistent_starts[row] = shared_cache_length
-                compute_starts[row] = circle_compute_start
+                persistent_starts[row] = int(original_hit)
+                has_private_circle_bounded_replay = True
 
-        num_scheduled_tokens += bounded_replay_lengths
         total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
-        if total_num_scheduled_tokens > self.input_ids.cpu.shape[0]:
-            raise RuntimeError(
-                "private circle bounded replay exceeds runner token-buffer capacity: "
-                f"{total_num_scheduled_tokens} > {self.input_ids.cpu.shape[0]}"
-            )
-        has_private_circle_bounded_replay = bool(np.any(bounded_replay_lengths))
         self._private_circle_compute_starts_np = compute_starts
         self._private_circle_has_bounded_replay = has_private_circle_bounded_replay
         compute_starts_cpu = getattr(self, "_private_circle_compute_starts_cpu", None)
@@ -1453,8 +1423,7 @@ class NPUModelRunner(GPUModelRunner):
                 [
                     scheduler_output.num_scheduled_tokens[i]
                     - len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
-                    + bounded_replay_lengths[row]
-                    for row, i in enumerate(self.input_batch.req_ids)
+                    for i in self.input_batch.req_ids
                 ],
                 dtype=np.int32,
             )
@@ -5814,7 +5783,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
-                max_num_batched_tokens=self._max_input_batch_tokens,
+                max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
