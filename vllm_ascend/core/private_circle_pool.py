@@ -162,7 +162,7 @@ class PrivateCirclePool:
         with self._lock:
             if request_id in self._owned:
                 allocation = self._owned[request_id]
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL reserve_reuse request_id=%s allocation=%d "
                     "blocks=%d-%d free_allocations=%d",
                     request_id,
@@ -173,7 +173,7 @@ class PrivateCirclePool:
                 )
                 return allocation
             if not self._free:
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL reserve_exhausted request_id=%s "
                     "allocations=%d retained=%d",
                     request_id,
@@ -183,7 +183,7 @@ class PrivateCirclePool:
                 return None
             allocation = self._free.pop()
             self._owned[request_id] = allocation
-            logger.info(
+            logger.debug(
                 "PRIVATE_CIRCLE_POOL reserve request_id=%s allocation=%d "
                 "blocks=%d-%d free_allocations=%d",
                 request_id,
@@ -198,7 +198,7 @@ class PrivateCirclePool:
         with self._lock:
             allocation = self._owned.pop(request_id, None)
             if allocation is None:
-                logger.info("PRIVATE_CIRCLE_POOL release_missing request_id=%s", request_id)
+                logger.debug("PRIVATE_CIRCLE_POOL release_missing request_id=%s", request_id)
                 return False
             self._return_allocation_locked(allocation, request_id)
             return True
@@ -214,7 +214,7 @@ class PrivateCirclePool:
             allocation = self._owned.pop(request_id, None)
             if allocation is not None:
                 self._detached.add(allocation)
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL detach request_id=%s allocation=%d "
                     "blocks=%d-%d refs=%d",
                     request_id,
@@ -231,7 +231,7 @@ class PrivateCirclePool:
         with self._lock:
             self._validate_allocation(allocation)
             if allocation not in self._detached:
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL return_detached_missing allocation=%d",
                     allocation,
                 )
@@ -246,7 +246,7 @@ class PrivateCirclePool:
             self._retained[allocation] = request_id
         else:
             self._free.append(allocation)
-        logger.info(
+        logger.debug(
             "PRIVATE_CIRCLE_POOL release request_id=%s allocation=%d "
             "blocks=%d-%d refs=%d retained=%s free_allocations=%d",
             request_id,
@@ -263,7 +263,7 @@ class PrivateCirclePool:
             self._validate_allocation(allocation)
             refs = self._refs.get(allocation, 0) + 1
             self._refs[allocation] = refs
-            logger.info(
+            logger.debug(
                 "PRIVATE_CIRCLE_POOL acquire_ref allocation=%d blocks=%d-%d refs=%d",
                 allocation,
                 self._first_block_id(allocation),
@@ -276,7 +276,7 @@ class PrivateCirclePool:
             self._validate_allocation(allocation)
             refs = self._refs.get(allocation, 0)
             if refs <= 0:
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL release_ref_missing allocation=%d", allocation
                 )
                 return False
@@ -291,7 +291,7 @@ class PrivateCirclePool:
             else:
                 refs -= 1
                 self._refs[allocation] = refs
-            logger.info(
+            logger.debug(
                 "PRIVATE_CIRCLE_POOL release_ref allocation=%d blocks=%d-%d refs=%d "
                 "released_to_free=%s free_allocations=%d",
                 allocation,

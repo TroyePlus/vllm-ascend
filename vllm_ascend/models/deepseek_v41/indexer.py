@@ -224,7 +224,6 @@ class DeepseekV41Indexer(nn.Module):
 
         common = dict(
             cu_seqlens_q=source_metadata.query_start_loc,
-            seqused_q=source_metadata.query_lens,
             seqused_k=source_metadata.cache_seq_lens,
             cmp_residual_k=source_metadata.cmp_residual,
             block_table=source_metadata.block_table,

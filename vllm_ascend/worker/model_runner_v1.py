@@ -471,7 +471,7 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 dtype=torch.bool,
             )
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM runner initialized: lookback_depth=%d "
                 "max_requests=%d max_tokens=%d engram_tp_size=%d",
                 self.engram_lookback_depth,
@@ -4494,7 +4494,7 @@ class NPUModelRunner(GPUModelRunner):
         load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
         if self.engram_enabled:
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM runner model loading started: model=%s",
                 self.model_config.model,
             )
@@ -4529,13 +4529,13 @@ class NPUModelRunner(GPUModelRunner):
                         "offload_weights is not implemented"
                     )
                     raise RuntimeError("Engram model does not implement offload_weights()")
-                logger.info("FOR-ENGRAM runner ElasticBuffer offload started")
+                logger.debug("FOR-ENGRAM runner ElasticBuffer offload started")
                 try:
                     offload_weights()
                 except BaseException:
                     logger.exception("FOR-ENGRAM runner ElasticBuffer offload failed")
                     raise
-                logger.info("FOR-ENGRAM runner ElasticBuffer offload completed")
+                logger.debug("FOR-ENGRAM runner ElasticBuffer offload completed")
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
@@ -4664,7 +4664,7 @@ class NPUModelRunner(GPUModelRunner):
             load_model_total_time,
         )
         if self.engram_enabled:
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM runner model loading completed: elapsed_seconds=%.2f",
                 load_model_total_time,
             )
@@ -4673,7 +4673,7 @@ class NPUModelRunner(GPUModelRunner):
         model = getattr(self, "model", None)
         engram_enabled = getattr(self, "engram_enabled", False)
         if engram_enabled:
-            logger.info("FOR-ENGRAM runner shutdown started")
+            logger.debug("FOR-ENGRAM runner shutdown started")
         if model is not None:
             destroy_engram = getattr(self.get_model(), "destroy_engram", None)
             if callable(destroy_engram):
@@ -4686,7 +4686,7 @@ class NPUModelRunner(GPUModelRunner):
         if callable(parent_shutdown):
             parent_shutdown()
         if engram_enabled:
-            logger.info("FOR-ENGRAM runner shutdown completed")
+            logger.debug("FOR-ENGRAM runner shutdown completed")
 
     def _start_dump_data(self, **kwargs) -> None:
         if self.debugger is None or self._debugger_started:
