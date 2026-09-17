@@ -337,8 +337,8 @@ def dsa_v41_forward(
     """Execute V4.1 attention behind an explicit graph side-effect boundary."""
     forward_context = get_forward_context()
     attn = forward_context.no_compile_layers[layer_name]
-    projected = attn.v41_impl.forward(attn, None, hidden_states)
-    output.copy_(projected)
+    attn.v41_impl.forward(attn, None, hidden_states, output)
+
 
 
 def dsa_v41_forward_fake(
@@ -755,8 +755,29 @@ class DeepseekV41EagerAttentionImpl:
             return "reference" if backend == "reference" else backend
         if backend != "reference":
             try:
-                rows = self._native_pack_rows(values, kind)
-                self._scatter_rows(cache, slot_mapping, rows)
+                # 小算子实现
+                # rows = self._native_pack_rows(values, kind)
+                # self._scatter_rows(cache, slot_mapping, rows)
+                # 融合算子实现
+                slot = (slot_mapping[:, 0]) * cache.shape[1] + slot_mapping[:, 1]
+                slot_mapping = slot.clamp(min=-1).to(torch.int32)
+                if kind == "cmp":
+                    group_size, quant_mode = (16, "mxfp4_bf16",)
+                elif kind == "win":
+                    group_size, quant_mode = (32, "mxfp8_bf16",)
+                    # 算子校验要求
+                    cache = cache.view(torch.float8_e4m3fn)
+                else:
+                    raise ValueError(f"Unsupported A5 packed cache kind: {kind}")
+                torch.ops.custom.kv_compress_epilog_v2(
+                cache,
+                values,
+                slot_mapping,
+                quant_group_size=group_size,
+                quant_mode=quant_mode,
+                round_scale=True,
+                x_scale=1.0,
+                )
                 return "native"
             except Exception:
                 if backend == "native":
@@ -1295,10 +1316,28 @@ class DeepseekV41EagerAttentionImpl:
         """V4.1 owns stable metadata buffers; no backend pointer patch is needed."""
         return None
 
-    def forward(self, attn, positions, hidden_states):
+    def _project_output(self, attn, attention_output, hidden_states, *, projected):
+        """Write the O-projection result into a caller-supplied buffer.
+        When the attention output has fewer rows than ``hidden_states``
+        (e.g. graph padding), zero-pad before the matmul so the stale tail
+        of ``projected`` is never returned to the model.
+        """
+        padded = attention_output
+        if attention_output.shape[0] != hidden_states.shape[0]:
+            padded = attention_output.new_zeros(
+                (hidden_states.shape[0], attention_output.shape[1], attention_output.shape[2])
+            )
+            padded[: attention_output.shape[0]] = attention_output
+        attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
+        return projected
+
+    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None):
+        if output is None:
+            output = torch.empty_like(hidden_states)
         forward_context = get_forward_context()
         if forward_context.attn_metadata is None:
-            return torch.zeros_like(hidden_states)
+            output.zero_()
+            return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
@@ -1315,17 +1354,16 @@ class DeepseekV41EagerAttentionImpl:
                 metadata,
             )
         compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
-        output = self._attention(attn, q, metadata, compressed_indices)
+        attention_output = self._attention(attn, q, metadata, compressed_indices)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
-            output.unsqueeze(1),
+            attention_output.unsqueeze(1),
             cos,
             -sin,
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        projected = torch.empty_like(hidden_states)
-        attn.dsa_attn.dsa_attn.impl._forward_o_proj(output, projected)
-        return projected
+        self._project_output(attn, attention_output, hidden_states, projected=output)
+        return output
 
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
@@ -1571,9 +1609,14 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_prefills = 0
             num_prefill_tokens = 0
         if cache_kind == "swa" and positions is not None:
+            # Single-token prefill rows (a PD request's last-token recompute)
+            # appear in DecodeOnly graph steps. The fresh-indexing branch would
+            # bake a per-step allocation into the replayed graph; those steps
+            # must gather into the stable runtime buffers like pure decodes.
+            # Their token count (num_reqs) is far below the buffer capacity.
             cos, sin = get_cos_and_sin_dsa(
                 positions,
-                use_cache=num_prefills == 0,
+                use_cache=(num_prefills == 0 or num_prefill_tokens == num_prefills),
             )
         text_config = self.vllm_config.model_config.hf_text_config
         window_size = int(_config_value(text_config, "sliding_window", 0))

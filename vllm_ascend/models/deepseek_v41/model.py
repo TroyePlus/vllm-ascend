@@ -450,7 +450,7 @@ class DeepseekV41Model(DeepseekV4Model):
         ascend_config = get_ascend_config()
         if ascend_config.enable_engram:
             hf_config = vllm_config.model_config.hf_config
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM model initialization started: model=%s prefix=%s layers=%s engram_tp_size=%d storage=%s",
                 vllm_config.model_config.model,
                 prefix,
@@ -534,7 +534,7 @@ class DeepseekV41Model(DeepseekV4Model):
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
         if ascend_config.enable_engram:
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM model initialization completed: layers=%s max_graph_tokens=%d device=%s",
                 config.engram_layer_ids,
                 self._engram_max_tokens,
@@ -694,7 +694,7 @@ class DeepseekV41Model(DeepseekV4Model):
     def offload_weights(self, checkpoint_keys: dict[int, str]):
         if self.engram_hash is None:
             return
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM model offload started: layers=%s",
             self.config.engram_layer_ids,
         )
@@ -720,7 +720,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     "the original offload error"
                 )
             raise
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM model offload completed: layers=%s",
             self.config.engram_layer_ids,
         )
@@ -813,7 +813,7 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if not get_ascend_config().enable_engram:
             return super().load_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM checkpoint weight loading started: expected_layers=%s",
             self.model.config.engram_layer_ids,
         )
@@ -860,7 +860,7 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
             except BaseException:
                 logger.exception("FOR-ENGRAM checkpoint failure cleanup also failed")
             raise
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM checkpoint weight loading completed: layers=%s",
             sorted(loaded_tables),
         )

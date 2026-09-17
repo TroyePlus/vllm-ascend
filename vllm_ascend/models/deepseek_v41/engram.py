@@ -37,7 +37,7 @@ class AscendEngram(nn.Module):
         self.k_weight = nn.Parameter(
             torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
         )
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM gate module initialized: prefix=%s hash_width=%d "
             "hidden_size=%d hc_mult=%d basis=checkpoint-native",
             prefix,

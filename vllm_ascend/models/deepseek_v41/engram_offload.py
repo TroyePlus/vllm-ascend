@@ -30,14 +30,14 @@ def _serialized_extension_build(name: str):
     guard_path = build_directory / ".vllm_ascend_build.lock"
     torch_lock_path = build_directory / "lock"
 
-    logger.info(
+    logger.debug(
         "FOR-ENGRAM legacy ACLNN fetch bridge build lock waiting: path=%s",
         guard_path,
     )
     with guard_path.open("a+", encoding="utf-8") as guard:
         fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
         try:
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM legacy ACLNN fetch bridge build lock acquired: path=%s",
                 guard_path,
             )
@@ -86,7 +86,7 @@ def _load_legacy_engram_fetch_op():
             # case another thread in this worker completed the load.
             if _LEGACY_ENGRAM_FETCH_OP is not None:
                 return _LEGACY_ENGRAM_FETCH_OP
-            logger.info(
+            logger.debug(
                 "FOR-ENGRAM legacy ACLNN fetch bridge build started: directory=%s",
                 build_directory,
             )
@@ -95,7 +95,7 @@ def _load_legacy_engram_fetch_op():
         raise RuntimeError(
             "Failed to build the environment-compatible BF16 EngramFetch bridge"
         ) from exc
-    logger.info("FOR-ENGRAM legacy ACLNN fetch bridge build completed")
+    logger.debug("FOR-ENGRAM legacy ACLNN fetch bridge build completed")
     return _LEGACY_ENGRAM_FETCH_OP
 
 
@@ -151,7 +151,7 @@ def create_engram_process_group(
     rank = dist.get_rank()
     selected = None
     selected_ranks = None
-    logger.info(
+    logger.debug(
         "FOR-ENGRAM process group creation started: layer=%s rank=%d world_size=%d engram_tp_size=%d",
         layer_id,
         rank,
@@ -181,7 +181,7 @@ def create_engram_process_group(
             rank,
         )
         raise RuntimeError("Failed to create the local Engram process group")
-    logger.info(
+    logger.debug(
         "FOR-ENGRAM process group creation completed: layer=%s rank=%d ranks=%s",
         layer_id,
         rank,
@@ -243,7 +243,7 @@ class ElasticEngramEmbedding(nn.Module):
         self.engram_buffer = None
         self._fetch_in_flight = False
         self._state = EngramTableState.EMPTY
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM table manager initialized: layer=%s tp_rank=%d "
             "tp_size=%d global_rows=%d minimum_rows=%d shard_rows=%d "
             "width=%d storage=%s",
@@ -407,7 +407,7 @@ class ElasticEngramEmbedding(nn.Module):
         if self._state is not EngramTableState.EMPTY:
             raise RuntimeError(f"Engram table {key} cannot load from state {self._state.value}")
         root = Path(model_path)
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM checkpoint shard loading started: layer=%s key=%s tp_rank=%d row_range=[%d,%d) storage=%s",
             self.layer_id,
             key,
@@ -455,7 +455,7 @@ class ElasticEngramEmbedding(nn.Module):
         assert result is not None
         resolved_key, checkpoint_rows, copied_rows, block_size = result
         self._state = EngramTableState.STAGED
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM checkpoint shard loading completed: layer=%s key=%s "
             "tp_rank=%d checkpoint_rows=%d configured_rows=%d copied_rows=%d "
             "padded_shard_rows=%d checkpoint_scale_block_size=%d "
@@ -483,7 +483,7 @@ class ElasticEngramEmbedding(nn.Module):
 
     def offload_weights(self) -> None:
         """Write the staged BF16 shard into ElasticBuffer."""
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM ElasticBuffer write function entered: layer=%s tp_rank=%d state=%s",
             self.layer_id,
             self.rank,
@@ -498,7 +498,7 @@ class ElasticEngramEmbedding(nn.Module):
         assert self._host_weight is not None
         storage = self._host_weight
         weight_bytes = storage.numel() * storage.element_size()
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM ElasticBuffer offload started: layer=%s tp_rank=%d "
             "shard_rows=%d width=%d storage=%s weight_bytes=%d",
             self.layer_id,
@@ -617,7 +617,7 @@ class ElasticEngramEmbedding(nn.Module):
         self.engram_buffer = buffer
         self._release_staging()
         self._state = EngramTableState.READY
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM ElasticBuffer offload completed: layer=%s tp_rank=%d "
             "num_cpu_bytes=%d storage=%s staging_released=true state=%s",
             self.layer_id,
@@ -663,7 +663,7 @@ class ElasticEngramEmbedding(nn.Module):
                 "by the environment-compatible EngramFetch bridge"
             )
 
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM legacy ACLNN fetch parameters: layer=%s tp_rank=%d "
             "context_shape=%s indices_shape=%s indices_dtype=%s hidden_size=%d "
             "num_entries_per_rank=%d output_dtype=%s",
@@ -718,7 +718,7 @@ class ElasticEngramEmbedding(nn.Module):
 
     @torch.inference_mode()
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        logger.info(
+        logger.debug(
             "FOR-ENGRAM ElasticBuffer fetch function entered: layer=%s tp_rank=%d ids_shape=%s state=%s",
             self.layer_id,
             self.rank,
