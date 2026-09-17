@@ -1466,8 +1466,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         fast_build=False,
         **kwargs,
     ):
-        if common_prefix_len:
-            raise NotImplementedError("V4.1 prefix caching is not implemented")
+        # Prefix blocks are already represented by block_table and seq_lens.
+        # The V4.1 operators do not consume a separate common-prefix length,
+        # so keep the same semantics as DSA v1 and ignore this hint.
         self._device_metadata_tasks = ()
         spec = self.kv_cache_spec
         common = common_attn_metadata
