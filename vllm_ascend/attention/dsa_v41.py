@@ -418,6 +418,10 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_metadata_group_id: int | None = None
     block_stride_rows: int = 0
     private_circle_plan: dict | None = None
+    win_indices: torch.Tensor | None = None
+    win_topk_length: torch.Tensor | None = None
+    cmp_topk_lengths: dict[int, torch.Tensor] | None = None
+    fa_metadata: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -1078,25 +1082,48 @@ class DeepseekV41EagerAttentionImpl:
             self,
             attn,
             q: torch.Tensor,
-            swa_metadata: DeepseekV41Metadata,
+            swa_metadata,
             num_reqs: int,
             query_start_loc: torch.Tensor,
+            *,
+            positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute sliding-window KV slot indices in TNK format.
 
-        Fully vectorised on-device implementation — no per-request Python
-        loop, no CPU-side tensor creation, no D2H/H2D copy.
+        When ``positions`` is provided (absolute token positions), a direct
+        vectorised path mirroring the reference recipe's
+        ``generate_win_topk_ids`` is used — no ``searchsorted``, no
+        per-request index reconstruction.  When ``positions`` is ``None``
+        (private-circle prefill with workspace-local coordinates), the
+        original reconstruction from ``start_pos`` + ``query_start_loc`` is
+        used instead.
 
         Returns a ``[total_tokens, 1, window_size]`` int32 tensor
-        where rows are concatenated across requests (TNK layout).  ``-1`` marks
-        a slot that holds nothing or padding.  Returns all ``-1`` when
-        ``start_pos`` is unavailable (e.g. drafting metadata).
+        where rows are concatenated across requests (TNK layout).  ``-1``
+        marks a slot that holds nothing or padding.
         """
         window_size = attn.window_size
         total_tokens = q.shape[0]
         device = q.device
+        if total_tokens == 0:
+            return torch.full(
+                (total_tokens, 1, window_size),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        if positions is not None:
+            positions = positions.to(torch.int32)
+            cols = torch.arange(window_size, device=device, dtype=torch.int32)
+            valid_len = torch.clamp(positions + 1, max=window_size)
+            window_start = positions - valid_len + 1
+            win_indices = window_start.unsqueeze(1) + cols.unsqueeze(0)
+            valid_mask = cols.unsqueeze(0) < valid_len.unsqueeze(1)
+            return torch.where(
+                valid_mask, win_indices, torch.full_like(win_indices, -1)
+            ).unsqueeze(1)
         start_pos = swa_metadata.start_pos
-        if start_pos is None or total_tokens == 0:
+        if start_pos is None:
             return torch.full(
                 (total_tokens, 1, window_size),
                 -1,
@@ -1117,6 +1144,41 @@ class DeepseekV41EagerAttentionImpl:
             win_indices > token_abs_pos.unsqueeze(1), -1
         )
         return win_indices.unsqueeze(1).to(torch.int32)
+
+    def _get_cached_win_indices(
+            self,
+            attn,
+            q: torch.Tensor,
+            swa_metadata,
+            num_reqs: int,
+            query_start_loc: torch.Tensor,
+            *,
+            positions: torch.Tensor | None = None,
+            sub_batch: str = "full",
+    ) -> torch.Tensor:
+        """Resolve window indices through the step-local cache.
+
+        The window indices depend only on step-level quantities
+        (``positions``, ``start_pos``, ``query_start_loc``,
+        ``window_size``), so — like the FA scheduling metadata — they are
+        built once per ``(step, sub_batch)`` and reused by every layer
+        instead of being recomputed per attention layer.
+        """
+        cache_lookup = getattr(getattr(attn, "shared_state", None),
+                               "fa_metadata", None)
+        if cache_lookup is None:
+            return self._get_window_topk_idxs(
+                attn, q, swa_metadata, num_reqs, query_start_loc,
+                positions=positions,
+            )
+        return cache_lookup(
+            get_forward_context(),
+            ("win_indices", sub_batch),
+            lambda: self._get_window_topk_idxs(
+                attn, q, swa_metadata, num_reqs, query_start_loc,
+                positions=positions,
+            ),
+        )
 
     def _prepare_cmp_attention(
         self,
@@ -1186,18 +1248,22 @@ class DeepseekV41EagerAttentionImpl:
                     win_block_table=metadata.swa.block_table[:num_decodes],
                     cu_seqlens_q=decode_qsl,
                     seqused_win_kv=metadata.swa.seq_lens[:num_decodes],
-                    win_indices=self._get_window_topk_idxs(
+                    win_indices=self._get_cached_win_indices(
                         attn,
                         q[:num_decode_tokens],
                         SimpleNamespace(start_pos=decode_start_pos),
                         num_decodes,
                         decode_qsl,
+                        positions=metadata.swa.positions[:num_decode_tokens]
+                        if metadata.swa.positions is not None else None,
+                        sub_batch="decode",
                     ),
                     cmp_indices=decode_cmp_indices,
                     cmp_block_table=decode_cmp_block_table,
                     seqused_cmp_kv=decode_cmp_seq_lens,
                     source_cache=source_cache,
                     has_compressed=has_compressed,
+                    sub_batch="decode",
                 )
             )
         if q.shape[0] > num_decode_tokens:
@@ -1210,23 +1276,83 @@ class DeepseekV41EagerAttentionImpl:
                     win_block_table=plan["ws_block_table"],
                     cu_seqlens_q=plan["prefill_query_start_loc"],
                     seqused_win_kv=plan["ws_seq_lens"],
-                    win_indices=self._get_window_topk_idxs(
+                    win_indices=self._get_cached_win_indices(
                         attn,
                         prefill_q,
                         SimpleNamespace(start_pos=plan["ws_local_start_pos"]),
                         num_reqs - num_decodes,
                         plan["prefill_query_start_loc"],
-                    ),
+                        sub_batch="prefill",
+                        ),
                     cmp_indices=prefill_cmp_indices,
                     cmp_block_table=prefill_cmp_block_table,
                     seqused_cmp_kv=prefill_cmp_seq_lens,
                     source_cache=source_cache,
                     has_compressed=has_compressed,
+                    sub_batch="prefill",
                 )
             )
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         self._commit_private_circle_prefill(plan, cache, workspace)
         return output
+
+    def _build_fa_op_metadata(
+            self,
+            attn,
+            q: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            win_topk_length: torch.Tensor,
+            cmp_topk_length: torch.Tensor,
+            has_compressed: bool,
+    ):
+        """Invoke the FA scheduling-metadata operator once."""
+        return mixed_quant_sparse_flash_mla_metadata(
+            win_topk_length,
+            cmp_topk_length,
+            cu_seqlens_q=cu_seqlens_q,
+            num_heads_q=q.shape[1],
+            num_heads_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0].shape[2],
+            head_dim=q.shape[-1],
+            quant_mode=1,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            has_win_kv=True,
+            has_cmp_kv=has_compressed,
+        )
+
+    def _fa_op_metadata(
+            self,
+            attn,
+            q: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            win_topk_length: torch.Tensor,
+            cmp_topk_length: torch.Tensor,
+            has_compressed: bool,
+            sub_batch: str,
+    ):
+        """Resolve the step-local FA scheduling metadata for one attention type.
+
+        The metadata operator only consumes step-level quantities: the
+        window/compressed topk lengths, ``cu_seqlens_q`` and the head layout
+        shared by every layer.  Following the reference recipe's
+        ``generate_kernel_metadata``, it is therefore invoked once per
+        attention type per sub-batch each step -- a fixed three calls (win,
+        c2a, c1a) on full-batch steps -- and every layer reuses the cached
+        result instead of re-deriving it per attention layer.
+        """
+        cache_lookup = getattr(getattr(attn, "shared_state", None), "fa_metadata", None)
+        if cache_lookup is None:
+            return self._build_fa_op_metadata(
+                attn, q, cu_seqlens_q, win_topk_length, cmp_topk_length, has_compressed
+            )
+        attention_type = "win" if not has_compressed else f"c{self.role.compress_ratio}a"
+        return cache_lookup(
+            get_forward_context(),
+            (attention_type, sub_batch),
+            lambda: self._build_fa_op_metadata(
+                attn, q, cu_seqlens_q, win_topk_length, cmp_topk_length, has_compressed
+            ),
+        )
 
     def _sparse_mla_attention(
         self,
@@ -1243,28 +1369,45 @@ class DeepseekV41EagerAttentionImpl:
         seqused_cmp_kv: torch.Tensor | None,
         source_cache,
         has_compressed: bool,
+        sub_batch: str = "full",
+        precomputed_swa: DeepseekV41Metadata | None = None,
     ) -> torch.Tensor:
         """One mixed_quant_sparse_flash_mla call: shared by the base full-batch
-        path and the private-circle decode/prefill sub-batches."""
-        win_topk_length = (win_indices >= 0).sum(dim=-1).to(torch.int32)
-        cmp_topk_length = (
-            torch.zeros_like(win_topk_length)
-            if cmp_indices is None
-            else (cmp_indices >= 0).sum(dim=-1).to(torch.int32)
-        )
-        op_metadata = mixed_quant_sparse_flash_mla_metadata(
-            win_topk_length,
-            cmp_topk_length,
-            cu_seqlens_q=cu_seqlens_q,
-            num_heads_q=q.shape[1],
-            num_heads_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0].shape[2],
-            head_dim=q.shape[-1],
-            quant_mode=1,
-            layout_q="TND",
-            layout_kv="PA_BBND",
-            has_win_kv=True,
-            has_cmp_kv=has_compressed,
-        )
+        path and the private-circle decode/prefill sub-batches.  The FA
+        scheduling metadata comes from the step-local cache keyed by
+        ``(attention type, sub_batch)``, or from the builder-pre-computed
+        metadata when available (full-batch path only)."""
+        if (
+                precomputed_swa is not None
+                and sub_batch == "full"
+                and precomputed_swa.fa_metadata is not None
+                and precomputed_swa.win_topk_length is not None
+        ):
+            n = q.shape[0]
+            win_topk_length = precomputed_swa.win_topk_length[:n]
+            ratio = self.role.compress_ratio
+            if has_compressed and precomputed_swa.cmp_topk_lengths is not None:
+                cmp_topk_length = precomputed_swa.cmp_topk_lengths[ratio][:n]
+            else:
+                cmp_topk_length = torch.zeros_like(win_topk_length)
+            attention_type = "win" if ratio == 0 else f"c{ratio}a"
+            op_metadata = precomputed_swa.fa_metadata[attention_type]
+        else:
+            win_topk_length = (win_indices >= 0).sum(dim=-1).to(torch.int32)
+            cmp_topk_length = (
+                torch.zeros_like(win_topk_length)
+                if cmp_indices is None
+                else (cmp_indices >= 0).sum(dim=-1).to(torch.int32)
+            )
+            op_metadata = self._fa_op_metadata(
+                attn,
+                q,
+                cu_seqlens_q,
+                win_topk_length,
+                cmp_topk_length,
+                has_compressed,
+                sub_batch,
+            )
         cmp_topk_length = None if cmp_indices is None else cmp_topk_length
         output, _ = cann_ops_transformer.ops.ds41.mixed_quant_sparse_flash_mla(
             q,
@@ -1319,6 +1462,15 @@ class DeepseekV41EagerAttentionImpl:
         cmp_indices, cmp_block_table, cmp_seq_lens = self._prepare_cmp_attention(
             metadata, source_cache, compressed_indices, num_reqs
         )
+        precomputed_swa = metadata.swa if metadata.swa.fa_metadata is not None else None
+        if precomputed_swa is not None and precomputed_swa.win_indices is not None:
+            win_indices = precomputed_swa.win_indices[:q.shape[0]]
+        else:
+            win_indices = self._get_cached_win_indices(
+                attn, q, metadata.swa, num_reqs, query_start_loc,
+                positions=metadata.swa.positions[:q.shape[0]]
+                if metadata.swa.positions is not None else None,
+            )
         return self._sparse_mla_attention(
             attn,
             q,
@@ -1326,14 +1478,13 @@ class DeepseekV41EagerAttentionImpl:
             win_block_table=metadata.swa.block_table[:num_reqs],
             cu_seqlens_q=query_start_loc,
             seqused_win_kv=metadata.swa.seq_lens[:num_reqs],
-            win_indices=self._get_window_topk_idxs(
-                attn, q, metadata.swa, num_reqs, query_start_loc
-            ),
+            win_indices=win_indices,
             cmp_indices=cmp_indices,
             cmp_block_table=cmp_block_table,
             seqused_cmp_kv=cmp_seq_lens,
             source_cache=source_cache,
             has_compressed=has_compressed,
+            precomputed_swa=precomputed_swa,
         )
 
 
@@ -1439,6 +1590,20 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._c2_full_source_rope: tuple[torch.Tensor, torch.Tensor] | None = None
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+        self._fa_precomputed = isinstance(kv_cache_spec, DeepseekV41SWASpec) and self._supports_device_ops
+        if self._fa_precomputed:
+            window_size = int(_config_value(text_config, "sliding_window", 0))
+            self._win_indices_buf = torch.full(
+                (max_tokens, 1, window_size), -1, dtype=torch.int32, device=device,
+            )
+            self._win_topk_length_buf = torch.zeros(
+                (max_tokens, 1), dtype=torch.int32, device=device,
+            )
+            self._cmp_topk_length_bufs: dict[int, torch.Tensor] = {
+                r: torch.zeros((max_tokens, 1), dtype=torch.int32, device=device)
+                for r in (1, 2)
+            }
+            self._fa_metadata_bufs: dict[str, torch.Tensor] = {}
 
     @classmethod
     def get_cudagraph_support(
@@ -1500,6 +1665,78 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         else:
             run()
         return buffer
+
+    def _build_kernel_metadata(
+            self,
+            positions: torch.Tensor,
+            num_tokens: int,
+            num_reqs: int,
+            cu_seqlens_q: torch.Tensor,
+            window_size: int,
+            num_heads_q: int,
+            head_dim: int,
+            index_topk: int,
+    ):
+        """Pre-compute win_indices, topk lengths and FA metadata once per step.
+
+        Mirrors the reference recipe's ``build_attn_metadata`` +
+        ``generate_kernel_metadata`` flow: window indices and compressed
+        top-k lengths are derived from positions alone, then the FA
+        scheduling-metadata operator is invoked a fixed three times (win,
+        c1a, c2a).  Every attention layer reuses the cached result instead
+        of re-deriving it per layer.
+        """
+        device = positions.device
+        pos_i32 = positions[:num_tokens].to(torch.int32)
+        cols = torch.arange(window_size, device=device, dtype=torch.int32)
+        valid_len = torch.clamp(pos_i32 + 1, max=window_size)
+        window_start = pos_i32 - valid_len + 1
+        win_ids = window_start.unsqueeze(1) + cols.unsqueeze(0)
+        valid_mask = cols.unsqueeze(0) < valid_len.unsqueeze(1)
+        win_indices = self._win_indices_buf[:num_tokens]
+        win_indices.copy_(
+            torch.where(valid_mask, win_ids, torch.full_like(win_ids, -1)).unsqueeze(1)
+        )
+        win_topk_length = self._win_topk_length_buf[:num_tokens]
+        win_topk_length.copy_((win_indices >= 0).sum(dim=-1).to(torch.int32))
+
+        cmp_topk_lengths: dict[int, torch.Tensor] = {}
+        for r in self._cmp_topk_length_bufs:
+            buf = self._cmp_topk_length_bufs[r][:num_tokens]
+            valid_length = (pos_i32 + 1) // r
+            if index_topk > 0:
+                valid_length = valid_length.clamp_max(index_topk)
+            buf.copy_(valid_length.unsqueeze(1).to(torch.int32))
+            cmp_topk_lengths[r] = buf
+
+        fa_metadata: dict[str, torch.Tensor] = {}
+        for ratio, attn_type in ((0, "win"), (2, "c2a"), (1, "c1a")):
+            has_cmp = ratio > 0
+            cmp_tl = (
+                cmp_topk_lengths[ratio] if has_cmp
+                else torch.zeros_like(win_topk_length)
+            )
+            value = mixed_quant_sparse_flash_mla_metadata(
+                win_topk_length,
+                cmp_tl,
+                cu_seqlens_q=cu_seqlens_q,
+                num_heads_q=num_heads_q,
+                num_heads_kv=1,
+                head_dim=head_dim,
+                quant_mode=1,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_win_kv=True,
+                has_cmp_kv=has_cmp,
+            )
+            buf = self._fa_metadata_bufs.get(attn_type)
+            if buf is None or buf.shape != value.shape:
+                buf = value.clone()
+                self._fa_metadata_bufs[attn_type] = buf
+            else:
+                buf.copy_(value)
+            fa_metadata[attn_type] = buf
+        return win_indices, win_topk_length, cmp_topk_lengths, fa_metadata
 
     def build(
         self,
@@ -1859,6 +2096,23 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         block_stride_rows = 0
         if cache_kind == "long_kv" and isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
             block_stride_rows = (getattr(spec, "page_size_padded", None) or 0) // spec.head_size
+        win_indices_pre = None
+        win_topk_length_pre = None
+        cmp_topk_lengths_pre = None
+        fa_metadata_pre = None
+        if (
+                self._fa_precomputed
+                and positions is not None
+                and private_circle_plan is None
+                and num_actual_tokens > 0
+        ):
+            win_indices_pre, win_topk_length_pre, cmp_topk_lengths_pre, fa_metadata_pre = (
+                self._build_kernel_metadata(
+                    positions, num_input_tokens, num_reqs,
+                    common.query_start_loc[: num_reqs + 1],
+                    window_size, n_local_heads, head_dim, index_topk,
+                )
+            )
         return DeepseekV41Metadata(
             block_table=block_table,
             slot_mapping=slots,
@@ -1896,6 +2150,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             c2_source_sin=c2_source_sin,
             c2_metadata_group_id=c2_metadata_group_id,
             private_circle_plan=private_circle_plan,
+            win_indices=win_indices_pre,
+            win_topk_length=win_topk_length_pre,
+            cmp_topk_lengths=cmp_topk_lengths_pre,
+            fa_metadata=fa_metadata_pre,
             **coordinates,
         )
 

@@ -98,12 +98,35 @@ class DeepseekV41SharedAttentionState:
         self.topk_indices = topk_indices
         self.candidate_indices = candidate_indices
         self.candidate_lengths = candidate_lengths
+        self._fa_metadata_step = None
+        self._fa_medata_entries: dict = {}
 
     def reset(self):
         # Source layers overwrite the active rows before any consumer reads
         # them. Keeping the storage intact avoids replay depending on Python
         # state mutation and preserves a fixed address for ACL Graph.
         return None
+
+    def fa_metadata(self, step, key, build):
+        """Build one FA scheduling-metadata entry once per step.
+
+        The attention implementation resolves the
+        ``mixed_quant_sparse_flash_mla_metadata`` operator through this cache
+        so the operator runs a fixed three times per step (win / c2a / c1a on
+        full-batch steps, once per private-circle sub-batch) instead of once
+        per attention layer, mirroring the reference recipe's
+        ``generate_kernel_metadata``. ``step`` is the forward context of the
+        current scheduler step; a new context invalidates every cached entry,
+        so replayed Python state never leaks across steps.
+        """
+        if self._fa_metadata_step is not step:
+            self._fa_metadata_step = step
+            self._fa_metadata_entries = {}
+        metadata = self._fa_metadata_entries.get(key)
+        if metadata is None:
+            metadata = build()
+            self._fa_metadata_entries[key] = metadata
+        return metadata
 
 
 def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:
@@ -242,14 +265,14 @@ class DeepseekV41Attention(DeepseekV4Attention):
     swa_cache_cls = AscendDeepseekV41SWACache
 
     def __init__(
-        self,
-        vllm_config,
-        config,
-        max_position_embeddings=0,
-        cache_config=None,
-        quant_config=None,
-        prefix="",
-        topk_indices_buffer=None,
+            self,
+            vllm_config,
+            config,
+            max_position_embeddings=0,
+            cache_config=None,
+            quant_config=None,
+            prefix="",
+            topk_indices_buffer=None,
     ):
         config = text_config_of(config)
         validate_cache_runtime(vllm_config)
@@ -309,7 +332,7 @@ class DeepseekV41Attention(DeepseekV4Attention):
         width = _read(config, "head_dim")
         self.softmax_scale = width**-0.5
         use_a5_quantized_cache = (
-            get_ascend_device_type() == AscendDeviceType.A5
+                get_ascend_device_type() == AscendDeviceType.A5
         )
         if role.is_kv_source:
             # On A5 the long-context KV is stored quantized:
@@ -414,12 +437,12 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         return y.to(x.dtype)
 
     def forward(
-        self,
-        positions,
-        hidden_states,
-        pre_mix,
-        llama_4_scaling=None,
-        input_ids=None,
+            self,
+            positions,
+            hidden_states,
+            pre_mix,
+            llama_4_scaling=None,
+            input_ids=None,
     ):
         residual = hidden_states
         x, attn_post, attn_comb, attn_pre = self.hc_pre(
@@ -532,7 +555,7 @@ class DeepseekV41Model(DeepseekV4Model):
         self._engram_max_tokens = max(
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        )
+            )
         if ascend_config.enable_engram:
             logger.debug(
                 "FOR-ENGRAM model initialization completed: layers=%s max_graph_tokens=%d device=%s",
@@ -542,13 +565,13 @@ class DeepseekV41Model(DeepseekV4Model):
             )
 
     def prepare_engram(
-        self,
-        input_ids,
-        positions,
-        query_start_loc=None,
-        lookback_token_ids=None,
-        lookback_dead_mask=None,
-        current_dead_mask=None,
+            self,
+            input_ids,
+            positions,
+            query_start_loc=None,
+            lookback_token_ids=None,
+            lookback_dead_mask=None,
+            current_dead_mask=None,
     ):
         """Hash and synchronously fetch embeddings outside the model graph."""
         config = self.config
@@ -585,14 +608,14 @@ class DeepseekV41Model(DeepseekV4Model):
         return lookups, mask
 
     def prepare_engram_inputs(
-        self,
-        input_ids,
-        positions,
-        padded_tokens=None,
-        query_start_loc=None,
-        lookback_token_ids=None,
-        lookback_dead_mask=None,
-        current_dead_mask=None,
+            self,
+            input_ids,
+            positions,
+            padded_tokens=None,
+            query_start_loc=None,
+            lookback_token_ids=None,
+            lookback_dead_mask=None,
+            current_dead_mask=None,
     ):
         """Refresh persistent inputs before main-model capture or replay."""
         engram_enabled = get_ascend_config().enable_engram
@@ -640,13 +663,13 @@ class DeepseekV41Model(DeepseekV4Model):
         return {"engram_lookups": padded_lookups, "engram_mask": padded_mask}
 
     def forward(
-        self,
-        input_ids,
-        positions,
-        intermediate_tensors,
-        inputs_embeds=None,
-        engram_lookups=None,
-        engram_mask=None,
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds=None,
+            engram_lookups=None,
+            engram_mask=None,
     ):
         if not get_pp_group().is_first_rank or not get_pp_group().is_last_rank:
             raise NotImplementedError("V4.1 eager milestone currently requires PP=1")
@@ -758,14 +781,14 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     _DEFERRED_WEIGHT_PREFIXES = ("aligner.", "vision.", "image_", "mtp.")
 
     def prepare_engram_inputs(
-        self,
-        input_ids,
-        positions,
-        padded_tokens=None,
-        query_start_loc=None,
-        lookback_token_ids=None,
-        lookback_dead_mask=None,
-        current_dead_mask=None,
+            self,
+            input_ids,
+            positions,
+            padded_tokens=None,
+            query_start_loc=None,
+            lookback_token_ids=None,
+            lookback_dead_mask=None,
+            current_dead_mask=None,
     ):
         return self.model.prepare_engram_inputs(
             input_ids,
@@ -787,13 +810,13 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
         self.model.destroy_engram()
 
     def forward(
-        self,
-        input_ids,
-        positions,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-        engram_lookups=None,
-        engram_mask=None,
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            engram_lookups=None,
+            engram_mask=None,
     ):
         return self.model(
             input_ids,
@@ -846,7 +869,7 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
                     "FOR-ENGRAM checkpoint weight loading incomplete: missing_layers=%s unexpected_layers=%s",
                     expected_tables - loaded_tables,
                     loaded_tables - expected_tables,
-                )
+                    )
                 raise ValueError(
                     "Engram embedding table mismatch: "
                     f"missing={expected_tables - loaded_tables}, "
