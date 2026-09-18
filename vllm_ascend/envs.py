@@ -76,6 +76,22 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (compact private pool plus prefix-hit bounded replay by configured SWA window).
     # Non-sensitive; read on scheduler/runner initialization and hot paths.
     "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "1"))),
+    "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "0"))
+    ),
+    # Whether to enable lightweight request timeline tracing. Valid values are
+    # 0 (default, disabled) and 1 (enabled). This value is non-sensitive and is
+    # read during platform and worker patch initialization.
+    "VLLM_ASCEND_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_TRACE", "0"))),
+    # Role attached to trace records. Expected values are "prefill" or
+    # "decode"; the default identifies an unspecified role. Non-sensitive.
+    "ROLE": lambda: os.getenv("ROLE", "unknown_role"),
+    # Directory for per-process trace logs. Non-sensitive and read when the
+    # trace utility module is initialized.
+    "TRACE_OUTPUT_DIRECTORY": lambda: os.getenv("TRACE_OUTPUT_DIRECTORY", "/tmp/trace_output_directory"),
+    # Optional custom trace namelist path. Non-sensitive and read when trace
+    # patches are initialized.
+    "PROFILING_NAMELIST": lambda: os.getenv("PROFILING_NAMELIST", None),
 }
 
 # end-env-vars-definition

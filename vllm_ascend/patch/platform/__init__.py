@@ -16,6 +16,7 @@
 
 import os
 
+import vllm_ascend.envs as envs_ascend
 import vllm_ascend.patch.platform.patch_circular_buffer  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v4_vision  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v41_config  # noqa
@@ -52,3 +53,6 @@ import vllm_ascend.patch.platform.patch_eplb  # noqa
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
 import vllm_ascend.patch.platform.patch_vision  # noqa
+
+if envs_ascend.VLLM_ASCEND_TRACE:
+    import vllm_ascend.patch.platform.patch_trace  # noqa

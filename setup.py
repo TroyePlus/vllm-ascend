@@ -509,6 +509,7 @@ setup(
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
     package_data={
         "vllm_ascend.observability": ["config/*.yaml"],
+        "vllm_ascend.trace": ["*.yml"],
         "vllm_ascend.models.deepseek_v41": ["*.cpp"],
     },
     python_requires=">=3.10",
