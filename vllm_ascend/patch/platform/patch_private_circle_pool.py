@@ -66,33 +66,40 @@ def _patched_request_init(self: Request, *args: Any, **kwargs: Any) -> None:
     self.private_circle_imported_valid_length = None
     self.private_circle_remote_local_hit = None
     self.private_circle_transfer_shared_block_ids = frozenset()
+    # Scheduler-level bounded replay: the full hit blocks/length stashed by
+    # get_computed_blocks until allocate_slots adopts them.
+    self.private_circle_hit_blocks = None
+    self.private_circle_hit_length = None
 
 
 def _record_private_circle_prefix_hit(
     request: Request,
     hit_length: int,
+    replay_start: int,
     private_pool: PrivateCirclePool,
 ) -> None:
-    """Record one-shot SWA bounded replay boundaries for a cache hit."""
+    """Record one-shot SWA bounded replay boundaries for a cache hit.
+
+    ``replay_start`` is the block-aligned scheduler-visible hit after the
+    bounded replay rollback; ``hit_length`` is the true local hit the shared
+    planes adopt.
+    """
     if not envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL or hit_length <= 0:
         return
     previous_hit_length = getattr(request, "private_circle_original_hit_length", None)
     request.private_circle_original_hit_length = int(hit_length)
-    request.private_circle_effective_start = compute_prefix_bounded_replay_start(
-        int(hit_length), private_pool.config.window_size
-    )
+    request.private_circle_effective_start = int(replay_start)
     # Log only the first observation.
     if previous_hit_length != int(hit_length):
         total_prompt_tokens = int(getattr(request, "num_prompt_tokens", 0))
-        bounded_replay_start = int(request.private_circle_effective_start)
         logger.info(
             "PRIVATE_CIRCLE_POOL prefix_hit request_id=%s total_prompt_tokens=%d "
             "hit_tokens=%d bounded_replay_start=%d bounded_replay_tokens=%d",
             request.request_id,
             total_prompt_tokens,
             int(hit_length),
-            bounded_replay_start,
-            int(hit_length) - bounded_replay_start,
+            int(replay_start),
+            int(hit_length) - int(replay_start),
         )
 
 
@@ -118,7 +125,16 @@ _original_get_computed_blocks = KVCacheManager.get_computed_blocks
 
 @wraps(_original_get_computed_blocks)
 def _patched_get_computed_blocks(self: KVCacheManager, request: Request):
-    """Record local prefix hits; v0.27 returns a 3-tuple here."""
+    """Scheduler-level bounded replay: report an aligned rollback start.
+
+    Producer and standalone engines roll the reported hit back by one window
+    so the scheduler schedules the warm-up rows inside the token budget; the
+    full hit blocks are returned untouched and ``_patched_allocate_slots``
+    restores the full hit length when they are adopted. Consumer engines keep
+    the connector-facing hit semantics; a consumer-local hit that does not
+    join a remote prefill is dropped (the decode-side token budget cannot
+    hold the warm-up window, so the ring is rebuilt from scratch instead).
+    """
     was_uncomputed = int(request.num_computed_tokens) == 0
     result = _original_get_computed_blocks(self, request)
     if was_uncomputed:
@@ -126,8 +142,42 @@ def _patched_get_computed_blocks(self: KVCacheManager, request: Request):
         if envs.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL:
             private_pool = getattr(self.coordinator, "private_circle_pool", None)
         if private_pool is not None:
-            _, hit_length, _ = result
-            _record_private_circle_prefix_hit(request, int(hit_length), private_pool)
+            hit_blocks, hit_length, boundary = result
+            hit_length = int(hit_length)
+            if hit_length > 0:
+                scheduler_replay = getattr(
+                    self.coordinator, "private_circle_scheduler_replay", False
+                )
+                if scheduler_replay:
+                    alignment = int(
+                        getattr(self.coordinator, "scheduler_block_size", 0)
+                        or getattr(self.coordinator, "lcm_block_size", 0)
+                        or 1
+                    )
+                    replay_start = compute_prefix_bounded_replay_start(
+                        hit_length, int(private_pool.config.window_size), alignment
+                    )
+                    if replay_start >= hit_length:
+                        replay_start = max(0, hit_length - alignment)
+                    request.private_circle_hit_blocks = hit_blocks
+                    request.private_circle_hit_length = hit_length
+                    _record_private_circle_prefix_hit(
+                        request, hit_length, replay_start, private_pool
+                    )
+                    return (hit_blocks, replay_start, boundary)
+                params = getattr(request, "kv_transfer_params", None)
+                remote_prefill = params is not None and params.get(
+                    "do_remote_prefill", False
+                )
+                if not remote_prefill:
+                    logger.info(
+                        "PRIVATE_CIRCLE_POOL consumer_local_hit_dropped "
+                        "request_id=%s hit_tokens=%d total_prompt_tokens=%d",
+                        request.request_id,
+                        hit_length,
+                        int(getattr(request, "num_prompt_tokens", 0)),
+                    )
+                    return (self.empty_kv_cache_blocks, 0, boundary)
         else:
             # Keep prefix-cache observability when the private circle pool is
             # absent (feature disabled, or a non-V4.1 model with the env set).
@@ -217,15 +267,21 @@ def _patched_update_after_schedule(
                 request.private_circle_original_hit_length = None
                 request.private_circle_effective_start = None
                 continue
+            # Local hits are recorded solely by _patched_get_computed_blocks
+            # (scheduler-level rollback); external async loads reach the
+            # READY branch above, which cancels any replay state.
             confirmed_from_schedule = detect_new_prefix_hit_length(
                 computed_before,
                 int(request.num_computed_tokens),
                 num_scheduled,
                 waiting_for_remote_kvs=status_name == "WAITING_FOR_REMOTE_KVS",
             )
-            if confirmed_from_schedule is not None:
-                _record_private_circle_prefix_hit(
-                    request, confirmed_from_schedule, private_pool
+            if confirmed_from_schedule is not None and confirmed_from_schedule > 0:
+                logger.debug(
+                    "PRIVATE_CIRCLE_POOL external prefix advance without "
+                    "scheduler lookup: request_id=%s confirmed_length=%d",
+                    request_id,
+                    int(confirmed_from_schedule),
                 )
     for request_id, num_scheduled_tokens in (
         scheduler_output.num_scheduled_tokens.items()
@@ -361,6 +417,51 @@ def _patched_handle_invalid_blocks(
 _original_allocate_slots = KVCacheManager.allocate_slots
 
 
+def _restore_full_hit_for_adoption(
+    request: Request, args: tuple, kwargs: dict
+) -> tuple[tuple, dict] | None:
+    """Restore the full hit length when the stashed hit blocks are adopted.
+
+    ``_patched_get_computed_blocks`` reported the rolled-back start to the
+    scheduler (token budget), but the shared planes must adopt every hit
+    block. Rewrite the allocate contract to the full hit: the warm-up rows
+    before the original hit boundary need no new blocks (their shared-plane
+    writes are masked by the model runner).
+
+    Returns None when this step's chunk cannot cover the whole warm-up
+    window: the caller defers the request, so the warm-up rows always land
+    in one full-budget chunk (the one-shot replay mask/plan state and the
+    ring commit invariant both rely on that).
+    """
+    stashed_blocks = getattr(request, "private_circle_hit_blocks", None)
+    stashed_hit = getattr(request, "private_circle_hit_length", None)
+    if stashed_blocks is None or stashed_hit is None:
+        return args, kwargs
+    replay_start = int(kwargs.get("num_new_computed_tokens") or 0)
+    full_hit = int(stashed_hit)
+    rollback = max(0, full_hit - replay_start)
+    if args:
+        num_new_tokens = args[0]
+    else:
+        num_new_tokens = kwargs.get("num_new_tokens")
+    if isinstance(num_new_tokens, int) and 0 < num_new_tokens <= rollback:
+        # A budget-tail chunk cannot hold the warm-up rows; deferring (rather
+        # than adopting with an unrewritten token count) keeps the cache
+        # commit inside the actually-scheduled range.
+        return None
+    kwargs = dict(kwargs)
+    kwargs["new_computed_blocks"] = stashed_blocks
+    kwargs["num_new_computed_tokens"] = full_hit
+    if isinstance(num_new_tokens, int) and num_new_tokens > rollback:
+        # Defense in depth: never reduce a positive allocation to zero (the
+        # upstream allocator rejects that without external KV).
+        if args:
+            args = (num_new_tokens - rollback, *args[1:])
+        else:
+            kwargs["num_new_tokens"] = num_new_tokens - rollback
+    return args, kwargs
+
+
 @wraps(_original_allocate_slots)
 def _patched_allocate_slots(self: KVCacheManager, request: Request, *args: Any, **kwargs: Any) -> Any:
     private_pool: PrivateCirclePool | None = getattr(
@@ -373,19 +474,47 @@ def _patched_allocate_slots(self: KVCacheManager, request: Request, *args: Any, 
             return None
         request.private_circle_allocation = allocation
         reserved_here = True
-    if not reserved_here:
-        return _original_allocate_slots(self, request, *args, **kwargs)
     try:
+        if getattr(request, "private_circle_hit_blocks", None) is not None:
+            restored = _restore_full_hit_for_adoption(request, args, kwargs)
+            if restored is None:
+                # Defer: the scheduler retries with a fresh token budget
+                # next step, where the chunk always covers the warm-up
+                # rows. The stash is cleared below and re-stashed by
+                # get_computed_blocks, so the retry is self-healing.
+                if reserved_here:
+                    private_pool.release(request.request_id)
+                    request.private_circle_allocation = None
+                chunk = args[0] if args else kwargs.get("num_new_tokens")
+                hit_length = int(
+                    getattr(request, "private_circle_hit_length", 0) or 0
+                )
+                replay_start = int(kwargs.get("num_new_computed_tokens") or 0)
+                logger.info(
+                    "PRIVATE_CIRCLE_POOL replay_deferred request_id=%s "
+                    "chunk_tokens=%s warmup_tokens=%d: step budget cannot "
+                    "hold the warm-up window, retrying next step",
+                    request.request_id,
+                    chunk,
+                    hit_length - replay_start,
+                )
+                return None
+            args, kwargs = restored
+        if not reserved_here:
+            return _original_allocate_slots(self, request, *args, **kwargs)
         result = _original_allocate_slots(self, request, *args, **kwargs)
         if result is None and private_pool is not None:
             private_pool.release(request.request_id)
             request.private_circle_allocation = None
         return result
     except Exception:
-        if private_pool is not None:
+        if private_pool is not None and reserved_here:
             private_pool.release(request.request_id)
             request.private_circle_allocation = None
         raise
+    finally:
+        request.private_circle_hit_blocks = None
+        request.private_circle_hit_length = None
 
 
 _original_kv_cache_manager_free = KVCacheManager.free
@@ -564,6 +693,33 @@ def _patched_scheduler_init(self: Scheduler, vllm_config: VllmConfig, *args: Any
             in_flight_tokens=1 + draft_tokens,
             max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
         )
+        # Producer and standalone engines schedule the bounded-replay warm-up
+        # rows inside the token budget; consumers keep connector-facing hit
+        # semantics (PD imports cover the window instead of replaying it).
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        is_consumer = bool(
+            getattr(kv_transfer_config, "is_kv_consumer", False)
+        )
+        coordinator.private_circle_scheduler_replay = not is_consumer
+        if coordinator.private_circle_scheduler_replay:
+            alignment = int(
+                getattr(coordinator, "scheduler_block_size", 0)
+                or getattr(coordinator, "lcm_block_size", 0)
+                or int(private_config.block_size)
+            )
+            max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            if max_batched_tokens < int(private_config.window_size) + alignment:
+                # The rollback can span window + one alignment of tokens; a
+                # smaller budget would strand a chunk entirely inside the
+                # warm-up rows.
+                raise RuntimeError(
+                    "DeepSeek-V4.1 bounded replay requires "
+                    f"max_num_batched_tokens ({max_batched_tokens}) >= "
+                    f"sliding_window + block alignment "
+                    f"({int(private_config.window_size)} + {alignment}); disable "
+                    "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL or raise the token "
+                    "budget."
+                )
         coordinator.private_circle_group_ids = frozenset(private_group_ids)
         coordinator.private_circle_config = private_config
         coordinator.private_circle_pool = PrivateCirclePool(private_config)

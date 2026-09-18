@@ -24,16 +24,20 @@ def is_private_circle_kv_cache_spec(spec: object) -> bool:
 def compute_prefix_bounded_replay_start(
     hit_length: int,
     bounded_replay_tokens: int,
+    alignment: int = 1,
 ) -> int:
-    """Return the exact request-private circle recompute start.
+    """Return the scheduler-visible recompute start after bounded replay.
 
-    Shared cache accounting stays at ``hit_length``. The returned position is
-    only used to prepend private-circle warm-up tokens in the model runner, so it
-    must not be aligned to a shared-cache block size.
+    The hit length is rolled back by one warm-up window and floored to
+    ``alignment`` (the scheduler block alignment) so the reported hit stays
+    block-aligned for allocation.
     """
     if hit_length < 0 or bounded_replay_tokens < 0:
         raise ValueError("hit_length and bounded_replay_tokens must be non-negative")
-    return max(0, hit_length - bounded_replay_tokens)
+    if alignment < 1:
+        raise ValueError("alignment must be positive")
+    start = max(0, hit_length - bounded_replay_tokens)
+    return start // alignment * alignment
 
 
 def detect_new_prefix_hit_length(

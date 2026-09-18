@@ -75,6 +75,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Valid values: 0 (default, original pool/prefix-cache flow) or 1
     # (compact private pool plus prefix-hit bounded replay by configured SWA window).
     # Non-sensitive; read on scheduler/runner initialization and hot paths.
+    "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "1"))),
     "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "0"))
     ),
