@@ -99,7 +99,7 @@ class DeepseekV41SharedAttentionState:
         self.candidate_indices = candidate_indices
         self.candidate_lengths = candidate_lengths
         self._fa_metadata_step = None
-        self._fa_medata_entries: dict = {}
+        self._fa_metadata_entries: dict = {}
 
     def reset(self):
         # Source layers overwrite the active rows before any consumer reads

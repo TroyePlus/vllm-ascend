@@ -422,6 +422,7 @@ class DeepseekV41Metadata(AttentionMetadata):
     win_topk_length: torch.Tensor | None = None
     cmp_topk_lengths: dict[int, torch.Tensor] | None = None
     fa_metadata: dict[str, torch.Tensor] | None = None
+    fa_metadata_group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1464,6 +1465,10 @@ class DeepseekV41EagerAttentionImpl:
         )
         precomputed_swa = metadata.swa if metadata.swa.fa_metadata is not None else None
         if precomputed_swa is not None and precomputed_swa.win_indices is not None:
+            if precomputed_swa.fa_metadata_group_id is not None:
+                wait_for_device_metadata(
+                    DeviceMetadataStage.ATTENTION, precomputed_swa.fa_metadata_group_id
+                )
             win_indices = precomputed_swa.win_indices[:q.shape[0]]
         else:
             win_indices = self._get_cached_win_indices(
@@ -1604,6 +1609,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 for r in (1, 2)
             }
             self._fa_metadata_bufs: dict[str, torch.Tensor] = {}
+            self._fa_metadata_sentinel = torch.zeros(1, dtype=torch.int32, device=device)
 
     @classmethod
     def get_cudagraph_support(
@@ -1676,15 +1682,22 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_heads_q: int,
             head_dim: int,
             index_topk: int,
-    ):
+    ) -> None:
         """Pre-compute win_indices, topk lengths and FA metadata once per step.
 
         Mirrors the reference recipe's ``build_attn_metadata`` +
         ``generate_kernel_metadata`` flow: window indices and compressed
         top-k lengths are derived from positions alone, then the FA
         scheduling-metadata operator is invoked a fixed three times (win,
-        c1a, c2a).  Every attention layer reuses the cached result instead
-        of re-deriving it per layer.
+        c2a, c1a).  Results are written into the builder's persistent
+        buffers (``_win_indices_buf``, ``_win_topk_length_buf``,
+        ``_cmp_topk_length_bufs``, ``_fa_metadata_bufs``) so that every
+        attention layer reuses them instead of re-deriving per layer.
+
+        When ``_device_metadata_enabled`` is True the call is deferred via
+        ``_publish_task`` and runs on a separate NPU stream; the layer
+        forward must ``wait_for_device_metadata`` before consuming the
+        buffers.
         """
         device = positions.device
         pos_i32 = positions[:num_tokens].to(torch.int32)
@@ -1709,7 +1722,6 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             buf.copy_(valid_length.unsqueeze(1).to(torch.int32))
             cmp_topk_lengths[r] = buf
 
-        fa_metadata: dict[str, torch.Tensor] = {}
         for ratio, attn_type in ((0, "win"), (2, "c2a"), (1, "c1a")):
             has_cmp = ratio > 0
             cmp_tl = (
@@ -1732,11 +1744,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             buf = self._fa_metadata_bufs.get(attn_type)
             if buf is None or buf.shape != value.shape:
                 buf = value.clone()
-                self._fa_metadata_bufs[attn_type] = buf
             else:
                 buf.copy_(value)
-            fa_metadata[attn_type] = buf
-        return win_indices, win_topk_length, cmp_topk_lengths, fa_metadata
+            self._fa_metadata_bufs[attn_type] = buf
 
     def build(
         self,
@@ -2100,19 +2110,42 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         win_topk_length_pre = None
         cmp_topk_lengths_pre = None
         fa_metadata_pre = None
+        fa_metadata_group_id = None
         if (
                 self._fa_precomputed
                 and positions is not None
                 and private_circle_plan is None
                 and num_actual_tokens > 0
         ):
-            win_indices_pre, win_topk_length_pre, cmp_topk_lengths_pre, fa_metadata_pre = (
+            cu_seqlens_q = common.query_start_loc[: num_reqs + 1]
+            pos_for_build = positions
+            n_tokens = num_input_tokens
+            n_reqs = num_reqs
+            ws = window_size
+            nhq = n_local_heads
+            hd = head_dim
+            itk = index_topk
+
+            def build_fa_metadata() -> None:
                 self._build_kernel_metadata(
-                    positions, num_input_tokens, num_reqs,
-                    common.query_start_loc[: num_reqs + 1],
-                    window_size, n_local_heads, head_dim, index_topk,
+                    pos_for_build, n_tokens, n_reqs, cu_seqlens_q,
+                    ws, nhq, hd, itk,
                 )
+
+            sentinel = self._publish_task(
+                shared,
+                "fa:kernel_metadata",
+                self._fa_metadata_sentinel,
+                DeviceMetadataStage.ATTENTION,
+                build_fa_metadata,
             )
+            win_indices_pre = self._win_indices_buf[:n_tokens]
+            win_topk_length_pre = self._win_topk_length_buf[:n_tokens]
+            cmp_topk_lengths_pre = {
+                r: buf[:n_tokens] for r, buf in self._cmp_topk_length_bufs.items()
+            }
+            fa_metadata_pre = self._fa_metadata_bufs
+            fa_metadata_group_id = id(sentinel)
         return DeepseekV41Metadata(
             block_table=block_table,
             slot_mapping=slots,
@@ -2154,6 +2187,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             win_topk_length=win_topk_length_pre,
             cmp_topk_lengths=cmp_topk_lengths_pre,
             fa_metadata=fa_metadata_pre,
+            fa_metadata_group_id=fa_metadata_group_id,
             **coordinates,
         )
 
