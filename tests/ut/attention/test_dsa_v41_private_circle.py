@@ -10,6 +10,7 @@ import torch
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41EagerAttentionImpl,
     _assert_decode_rows_first,
+    _validate_batch_layout,
 )
 
 
@@ -53,6 +54,83 @@ def test_guard_rejects_only_rows_below_num_decodes():
     _assert_decode_rows_first(_common([False, True, True]), num_reqs=3, num_decodes=1)
     with pytest.raises(RuntimeError, match="decode rows before prefill"):
         _assert_decode_rows_first(_common([True, False, True]), num_reqs=3, num_decodes=1)
+
+
+def _batch_layout_common(num_reqs=2, num_tokens=2):
+    return SimpleNamespace(
+        query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32),
+        block_table_tensor=torch.zeros((num_reqs, 1), dtype=torch.int32),
+        slot_mapping=torch.full((num_tokens,), -1, dtype=torch.int32),
+    )
+
+
+def test_batch_layout_accepts_graph_padding():
+    _validate_batch_layout(
+        _batch_layout_common(num_reqs=4, num_tokens=4),
+        num_reqs=4,
+        num_actual_reqs=2,
+        num_input_tokens=4,
+        num_actual_tokens=2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "num_actual_reqs", "num_input_tokens", "num_actual_tokens"),
+    [
+        (2, 3, 2, 2),
+        (2, 2, 2, 3),
+    ],
+)
+def test_batch_layout_rejects_actual_counts_above_padded_shape(
+    num_reqs, num_actual_reqs, num_input_tokens, num_actual_tokens
+):
+    with pytest.raises(ValueError):
+        _validate_batch_layout(
+            _batch_layout_common(num_reqs=num_reqs, num_tokens=num_input_tokens),
+            num_reqs=num_reqs,
+            num_actual_reqs=num_actual_reqs,
+            num_input_tokens=num_input_tokens,
+            num_actual_tokens=num_actual_tokens,
+        )
+
+
+def test_batch_layout_requires_all_padded_request_rows():
+    common = _batch_layout_common(num_reqs=2)
+    common.block_table_tensor = common.block_table_tensor[:1]
+    with pytest.raises(ValueError, match="block table row"):
+        _validate_batch_layout(
+            common,
+            num_reqs=2,
+            num_actual_reqs=0,
+            num_input_tokens=2,
+            num_actual_tokens=1,
+        )
+
+
+def test_batch_layout_allows_one_synthetic_padding_row():
+    common = _batch_layout_common(num_reqs=2)
+    common.block_table_tensor = common.block_table_tensor[:1]
+    _validate_batch_layout(
+        common,
+        num_reqs=2,
+        num_actual_reqs=1,
+        num_input_tokens=2,
+        num_actual_tokens=1,
+    )
+
+
+def test_query_projection_is_split_into_heads_consistently():
+    query = torch.zeros((5, 12), dtype=torch.bfloat16)
+    reshaped = DeepseekV41EagerAttentionImpl._reshape_query_heads(query, 4)
+    assert reshaped.shape == (5, 3, 4)
+    assert reshaped.data_ptr() == query.data_ptr()
+
+
+def test_query_projection_rejects_partial_head():
+    with pytest.raises(ValueError, match="divisible by head_dim"):
+        DeepseekV41EagerAttentionImpl._reshape_query_heads(
+            torch.zeros((2, 10)), 4
+        )
 
 
 def _ws_plan(query_lens, histories):
