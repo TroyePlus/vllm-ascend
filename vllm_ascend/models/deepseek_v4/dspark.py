@@ -233,11 +233,10 @@ class DeepseekV4DSparkModel(nn.Module):
 
         from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 
+        plan = get_dsa_attn_kv_plan(self.vllm_config)
         if slot_mapping.ndim == 1:
-            slot_mapping = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
-                slot_mapping, swa_cache_layer.block_size
-            )
-        get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(swa_kv_cache, shared_kv, slot_mapping)
+            slot_mapping = plan.format_dsa_slot_mapping(slot_mapping, swa_cache_layer.block_size)
+        plan.dsa_kv_compress_scatter(swa_kv_cache, shared_kv, slot_mapping)
 
     def precompute_and_store_context_kv(
         self,
@@ -455,6 +454,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
             # Expert scale parameters use Ascend's ``weight_scale`` convention.
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
+
+            if name.endswith(".e_score_correction_bias_vl") and name not in params_dict:
+                logger.info_once("Ignoring vision-only router bias while loading the text-only DSpark drafter")
+                continue
 
             if ".experts." in name:
                 for param_name, weight_name, expert_id, shard_id in expert_mapping:

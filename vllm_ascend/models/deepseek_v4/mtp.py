@@ -334,7 +334,10 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             if ".attn_norm." in name:
                 name = name.replace(".attn_norm.", ".input_layernorm.")
 
-            if ".gate.bias" in name:
+            if ".gate.bias_vl" in name:
+                if name not in params_dict:
+                    continue
+            elif ".gate.bias" in name:
                 name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
 
             if "sink" in name:

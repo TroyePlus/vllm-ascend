@@ -36,10 +36,13 @@ from vllm.v1.attention.backend import (
 
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41A5DraftSWASpec,
     DeepseekV41CompressorStateSpec,
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
+    is_v41_draft_swa_spec,
 )
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
@@ -1501,6 +1504,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             run()
         return buffer
 
+    def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
+        if not is_v41_draft_swa_spec(self.kv_cache_spec):
+            raise TypeError("V4.1 drafting requires a draft SWA cache")
+        # DSpark issues one eager block per step. Group-local tables and slots
+        # remain independent; the builder owns the operator metadata buffers.
+        return self.build(0, common_attn_metadata)
+
     def build(
         self,
         common_prefix_len,
@@ -1516,7 +1526,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
         ratio = getattr(spec, "compress_ratio", 1)
-        if isinstance(spec, DeepseekV41SWASpec):
+        if isinstance(spec, (DeepseekV41SWASpec, DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec)):
             cache_kind = "swa"
         elif isinstance(spec, DeepseekV41FullSpec):
             cache_kind = "long_kv"
