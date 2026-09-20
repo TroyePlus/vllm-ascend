@@ -2117,35 +2117,61 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 and private_circle_plan is None
                 and num_actual_tokens > 0
         ):
-            cu_seqlens_q = common.query_start_loc[: num_reqs + 1]
-            pos_for_build = positions
-            n_tokens = num_input_tokens
-            n_reqs = num_reqs
-            ws = window_size
-            nhq = n_local_heads
-            hd = head_dim
-            itk = index_topk
+            fa_shared = kwargs.get("fa_metadata_shared")
+            if fa_shared is None:
+                fa_shared = shared
+            fa_key = "fa:kernel_metadata"
+            fa_cache = fa_shared.get(fa_key)
+            if fa_cache is not None:
+                n_tokens = num_input_tokens
+                win_indices_pre = fa_cache["win_indices"][:n_tokens]
+                win_topk_length_pre = fa_cache["win_topk_length"][:n_tokens]
+                cmp_topk_lengths_pre = {
+                    r: buf[:n_tokens] for r, buf in fa_cache["cmp_topk_lengths"].items()
+                }
+                fa_metadata_pre = fa_cache["fa_metadata"]
+                fa_metadata_group_id = fa_cache["group_id"]
+            else:
+                cu_seqlens_q = common.query_start_loc[: num_reqs + 1]
+                pos_for_build = positions
+                n_tokens = num_input_tokens
+                n_reqs = num_reqs
+                ws = window_size
+                nhq = n_local_heads
+                hd = head_dim
+                itk = index_topk
 
-            def build_fa_metadata() -> None:
-                self._build_kernel_metadata(
-                    pos_for_build, n_tokens, n_reqs, cu_seqlens_q,
-                    ws, nhq, hd, itk,
-                )
+                def build_fa_metadata() -> None:
+                    self._build_kernel_metadata(
+                        pos_for_build, n_tokens, n_reqs, cu_seqlens_q,
+                        ws, nhq, hd, itk,
+                    )
 
-            sentinel = self._publish_task(
-                shared,
-                "fa:kernel_metadata",
-                self._fa_metadata_sentinel,
-                DeviceMetadataStage.ATTENTION,
-                build_fa_metadata,
-            )
-            win_indices_pre = self._win_indices_buf[:n_tokens]
-            win_topk_length_pre = self._win_topk_length_buf[:n_tokens]
-            cmp_topk_lengths_pre = {
-                r: buf[:n_tokens] for r, buf in self._cmp_topk_length_bufs.items()
-            }
-            fa_metadata_pre = self._fa_metadata_bufs
-            fa_metadata_group_id = id(sentinel)
+                if self._device_metadata_enabled:
+                    self._device_metadata_tasks = (
+                        *self._device_metadata_tasks,
+                        DeviceMetadataTask(
+                            DeviceMetadataStage.ATTENTION,
+                            build_fa_metadata,
+                            id(self._fa_metadata_sentinel),
+                        ),
+                    )
+                else:
+                    build_fa_metadata()
+                fa_metadata_group_id = id(self._fa_metadata_sentinel)
+                fa_shared[fa_key] = {
+                    "win_indices": self._win_indices_buf,
+                    "win_topk_length": self._win_topk_length_buf,
+                    "cmp_topk_lengths": self._cmp_topk_length_bufs,
+                    "fa_metadata": self._fa_metadata_bufs,
+                    "group_id": fa_metadata_group_id,
+                }
+                win_indices_pre = self._win_indices_buf[:n_tokens]
+                win_topk_length_pre = self._win_topk_length_buf[:n_tokens]
+                cmp_topk_lengths_pre = {
+                    r: buf[:n_tokens] for r, buf in self._cmp_topk_length_bufs.items()
+                }
+                fa_metadata_pre = self._fa_metadata_bufs
         return DeepseekV41Metadata(
             block_table=block_table,
             slot_mapping=slots,

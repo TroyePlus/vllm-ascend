@@ -3915,6 +3915,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_actual_reqs=num_reqs,
                     skip_ring_state_update=skip_gdn_state_update,
                     common_v41_metadata=common_v41_metadata,
+                    fa_metadata_shared=fa_metadata_shared,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
             if (for_cudagraph_capture
@@ -3957,6 +3958,7 @@ class NPUModelRunner(GPUModelRunner):
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
+        fa_metadata_shared: dict[str, Any] = {}
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             # V4.1 cache coordinates are shared only inside one framework KV
             # cache group. This lets a source's LongKV and Indexer reuse the
