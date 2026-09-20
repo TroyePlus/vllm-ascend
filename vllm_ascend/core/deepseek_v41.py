@@ -254,10 +254,16 @@ def group_cache_specs(specs, *, divert_swa: bool | None = None):
     groups = [_uniform(full, "full"), _uniform(state, "state")]
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
     swa_source = specs if divert else padded
-    groups.extend(
-        _uniform({n: swa_source[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
-        for start in range(0, len(swa), len(slots))
-    )
+    if divert:
+        # Diverted SWA layers share one ring allocation per request and never
+        # touch the shared slots, so the slot-aligned split below is redundant;
+        # one group keeps a single identical ring table per step.
+        groups.append(_uniform({n: swa_source[n] for n in swa}, "swa"))
+    else:
+        groups.extend(
+            _uniform({n: swa_source[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
+            for start in range(0, len(swa), len(slots))
+        )
     draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
     if draft:
         groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
