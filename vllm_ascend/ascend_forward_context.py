@@ -394,6 +394,7 @@ _A5_MEGA_MOE_QUANT_TYPES = {
 }
 _A5_MEGA_MOE_GROUP_SIZE = 32
 _A5_MOE_QUANT_TYPES_BY_CONFIG_ID: dict[int, QuantType] = {}
+_A5_MOE_ACTIVATIONS_BY_CONFIG_ID: dict[int, str | None] = {}
 
 
 def cache_a5_moe_quant_type(
@@ -409,33 +410,65 @@ def _get_a5_moe_quant_type(
     vllm_config: VllmConfig,
     model_instance: torch.nn.Module | None,
 ) -> QuantType | None:
+    """Routed-experts quant type amortized per vllm_config.
+
+    The module scan walks the full model tree, so it must stay a one-time
+    cache-miss fallback; the per-step path is a dict lookup.
+    """
+    config_id = id(vllm_config)
+    if config_id in _A5_MOE_QUANT_TYPES_BY_CONFIG_ID:
+        return _A5_MOE_QUANT_TYPES_BY_CONFIG_ID[config_id]
+    quant_type: QuantType | None = None
     if model_instance is not None:
         modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
         for module in modules:
             if not hasattr(module, "moe_config"):
                 continue
-            quant_type = getattr(module, "quant_type", None)
-            if isinstance(quant_type, QuantType) and quant_type != QuantType.NONE:
-                return quant_type
-    return _A5_MOE_QUANT_TYPES_BY_CONFIG_ID.get(id(vllm_config))
+            module_quant_type = getattr(module, "quant_type", None)
+            if (
+                isinstance(module_quant_type, QuantType)
+                and module_quant_type != QuantType.NONE
+            ):
+                quant_type = module_quant_type
+                break
+    _A5_MOE_QUANT_TYPES_BY_CONFIG_ID[config_id] = quant_type
+    return quant_type
 
 
 def _get_a5_moe_activation(
     vllm_config: VllmConfig,
     model_instance: torch.nn.Module | None,
 ) -> str | None:
+    """MoE activation amortized per vllm_config.
+
+    No current MoE module exposes ``activation``, so the scan is a one-time
+    fallback; the per-step path is a dict lookup.
+    """
+    config_id = id(vllm_config)
+    if config_id in _A5_MOE_ACTIVATIONS_BY_CONFIG_ID:
+        return _A5_MOE_ACTIVATIONS_BY_CONFIG_ID[config_id]
+    activation: str | None = None
     if model_instance is not None:
         modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
         for module in modules:
             if not hasattr(module, "moe_config"):
                 continue
-            activation = getattr(module, "activation", None)
-            if isinstance(activation, str):
-                return activation
-            if isinstance(activation, Enum):
-                return activation.name
-    hf_text_config = vllm_config.model_config.hf_text_config
-    return getattr(hf_text_config, "hidden_act", getattr(hf_text_config, "hidden_activation", None))
+            module_activation = getattr(module, "activation", None)
+            if isinstance(module_activation, str):
+                activation = module_activation
+                break
+            if isinstance(module_activation, Enum):
+                activation = module_activation.name
+                break
+    if activation is None:
+        hf_text_config = vllm_config.model_config.hf_text_config
+        activation = getattr(
+            hf_text_config,
+            "hidden_act",
+            getattr(hf_text_config, "hidden_activation", None),
+        )
+    _A5_MOE_ACTIVATIONS_BY_CONFIG_ID[config_id] = activation
+    return activation
 
 
 def _get_a5_moe_group_size(vllm_config: VllmConfig) -> int | None:
