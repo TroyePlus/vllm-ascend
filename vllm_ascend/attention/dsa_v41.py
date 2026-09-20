@@ -519,6 +519,34 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
+def _prefill_rows_fit_ring_capacity(
+    common: Any,
+    num_reqs: int,
+    max_query_len: int,
+) -> bool:
+    """Whether every prefill row's query fits the ring's in-flight capacity.
+
+    Rows within the per-step in-flight capacity (a PD request's
+    last-token recompute, optionally fused with the first speculative
+    draft block) write ring slots directly and need no shared prefill
+    workspace, so their position in the batch does not matter.
+    """
+    is_prefilling = getattr(common, "is_prefilling", None)
+    query_start_loc_cpu = getattr(common, "query_start_loc_cpu", None)
+    if (
+        is_prefilling is None
+        or query_start_loc_cpu is None
+        or getattr(is_prefilling, "device", None) is None
+        or is_prefilling.device.type != "cpu"
+    ):
+        return False
+    flags = is_prefilling[:num_reqs].bool()
+    starts = query_start_loc_cpu[: num_reqs + 1]
+    query_lens = starts[1:] - starts[:-1]
+    prefill_query_lens = query_lens[flags]
+    return bool((prefill_query_lens <= max_query_len).all())
+
+
 def _validate_batch_layout(
     common: Any,
     *,
@@ -1669,16 +1697,25 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_prefills,
             num_prefill_tokens,
         ) = _request_counts(common, num_actual_reqs)
+        draft_tokens = (
+            getattr(self.vllm_config.speculative_config, "num_speculative_tokens", 0)
+            if self.vllm_config.speculative_config is not None
+            else 0
+        )
         if (
             cache_kind == "swa"
             and num_prefills > 0
-            and num_prefill_tokens == num_prefills
+            and not is_v41_draft_swa_spec(spec)
             and getattr(common, "private_circle_blocks_per_allocation", None)
+            and _prefill_rows_fit_ring_capacity(
+                common, num_actual_reqs, 1 + draft_tokens
+            )
         ):
-            # Every prefill row schedules exactly one token: a PD request's
-            # last-token recompute, whose window the imported ring already
-            # covers. Run those rows as decodes so the step needs no plan and
-            # stays graph-capturable.
+            # Every prefill row's query fits the ring's in-flight capacity:
+            # a PD request's last-token recompute, optionally fused with the
+            # first speculative draft block. The imported ring already covers
+            # the window, so those rows run as decodes: no plan, and the step
+            # stays graph-capturable regardless of row order.
             num_decodes += num_prefills
             num_decode_tokens += num_prefill_tokens
             num_prefills = 0
@@ -1709,7 +1746,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         smla_metadata = None
         qli_metadata = None
         private_circle_plan = None
-        if cache_kind == "swa" and num_prefills > 0:
+        # Draft SWA layers live in the shared slots, not the request-private
+        # ring: their builds must never construct a pool plan, or the plan's
+        # ring-geometry restore/commit would run against the draft's
+        # shared-slot cache.
+        if (
+            cache_kind == "swa"
+            and num_prefills > 0
+            and not is_v41_draft_swa_spec(spec)
+        ):
             blocks_per_allocation = getattr(common, "private_circle_blocks_per_allocation", None)
             if blocks_per_allocation:
                 private_circle_plan = _prepare_private_circle_plan(
