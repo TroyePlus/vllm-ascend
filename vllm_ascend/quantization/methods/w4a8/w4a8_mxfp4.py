@@ -194,6 +194,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                shared_weights=shared_experts,
             )
         )
 

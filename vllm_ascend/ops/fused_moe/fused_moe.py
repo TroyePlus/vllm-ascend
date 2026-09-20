@@ -213,6 +213,49 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self.ascend_shared_experts is not None:
             self.ascend_shared_experts.set_lora_context(lora_context)
 
+    def _forward_with_fused_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.ascend_shared_experts is None:
+            return None
+        if shared_hidden_states is not hidden_states:
+            return None
+        if _EXTRA_CTX.moe_comm_type != MoECommType.FUSED_MC2:
+            return None
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        supports_fused_shared = getattr(moe_comm_method, "supports_fused_shared_experts", None)
+        if supports_fused_shared is None or not supports_fused_shared():
+            return None
+        shared_weights = self.ascend_shared_experts.get_mega_moe_weights()
+        if shared_weights is None:
+            return None
+
+        if self.is_internal_router:
+            gate = self.gate
+            assert gate is not None
+            gate_weight = gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32)
+            router_logits = F.linear(shared_hidden_states.float(), gate_weight)
+
+        combined_out, fused_moe_events = self.routed_experts.forward_impl(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+            shared_experts=shared_weights,
+            shared_experts_input=shared_hidden_states,
+        )
+        if not fused_moe_events.shared_experts_fused:
+            raise RuntimeError("MegaMoE returned without fusing the provided shared expert weights.")
+        # vLLM selects the two-Tensor moe_forward_shared schema whenever this
+        # runner owns shared experts. MegaMoE has already summed the routed and
+        # shared contributions, so expose that sum in the shared slot and a
+        # shape-compatible zero in the routed slot. This also prevents vLLM
+        # from applying routed-only scaling or transforms to the combined sum.
+        return combined_out, torch.zeros_like(combined_out)
+
     if vllm_version_is("0.27.1"):
 
         def _forward_impl(
@@ -230,6 +273,14 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         router_logits=router_logits,
                         input_ids=input_ids,
                     )
+                fused_shared_out = self._forward_with_fused_shared_experts(
+                    hidden_states,
+                    router_logits,
+                    shared_hidden_states,
+                    input_ids,
+                )
+                if fused_shared_out is not None:
+                    return fused_shared_out
                 shared_expert_input, shared_input_all_gather_done = (
                     self.ascend_shared_experts.prepare_input_before_routed_experts(shared_hidden_states)
                 )
@@ -293,6 +344,14 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         router_logits=router_logits,
                         input_ids=input_ids,
                     )
+                fused_shared_out = self._forward_with_fused_shared_experts(
+                    hidden_states,
+                    router_logits,
+                    shared_hidden_states,
+                    input_ids,
+                )
+                if fused_shared_out is not None:
+                    return fused_shared_out
                 shared_expert_input, shared_input_all_gather_done = (
                     self.ascend_shared_experts.prepare_input_before_routed_experts(shared_hidden_states)
                 )

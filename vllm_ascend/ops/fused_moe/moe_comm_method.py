@@ -77,6 +77,7 @@ class FusedExpertsResult:
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    shared_experts_fused: bool = False
 
 
 class MoECommMethod(ABC):
@@ -288,6 +289,13 @@ class FusedMC2CommImpl(MoECommMethod):
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
+    def supports_fused_shared_experts(self) -> bool:
+        return (
+            self._is_a5_backend
+            and self._mega_moe_backend is not None
+            and self._mega_moe_backend.supports_shared_experts()
+        )
+
     def _get_token_dispatcher(self):
         if get_ascend_device_type() == AscendDeviceType.A5:
             return _MegaMoEBypassTokenDispatcher()
@@ -468,10 +476,11 @@ class FusedMC2CommImpl(MoECommMethod):
     ):
         if self._is_a5_backend:
             assert self._mega_moe_backend is not None
-            out, expert_tokens = self._mega_moe_backend.fused_experts(fused_experts_input)
+            out, expert_tokens, shared_experts_fused = self._mega_moe_backend.fused_experts(fused_experts_input)
             return FusedExpertsResult(
                 routed_out=out,
                 expert_tokens=expert_tokens,
+                shared_experts_fused=shared_experts_fused,
             )
 
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (

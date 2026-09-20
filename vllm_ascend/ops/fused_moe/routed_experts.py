@@ -511,6 +511,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        shared_experts=None,
+        shared_experts_input: torch.Tensor | None = None,
     ):
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice
@@ -554,8 +556,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 x=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
             )
         finally:
             self.ascend_pertoken_scale = None
@@ -600,6 +602,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 before_dispatch=fused_experts_results.before_dispatch_evt,
                 before_gmm2=fused_experts_results.before_gmm2_evt,
                 before_combine=fused_experts_results.before_combine_evt,
+                shared_experts_fused=getattr(fused_experts_results, "shared_experts_fused", False),
             )
 
         # The vLLM FusedMoE forward_impl does not return events.
