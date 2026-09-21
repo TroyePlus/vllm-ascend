@@ -1749,7 +1749,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             raise TypeError("V4.1 drafting requires a draft SWA cache")
         # DSpark issues one eager block per step. Group-local tables and slots
         # remain independent; the builder owns the operator metadata buffers.
-        return self.build(0, common_attn_metadata)
+        # kwargs (shared step caches, spec-decode args) flow through so the
+        # draft reuses the same step-scoped construction as the target.
+        return self.build(0, common_attn_metadata, **kwargs)
 
     def _build_kernel_metadata(
             self,

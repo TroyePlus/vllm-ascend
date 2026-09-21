@@ -88,6 +88,17 @@ def test_diverted_swa_layers_form_one_group():
     assert {name.rsplit(".", 1)[0] for name in merged.kv_cache_specs} == {
         f"model.layers.{layer}.self_attn" for layer in range(40)
     }
+    draft_groups = [
+        g
+        for g in groups
+        if g.kv_cache_specs
+        and all(
+            isinstance(s, DeepseekV41DraftSWASpec)
+            for s in g.kv_cache_specs.values()
+        )
+    ]
+    assert len(draft_groups) == 1
+    assert len(draft_groups[0].kv_cache_specs) == 3
 
 
 def test_diverted_groups_without_draft_stay_three():

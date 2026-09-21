@@ -15,10 +15,23 @@ PRIVATE_CIRCLE_TRANSFER_FAILED = "failed"
 
 
 def is_private_circle_kv_cache_spec(spec: object) -> bool:
-    """Return whether a leaf KV cache spec is a V4.1 private-circle SWA spec."""
-    from vllm_ascend.core.deepseek_v41 import DeepseekV41SWASpec
+    """Return whether a leaf KV cache spec is a V4.1 private-circle SWA spec.
 
-    return isinstance(spec, DeepseekV41SWASpec)
+    Covers the target SWA plane and both DSpark draft SWA planes (BF16 and
+    the A5 quantized U8 row format): the draft layers join the
+    request-private ring when the pool is enabled, so they share the ring
+    lifecycle instead of the shared prefix-cache plane.
+    """
+    from vllm_ascend.core.deepseek_v41 import (
+        DeepseekV41A5DraftSWASpec,
+        DeepseekV41DraftSWASpec,
+        DeepseekV41SWASpec,
+    )
+
+    return isinstance(
+        spec,
+        (DeepseekV41SWASpec, DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec),
+    )
 
 
 def compute_prefix_bounded_replay_start(

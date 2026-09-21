@@ -16,6 +16,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import enable_pcp
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
+from vllm_ascend.core.private_circle_pool import is_private_circle_kv_cache_spec
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compute_num_programs
 from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 
@@ -110,6 +111,9 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._per_group_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+        # Draft groups whose SWA plane joined the request-private ring
+        # (pool enabled): gid -> ring window size for the context clamp.
+        self._private_ring_window: dict[int, int] = {}
 
     def _compute_confidence(
         self,
@@ -158,6 +162,10 @@ class AscendDSparkProposer(AscendDflashProposer):
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if is_private_circle_kv_cache_spec(layer_kv_cache_spec):
+                    self._private_ring_window[kv_cache_gid] = int(
+                        layer_kv_cache_spec.sliding_window
+                    )
                 key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
 
                 if key not in attention_groups:
@@ -223,6 +231,32 @@ class AscendDSparkProposer(AscendDflashProposer):
     ) -> None:
         self._per_group_block_tables[gid] = block_table
         self._per_group_slot_mappings[gid] = slot_mapping
+
+    def _clamp_private_context_slots_to_tail_window(
+        self, cad: CommonAttentionMetadata, batch_size: int
+    ) -> None:
+        """Keep only each request's tail-window context writes on the ring.
+
+        The draft context precompute would otherwise scatter the whole
+        context span into the ring; a span longer than the ring capacity
+        wraps onto itself and the surviving rows would depend on scatter
+        ordering. Skipping the rows below each request's tail window mirrors
+        the target model's "commit only the trailing window" discipline;
+        the skipped rows are outside the protocol-A table's exposed range
+        and are never read.
+        """
+        qsl = cad.query_start_loc[: batch_size + 1]
+        num_context = self._dflash_num_context
+        spans = qsl[1:] - qsl[:-1]
+        keeps = spans.clamp_max(max(self._private_ring_window.values()))
+        boundary = torch.repeat_interleave(
+            qsl[1:] - keeps, spans, output_size=num_context
+        )
+        head_rows = torch.arange(num_context, device=qsl.device) < boundary
+        for gid in self._private_ring_window:
+            buffer = self._per_group_context_slot_mapping_buffers.get(gid)
+            if buffer is not None:
+                buffer[:num_context].masked_fill_(head_rows, -1)
 
     def set_inputs_first_pass(
         self,
@@ -303,6 +337,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._context_slot_mapping_buffers = [
             self._per_group_context_slot_mapping_buffers[gidx] for gidx in self._layer_group_idx
         ]
+        # Clamp ring context writes to each request's tail window before the
+        # cad is rewritten to the draft's query layout below.
+        if self._private_ring_window and self._dflash_num_context > 0:
+            self._clamp_private_context_slots_to_tail_window(cad, batch_size)
 
         effective_seq_lens = cad.seq_lens
         if has_num_rejected:

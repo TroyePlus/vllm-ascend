@@ -97,10 +97,10 @@ class DeepseekV41Compressor(nn.Module):
         self.ratio = ratio
         self.width = _read(config, "head_dim")
         dim = _read(config, "hidden_size")
-        self.wkv = nn.Linear(dim, self.width, bias=False, dtype=torch.bfloat16)
+        self.wkv = nn.Linear(dim, self.width, bias=False, dtype=torch.float32 if ratio == 2 else torch.bfloat16)
         self.norm = DeepseekV41RMSNorm(self.width, _read(config, "rms_norm_eps"))
         if ratio == 2:
-            self.wgate = nn.Linear(dim, self.width, bias=False, dtype=torch.bfloat16)
+            self.wgate = nn.Linear(dim, self.width, bias=False, dtype=torch.float32)
             # Allocate persistent output before memory profiling, so its footprint
             # is included in the cache budget rather than added after allocation.
             if vllm_config is not None:

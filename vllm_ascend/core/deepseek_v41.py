@@ -257,8 +257,13 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
-            draft_bytes = sum(_cache_plane_sizes(draft_spec))
-            if not divert:
+            if divert:
+                # The draft joins the request-private ring tensors and never
+                # aliases the shared slot; ring geometry is validated by the
+                # pool's single-layout check instead.
+                pass
+            else:
+                draft_bytes = sum(_cache_plane_sizes(draft_spec))
                 swa_spec = specs[swa[slot_idx]]
                 # head_size may legally differ: on A5 the target SWA rows are
                 # mxfp8-quantized (uint8, payload + scales) while the DSpark
@@ -269,13 +274,12 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
                     or draft_spec.sliding_window != swa_spec.sliding_window
                 ):
                     raise ValueError("Aurora DSpark block geometry must match target SWA")
-            # The draft is a slot member like any other alias, and on A5 its
-            # plane (128 quantized rows) can exceed every target plane of a
-            # ratio-2 source slot. Size the slot by its largest member,
-            # draft included, instead of requiring it to fit planes that the
-            # A5 quantized layout shrank.
-            capacity = max(capacity, draft_bytes)
-            aliases.append(draft_name)
+                # The draft is a slot member like any other alias, and on A5
+                # its plane (128 quantized rows) can exceed every target plane
+                # of a ratio-2 source slot. Size the slot by its largest
+                # member, draft included.
+                capacity = max(capacity, draft_bytes)
+                aliases.append(draft_name)
         placements = [
             CachePlacement(kv_name, 0, kv_bytes),
             CachePlacement(index_name, kv_bytes, capacity - kv_bytes),
@@ -283,7 +287,7 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
         ]
         slots.append(CacheSlot(capacity, tuple(placements)))
     names = [p.name for slot in slots for p in slot.placements]
-    uncovered = set(specs) - set(names) - (set(swa) if divert else set())
+    uncovered = set(specs) - set(names) - ((set(swa) | set(draft)) if divert else set())
     if len(names) != len(set(names)) or uncovered:
         raise ValueError("V4.1 slot placement must cover each resource exactly once")
     return tuple(slots)
@@ -315,7 +319,11 @@ def group_cache_specs(specs, *, divert_swa: bool | None = None):
         )
     draft = sorted((n for n, s in specs.items() if is_v41_draft_swa_spec(s)), key=_draft_layer_number)
     if draft:
-        groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
+        # The draft leaves the shared slots under divert (it joins the
+        # request-private ring tensors), so its group must read the raw
+        # spec instead of the slot-padded one.
+        draft_source = specs if divert else padded
+        groups.append(_uniform({n: draft_source[n] for n in draft}, "dspark"))
     return groups
 
 
@@ -355,10 +363,15 @@ def pool_bytes_per_block(groups, *, divert_swa: bool | None = None):
 def request_blocks(vllm_config, groups, *, divert_swa: bool | None = None):
     # Different logical groups consume different IDs in one global block pool.
     # Diverted private-circle groups own ring allocations, not global IDs.
+    from vllm_ascend.core.private_circle_pool import is_private_circle_kv_cache_spec
+
     divert = _resolve_divert(_group_specs(groups), divert_swa)
     total = 0
     for g in groups:
-        if divert and all(isinstance(s, DeepseekV41SWASpec) for s in g.kv_cache_spec.kv_cache_specs.values()):
+        if divert and all(
+            is_private_circle_kv_cache_spec(s)
+            for s in g.kv_cache_spec.kv_cache_specs.values()
+        ):
             continue
         total += max(
             (s.max_memory_usage_bytes(vllm_config) + s.page_size_bytes - 1) // s.page_size_bytes
