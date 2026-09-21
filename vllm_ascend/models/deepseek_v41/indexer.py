@@ -268,5 +268,5 @@ class DeepseekV41Indexer(nn.Module):
                 candidate_indices = cand_indices
                 candidate_lengths = cand_lengths
 
-        # selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
-        return selected.view(-1, topk), candidate_indices, candidate_lengths
+        selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
+        return selected, candidate_indices, candidate_lengths
