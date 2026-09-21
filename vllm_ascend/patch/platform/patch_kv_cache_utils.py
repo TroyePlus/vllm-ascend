@@ -422,20 +422,44 @@ def _get_kv_cache_config_v41(
         private_specs = _iter_private_circle_specs(kv_cache_groups)
         first = private_specs[0]
         private_config = _private_circle_config_for(vllm_config, first)
-        if any(
-            (s.block_size, s.sliding_window, s.unpadded_page_size_bytes)
-            != (first.block_size, first.sliding_window, first.unpadded_page_size_bytes)
-            for s in private_specs
-        ):
-            raise RuntimeError("all V4.1 private circle layers must share one layout")
-        ring_bytes = len(private_specs) * private_config.num_blocks * first.unpadded_page_size_bytes
+        mismatched = [
+            spec
+            for spec in private_specs
+            if (spec.block_size, spec.sliding_window)
+            != (first.block_size, first.sliding_window)
+        ]
+        if mismatched:
+            spec = mismatched[0]
+            raise RuntimeError(
+                "all V4.1 private circle layers must share one ring "
+                "geometry: block_size/sliding_window mismatch — "
+                f"offending={getattr(spec, 'model_version', '?')} "
+                f"block_size={spec.block_size} "
+                f"window={spec.sliding_window} vs pool "
+                f"block_size={first.block_size} "
+                f"window={first.sliding_window}. The DSpark draft SWA "
+                "plane joins the ring, so its sliding_window and "
+                "block_size must match the target SWA spec; per-layer "
+                "page sizes may differ (each layer owns its tensor)."
+            )
+        # Each private layer owns a ring tensor of num_blocks pages sized
+        # by that layer's own plane, and the prefill workspace is cached
+        # per (dtype, shape) — heterogeneous layers (e.g. the quantized
+        # A5 draft plane vs the quantized target plane) each need their
+        # own pages.
+        ring_bytes = private_config.num_blocks * sum(
+            spec.unpadded_page_size_bytes for spec in private_specs
+        )
         workspace_blocks = compute_private_circle_prefill_workspace_blocks(
             max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             max_num_seqs=private_config.max_num_seqs,
             window_size=private_config.window_size,
             block_size=private_config.block_size,
         )
-        workspace_bytes = workspace_blocks * first.unpadded_page_size_bytes
+        distinct_page_bytes = {
+            spec.unpadded_page_size_bytes for spec in private_specs
+        }
+        workspace_bytes = workspace_blocks * sum(distinct_page_bytes)
         reserved_private_bytes = ring_bytes + workspace_bytes
         if reserved_private_bytes >= available_memory:
             raise ValueError(

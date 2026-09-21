@@ -140,6 +140,46 @@ def test_prefix_bounded_replay_start_floors_to_alignment():
     assert compute_prefix_bounded_replay_start(300, 128, alignment=64) == 192
 
 
+def test_private_circle_spec_accepts_dspark_draft_planes():
+    import torch
+
+    from vllm_ascend.core.deepseek_v41 import (
+        A5_WIN_ROW_BYTES,
+        DeepseekV41A5DraftSWASpec,
+        DeepseekV41DraftSWASpec,
+        DeepseekV41SWASpec,
+    )
+    from vllm_ascend.core.private_circle_pool import is_private_circle_kv_cache_spec
+
+    target_spec = DeepseekV41SWASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        sliding_window=128,
+    )
+    bf16_draft_spec = DeepseekV41DraftSWASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+    )
+    a5_draft_spec = DeepseekV41A5DraftSWASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=A5_WIN_ROW_BYTES,
+        dtype=torch.uint8,
+        sliding_window=128,
+    )
+    assert is_private_circle_kv_cache_spec(target_spec)
+    # Both draft SWA planes join the ring when the pool is enabled.
+    assert is_private_circle_kv_cache_spec(bf16_draft_spec)
+    assert is_private_circle_kv_cache_spec(a5_draft_spec)
+    # An unrelated spec stays on the shared plane.
+    assert not is_private_circle_kv_cache_spec(object())
+
+
 def test_compact_ring_wraps_at_absolute_block_boundary():
     config = PrivateCircleConfig(
         block_size=32, window_size=128, in_flight_tokens=5, max_num_seqs=1

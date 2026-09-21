@@ -253,7 +253,7 @@ def _patched_update_after_schedule(
                         "imported private circle does not cover the confirmed "
                         f"prefix for request {request_id}"
                     )
-                logger.info(
+                logger.debug(
                     "PRIVATE_CIRCLE_POOL import_cover request_id=%s "
                     "confirmed_length=%d imported_window=[%d, %d) "
                     "replay_cancelled=%s",
