@@ -215,6 +215,33 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         num_expert_group = self.num_expert_group if self.num_expert_group is not None else 1
         renorm = int(self.renormalize)
         if self.scoring_func == "sqrtsoftplus":
+            if self.tid2eid is None and self.bias_vl is None:
+                # Pure dynamic routing without a hash table (e.g. the V4.1
+                # DSpark draft, whose layers deliberately skip hash routing;
+                # see DeepseekV4MoE: self.hash = ... and not is_draft_layer).
+                # The native moe_gating_top_k_hash op requires input_ids and
+                # the tid2eid table, so use the reference implementation
+                # instead. Semantics match select_deepseek_v4_vision_experts:
+                # noaux_tc â€” the correction bias steers expert selection
+                # only, routing weights come from the raw scores.
+                scores = torch.nn.functional.softplus(router_logits).sqrt()
+                if self.e_score_correction_bias is not None:
+                    bias = self.e_score_correction_bias
+                    if bias.dtype != scores.dtype:
+                        bias = bias.to(scores.dtype)
+                    topk_ids = torch.topk(scores + bias.unsqueeze(0), k=self.top_k, dim=-1, sorted=True).indices
+                else:
+                    topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=True).indices
+                topk_weights = scores.gather(1, topk_ids)
+                if self.renormalize:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+                        torch.finfo(topk_weights.dtype).tiny
+                    )
+                if self.routed_scaling_factor != 1.0:
+                    topk_weights = topk_weights * self.routed_scaling_factor
+                return topk_weights.to(torch.float32), topk_ids.to(
+                    torch.int32 if indices_type is None else indices_type
+                )
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
                     raise ValueError(
