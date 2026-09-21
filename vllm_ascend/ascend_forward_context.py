@@ -99,6 +99,62 @@ def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     )
 
 
+_DRAFT_MOE_TOPOLOGY_LOGGED: set[tuple[int, int, int]] = set()
+
+
+def _resolve_draft_moe_topology(
+    vllm_config: VllmConfig,
+    is_draft_model: bool,
+) -> tuple[tuple[int, int, int] | None, bool]:
+    """Resolve the draft model's MoE topology key when it differs from the
+    target's.
+
+    The A5 MegaMoE symmetric buffer is process-wide and single-topology: it
+    is created by the target model and cannot be re-created for another
+    expert layout during inference. A draft whose MoE topology differs from
+    the target's (e.g. the DeepSeek V4.1 Aurora DSpark draft: 128 experts /
+    top-3 vs the target's 384 / top-6) therefore must (1) bypass the fused
+    A5 MegaMoE path and (2) resolve its own comm-method instances from the
+    topology-keyed registry. Drafts sharing the target's topology (e.g. the
+    DeepSeek V4 DSpark draft) keep the flat-registry fused path untouched.
+    """
+    if not is_draft_model:
+        return None, False
+    draft_model_config = getattr(getattr(vllm_config, "speculative_config", None), "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_text_config", None)
+    if draft_hf_config is None:
+        return None, False
+    draft_num_experts = getattr(draft_hf_config, "n_routed_experts", None)
+    draft_experts_per_token = getattr(draft_hf_config, "num_experts_per_tok", None)
+    target_hf_config = vllm_config.model_config.hf_text_config
+    target_num_experts = getattr(target_hf_config, "n_routed_experts", None)
+    target_experts_per_token = getattr(target_hf_config, "num_experts_per_tok", None)
+    if (
+        draft_num_experts is None
+        or draft_experts_per_token is None
+        or target_num_experts is None
+        or (draft_num_experts == target_num_experts and draft_experts_per_token == target_experts_per_token)
+    ):
+        return None, False
+
+    # Imported lazily: moe_comm_method imports MoECommType from this module.
+    from vllm_ascend.ops.fused_moe.moe_comm_method import make_moe_topology_key
+
+    topology_key = make_moe_topology_key(draft_num_experts, draft_experts_per_token, get_ep_group().world_size)
+    if topology_key not in _DRAFT_MOE_TOPOLOGY_LOGGED:
+        _DRAFT_MOE_TOPOLOGY_LOGGED.add(topology_key)
+        logger.info(
+            "Draft model MoE topology differs from the target's (num_experts=%d vs %d, "
+            "experts_per_token=%d vs %d); using topology-scoped MoE comm methods and "
+            "bypassing the fused A5 MegaMoE path for the draft forward.",
+            draft_num_experts,
+            target_num_experts,
+            draft_experts_per_token,
+            target_experts_per_token,
+        )
+    return topology_key, True
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -146,14 +202,16 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        draft_moe_topology_key, is_secondary_moe_topology = _resolve_draft_moe_topology(vllm_config, is_draft_model)
         moe_comm_type = select_moe_comm_method(
             max_num_tokens,
             vllm_config,
             model_instance=model_instance,
+            is_secondary_moe_topology=is_secondary_moe_topology,
         )
 
         forward_context.moe_comm_type = moe_comm_type
-        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type, draft_moe_topology_key)
         forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
 
@@ -354,6 +412,7 @@ def _select_a5_moe_comm_method(
     quant_type: QuantType | None,
     activation: str | None,
     group_size: int | None,
+    is_secondary_moe_topology: bool = False,
 ) -> MoECommType:
     num_experts_per_tok = getattr(
         vllm_config.model_config.hf_text_config,
@@ -372,6 +431,11 @@ def _select_a5_moe_comm_method(
     use_mega_moe = (
         ascend_config.enable_fused_mc2 == 1
         and world_size > 1
+        # The A5 MegaMoE symmetric buffer is process-wide and single-topology:
+        # it is created by the target model and cannot be re-created for a
+        # different expert layout during inference. A draft whose MoE topology
+        # differs from the target's must never take this path.
+        and not is_secondary_moe_topology
         and num_tokens <= buffer_tokens_per_rank
         and quant_type in _A5_MEGA_MOE_QUANT_TYPES
         and normalized_activation in (None, "silu", "swiglu")
@@ -382,6 +446,15 @@ def _select_a5_moe_comm_method(
     )
     if use_mega_moe:
         return MoECommType.FUSED_MC2
+    if is_secondary_moe_topology:
+        # A secondary (draft) topology must also avoid the A5 MC2 dispatch
+        # op: with W4A8MXFP comm quant it runs npu_moe_distribute_dispatch_v2
+        # with quant_mode=4, a combination only reachable for the primary
+        # topology when tokens overflow the MegaMoE symmetric buffer, and it
+        # fails the op tiling check ("Get WinSize failed", EZ1008). Fall
+        # back to the all-gather path (bf16 DP all-gather/reduce-scatter
+        # plus standard init_routing/grouped_matmul/unpermute ops).
+        return MoECommType.ALLGATHER
     if (num_tokens is None or num_tokens <= mc2_tokens_capacity) and world_size > 1:
         return MoECommType.MC2
     if world_size <= num_experts_per_tok:
@@ -394,6 +467,7 @@ _A5_MEGA_MOE_QUANT_TYPES = {
 }
 _A5_MEGA_MOE_GROUP_SIZE = 32
 _A5_MOE_QUANT_TYPES_BY_CONFIG_ID: dict[int, QuantType] = {}
+_A5_MOE_ACTIVATIONS_BY_CONFIG_ID: dict[int, str | None] = {}
 
 
 def cache_a5_moe_quant_type(
@@ -409,33 +483,65 @@ def _get_a5_moe_quant_type(
     vllm_config: VllmConfig,
     model_instance: torch.nn.Module | None,
 ) -> QuantType | None:
+    """Routed-experts quant type amortized per vllm_config.
+
+    The module scan walks the full model tree, so it must stay a one-time
+    cache-miss fallback; the per-step path is a dict lookup.
+    """
+    config_id = id(vllm_config)
+    if config_id in _A5_MOE_QUANT_TYPES_BY_CONFIG_ID:
+        return _A5_MOE_QUANT_TYPES_BY_CONFIG_ID[config_id]
+    quant_type: QuantType | None = None
     if model_instance is not None:
         modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
         for module in modules:
             if not hasattr(module, "moe_config"):
                 continue
-            quant_type = getattr(module, "quant_type", None)
-            if isinstance(quant_type, QuantType) and quant_type != QuantType.NONE:
-                return quant_type
-    return _A5_MOE_QUANT_TYPES_BY_CONFIG_ID.get(id(vllm_config))
+            module_quant_type = getattr(module, "quant_type", None)
+            if (
+                isinstance(module_quant_type, QuantType)
+                and module_quant_type != QuantType.NONE
+            ):
+                quant_type = module_quant_type
+                break
+    _A5_MOE_QUANT_TYPES_BY_CONFIG_ID[config_id] = quant_type
+    return quant_type
 
 
 def _get_a5_moe_activation(
     vllm_config: VllmConfig,
     model_instance: torch.nn.Module | None,
 ) -> str | None:
+    """MoE activation amortized per vllm_config.
+
+    No current MoE module exposes ``activation``, so the scan is a one-time
+    fallback; the per-step path is a dict lookup.
+    """
+    config_id = id(vllm_config)
+    if config_id in _A5_MOE_ACTIVATIONS_BY_CONFIG_ID:
+        return _A5_MOE_ACTIVATIONS_BY_CONFIG_ID[config_id]
+    activation: str | None = None
     if model_instance is not None:
         modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
         for module in modules:
             if not hasattr(module, "moe_config"):
                 continue
-            activation = getattr(module, "activation", None)
-            if isinstance(activation, str):
-                return activation
-            if isinstance(activation, Enum):
-                return activation.name
-    hf_text_config = vllm_config.model_config.hf_text_config
-    return getattr(hf_text_config, "hidden_act", getattr(hf_text_config, "hidden_activation", None))
+            module_activation = getattr(module, "activation", None)
+            if isinstance(module_activation, str):
+                activation = module_activation
+                break
+            if isinstance(module_activation, Enum):
+                activation = module_activation.name
+                break
+    if activation is None:
+        hf_text_config = vllm_config.model_config.hf_text_config
+        activation = getattr(
+            hf_text_config,
+            "hidden_act",
+            getattr(hf_text_config, "hidden_activation", None),
+        )
+    _A5_MOE_ACTIVATIONS_BY_CONFIG_ID[config_id] = activation
+    return activation
 
 
 def _get_a5_moe_group_size(vllm_config: VllmConfig) -> int | None:
@@ -449,6 +555,7 @@ def select_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     model_instance: torch.nn.Module | None = None,
+    is_secondary_moe_topology: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, and token count.
@@ -462,14 +569,21 @@ def select_moe_comm_method(
        all-to-all.
     5. On 310P, always use all-gather.
     6. On A5 with expert parallel, use MegaMoE for supported MXFP layouts
-       within its symmetric-buffer capacity; otherwise use MC2, all-gather,
-       or all-to-all according to the existing token and EP constraints.
+        within its symmetric-buffer capacity; otherwise use MC2, all-gather,
+        or all-to-all according to the existing token and EP constraints.
+    7. A draft whose MoE topology differs from the target's never selects
+        the fused A5 MegaMoE path: its symmetric buffer is process-wide and
+        single-topology, so it is sized for the target's experts only. It
+        also skips the A5 MC2 dispatch path, whose MXFP comm-quant tiling
+        is not validated for secondary topologies, and uses all-gather.
 
     Args:
         num_tokens (int): The number of tokens in the current batch.
         vllm_config (VllmConfig): Runtime configuration for the model.
         model_instance (torch.nn.Module | None): Model instance used to
             resolve the A5 routed-expert quantization and activation.
+        is_secondary_moe_topology (bool): Whether this forward belongs to a
+            draft whose MoE topology differs from the target's.
 
     Raises:
         ValueError: If the soc version is unsupported.
@@ -507,6 +621,7 @@ def select_moe_comm_method(
             _get_a5_moe_quant_type(vllm_config, model_instance),
             _get_a5_moe_activation(vllm_config, model_instance),
             _get_a5_moe_group_size(vllm_config),
+            is_secondary_moe_topology=is_secondary_moe_topology,
         )
     elif soc_version == AscendDeviceType._310P:
         moe_comm_type = MoECommType.ALLGATHER

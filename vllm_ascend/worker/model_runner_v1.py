@@ -140,6 +140,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.circular_buffer import is_circular_spec
 from vllm_ascend.core.deepseek_v41 import (
+    is_v41_draft_swa_spec,
     is_v41_spec,
     plan_cache_slots,
     reshape_cache,
@@ -4004,6 +4005,15 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            # Pure draft groups are rebuilt per drafting step via
+            # build_for_drafting; their target-forward metadata is never
+            # consumed, so skip the per-group builder pass. The drafter's
+            # per-group table capture above must still run.
+            group_specs = getattr(kv_cache_group.kv_cache_spec, "kv_cache_specs", None)
+            if group_specs and all(
+                is_v41_draft_swa_spec(s) for s in group_specs.values()
+            ):
+                continue
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid,

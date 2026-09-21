@@ -16,6 +16,13 @@ from vllm_ascend.device.hardware import AscendDeviceType
 
 STATE_RING_ROWS = 16
 
+A5_WIN_LOGICAL_DIM = 512
+A5_WIN_QUANT_GROUP_SIZE = 32
+A5_WIN_DATA_BYTES = A5_WIN_LOGICAL_DIM
+A5_WIN_SCALE_COUNT = A5_WIN_LOGICAL_DIM // A5_WIN_QUANT_GROUP_SIZE
+A5_WIN_SCALE_OFFSET_BYTES = A5_WIN_DATA_BYTES
+A5_WIN_ROW_BYTES = A5_WIN_DATA_BYTES + A5_WIN_SCALE_COUNT * torch.bfloat16.itemsize
+
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41FullSpec(AscendMLAAttentionSpec):
@@ -59,11 +66,46 @@ class DeepseekV41DraftSWASpec(AscendSlidingWindowMLASpec):
 
     def is_uniform_with_collection(self, specs):
         return all(
-            isinstance(s, DeepseekV41DraftSWASpec)
+            isinstance(s, (DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec))
             and s.block_size == self.block_size
             and s.sliding_window == self.sliding_window
             for s in specs.values()
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41A5DraftSWASpec(AscendSlidingWindowMLASpec):
+    """DSpark SWA in the A5 MQSMLA FP8/32 plus BF16-scale row format."""
+
+    logical_head_size: int = A5_WIN_LOGICAL_DIM
+    quant_group_size: int = A5_WIN_QUANT_GROUP_SIZE
+    scale_dtype: torch.dtype = torch.bfloat16
+    scale_offset_bytes: int = A5_WIN_SCALE_OFFSET_BYTES
+
+    def __post_init__(self):
+        if (
+            self.dtype != torch.uint8
+            or self.num_kv_heads != 1
+            or self.head_size != A5_WIN_ROW_BYTES
+            or self.logical_head_size != A5_WIN_LOGICAL_DIM
+            or self.quant_group_size != A5_WIN_QUANT_GROUP_SIZE
+            or self.scale_dtype != torch.bfloat16
+            or self.scale_offset_bytes != A5_WIN_SCALE_OFFSET_BYTES
+            or self.compress_ratio != 1
+        ):
+            raise ValueError("A5 DSpark win_kv requires one U8[544] row: FP8/32 payload plus 16 embedded BF16 scales")
+
+    def is_uniform_with_collection(self, specs):
+        return all(
+            isinstance(s, DeepseekV41A5DraftSWASpec)
+            and s.block_size == self.block_size
+            and s.sliding_window == self.sliding_window
+            for s in specs.values()
+        )
+
+
+def is_v41_draft_swa_spec(spec):
+    return isinstance(spec, (DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -87,6 +129,7 @@ def is_v41_spec(spec):
             DeepseekV41IndexerSpec,
             DeepseekV41SWASpec,
             DeepseekV41DraftSWASpec,
+            DeepseekV41A5DraftSWASpec,
             DeepseekV41CompressorStateSpec,
         ),
     )
@@ -180,7 +223,7 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
     full = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41FullSpec)), key=_layer_number)
     state = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41CompressorStateSpec)), key=_layer_number)
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
-    draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    draft = sorted((n for n, s in specs.items() if is_v41_draft_swa_spec(s)), key=_draft_layer_number)
     if draft and list(map(_draft_layer_number, draft)) != [0, 1, 2]:
         raise ValueError("Aurora DSpark requires exactly three ordered draft layers: mtp.0, mtp.1, mtp.2")
     if list(map(_layer_number, full)) != [2, 8, 14, 20]:
@@ -214,18 +257,24 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
         if slot_idx < len(draft):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
-            if divert:
-                if sum(_cache_plane_sizes(draft_spec)) > capacity:
-                    raise ValueError("Aurora DSpark draft does not fit the private-circle slot capacity")
-            else:
+            draft_bytes = sum(_cache_plane_sizes(draft_spec))
+            if not divert:
                 swa_spec = specs[swa[slot_idx]]
+                # head_size may legally differ: on A5 the target SWA rows are
+                # mxfp8-quantized (uint8, payload + scales) while the DSpark
+                # draft stays BF16. Aliased groups own distinct block IDs in
+                # the shared slot, so only block geometry must agree.
                 if (
                     draft_spec.block_size != swa_spec.block_size
-                    or draft_spec.head_size != swa_spec.head_size
                     or draft_spec.sliding_window != swa_spec.sliding_window
-                    or sum(_cache_plane_sizes(draft_spec)) > capacity
                 ):
-                    raise ValueError("Aurora DSpark geometry must match target SWA and fit its existing slot")
+                    raise ValueError("Aurora DSpark block geometry must match target SWA")
+            # The draft is a slot member like any other alias, and on A5 its
+            # plane (128 quantized rows) can exceed every target plane of a
+            # ratio-2 source slot. Size the slot by its largest member,
+            # draft included, instead of requiring it to fit planes that the
+            # A5 quantized layout shrank.
+            capacity = max(capacity, draft_bytes)
             aliases.append(draft_name)
         placements = [
             CachePlacement(kv_name, 0, kv_bytes),
@@ -254,11 +303,17 @@ def group_cache_specs(specs, *, divert_swa: bool | None = None):
     groups = [_uniform(full, "full"), _uniform(state, "state")]
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
     swa_source = specs if divert else padded
-    groups.extend(
-        _uniform({n: swa_source[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
-        for start in range(0, len(swa), len(slots))
-    )
-    draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    if divert:
+        # Diverted SWA layers share one ring allocation per request and never
+        # touch the shared slots, so the slot-aligned split below is redundant;
+        # one group keeps a single identical ring table per step.
+        groups.append(_uniform({n: swa_source[n] for n in swa}, "swa"))
+    else:
+        groups.extend(
+            _uniform({n: swa_source[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
+            for start in range(0, len(swa), len(slots))
+        )
+    draft = sorted((n for n, s in specs.items() if is_v41_draft_swa_spec(s)), key=_draft_layer_number)
     if draft:
         groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
     return groups
@@ -399,14 +454,5 @@ def validate_cache_runtime(vllm_config):
         raise NotImplementedError("V4.1 initial runtime requires PP=DCP=PCP=1")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
-    # V4.1 A5 always uses the byte-addressable quantized cache layout. Keep
-    # DSpark as an explicit BF16 exception because its draft SWA spec and
-    # kernel require BF16.
-    if get_ascend_device_type() == AscendDeviceType.A5:
-        vllm_config.cache_config.cache_dtype = "auto"
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
         raise NotImplementedError("V4.1 cache dtype selector must be auto or bfloat16")
-    if speculative is not None:
-        # Aurora's planes are always BF16. Pin the inherited DSV4 draft
-        # backend to the same layout, including on hardware where auto is FP8.
-        vllm_config.cache_config.cache_dtype = "bfloat16"

@@ -36,11 +36,17 @@ class AscendDSparkProposer(AscendDflashProposer):
     ):
         super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
-        self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        hf_config = self.draft_model_config.hf_config
+        hf_config = getattr(hf_config, "text_config", hf_config)
+        self.sample_from_anchor = getattr(hf_config, "sample_from_anchor", True)
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_tokens
         else:
             self.num_query_per_req = 1 + self.num_speculative_tokens
+
+        dspark_noise_token_id = getattr(hf_config, "dspark_noise_token_id", None)
+        if isinstance(dspark_noise_token_id, int) and dspark_noise_token_id >= 0:
+            self.parallel_drafting_token_id = dspark_noise_token_id
 
         blk = 1 + self.num_speculative_tokens
         self._dspark_draft_buffer = torch.zeros((self.max_batch_size, blk), dtype=torch.int64, device=device)
@@ -366,6 +372,12 @@ class AscendDSparkProposer(AscendDflashProposer):
         context_states = self.hidden_states[:num_input_tokens]
 
         self.token_indices_to_sample.fill_(0)
+        # ``_pad_draft_buffers`` uses this boundary when clearing every
+        # per-group context slot-mapping tail.  DP-synchronized dummy runs can
+        # reach that helper before the non-profile runnable below, including
+        # idle ranks whose local request count is zero.  Publish the current
+        # context length for both profile and non-profile paths first.
+        self._dflash_num_context = num_input_tokens
         self._pad_draft_buffers(num_query_total, num_input_tokens)
 
         with set_ascend_forward_context(
@@ -389,7 +401,6 @@ class AscendDSparkProposer(AscendDflashProposer):
                 )
 
             else:
-                self._dflash_num_context = num_input_tokens
                 self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=num_reqs,

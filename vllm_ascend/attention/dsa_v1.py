@@ -134,9 +134,13 @@ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
 
 
 def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
-    """BF16 SWA-only attention takes no compressed stream; otherwise keep main's value."""
-    if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
-        return 0
+    """Return a valid ratio even when the BF16 draft has no compressed KV.
+
+    SparseFlashMla uses ``has_cmp_kv`` to disable the compressed stream, while
+    its ``cmp_ratio`` attribute must remain in [1, 128].  Zero was accepted by
+    the old draft adapter during graph capture but is rejected by the packaged
+    operator when real decode metadata is consumed.
+    """
     return max(compress_ratio, 1)
 
 
