@@ -326,8 +326,8 @@ class NPUModelRunner(GPUModelRunner):
             getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None
         )
         is_deepseek_v41 = (
-            hf_model_type == "deepseek_v4.1"
-            or hf_text_model_type == "deepseek_v4.1_text"
+            hf_model_type == "deepseek_v41"
+            or hf_text_model_type == "deepseek_v41_text"
         )
         # The pool diverts V4.1 SWA layers only; DSV4 and other models must
         # not pay buffer inflation or eager-prefill side effects.
@@ -2806,8 +2806,8 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.hf_text_config, "model_type", None
         )
         is_deepseek_v41 = (
-            hf_model_type == "deepseek_v4.1"
-            or hf_text_model_type == "deepseek_v4.1_text"
+            hf_model_type == "deepseek_v41"
+            or hf_text_model_type == "deepseek_v41_text"
         )
         v41_eager_fallback = (
             is_deepseek_v41 and cudagraph_mode == CUDAGraphMode.NONE

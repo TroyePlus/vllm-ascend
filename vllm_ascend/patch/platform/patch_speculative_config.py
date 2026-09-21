@@ -55,10 +55,10 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     draft_hf_config = text_config if text_config is not None else hf_config
     root_model_type = getattr(hf_config, "model_type", None)
     text_model_type = getattr(draft_hf_config, "model_type", None)
-    is_v41 = root_model_type == "deepseek_v4.1" or text_model_type == "deepseek_v4.1_text"
+    is_v41 = root_model_type == "deepseek_v41" or text_model_type == "deepseek_v41_text"
     if (
         hf_config is None
-        or root_model_type not in ("deepseek_v4", "deepseek_v4.1")
+        or root_model_type not in ("deepseek_v4", "deepseek_v41")
         or getattr(draft_hf_config, "dspark_target_layer_ids", None) is None
     ):
         return
@@ -71,11 +71,11 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
         draft_hf_config.update(
             {
                 "n_routed_experts": draft_hf_config.dspark_n_routed_experts,
-                "num_experts_per_tok": draft_hf_config.dspark_n_activated_experts,
+                "num_experts_per_tok": draft_hf_config.dspark_num_experts_per_tok,
                 "n_mtp_layers": getattr(draft_hf_config, "num_nextn_predict_layers", 3),
             }
         )
-    normalized_model_type = "deepseek_v4.1" if is_v41 else root_model_type
+    normalized_model_type = "deepseek_v41" if is_v41 else root_model_type
     hf_config.update(
         {
             "architectures": [architecture],

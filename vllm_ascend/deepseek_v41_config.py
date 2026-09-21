@@ -7,10 +7,10 @@ from transformers.configuration_utils import PretrainedConfig
 
 
 class DeepseekV41TextConfig(PretrainedConfig):
-    model_type = "deepseek_v4.1_text"
+    model_type = "deepseek_v41_text"
     base_config_key = "text_config"
 
-    def __init__(self, model_type: str = "deepseek_v4.1_text", **kwargs: Any) -> None:
+    def __init__(self, model_type: str = "deepseek_v41_text", **kwargs: Any) -> None:
         for name, value in kwargs.items():
             setattr(self, name, value)
 
@@ -39,10 +39,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
 
 
 class DeepseekV41VisionConfig(PretrainedConfig):
-    model_type = "deepseek_v4.1_vision"
+    model_type = "deepseek_v41_vision"
     base_config_key = "vision_config"
 
-    def __init__(self, model_type: str = "deepseek_v4.1_vision", **kwargs: Any) -> None:
+    def __init__(self, model_type: str = "deepseek_v41_vision", **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.model_type = model_type
         for name, value in kwargs.items():
@@ -50,7 +50,7 @@ class DeepseekV41VisionConfig(PretrainedConfig):
 
 
 class DeepseekV41Config(PretrainedConfig):
-    model_type = "deepseek_v4.1"
+    model_type = "deepseek_v41"
     sub_configs = {
         "text_config": DeepseekV41TextConfig,
         "vision_config": DeepseekV41VisionConfig,
@@ -60,9 +60,11 @@ class DeepseekV41Config(PretrainedConfig):
         self,
         text_config: dict[str, Any] | DeepseekV41TextConfig | None = None,
         vision_config: dict[str, Any] | DeepseekV41VisionConfig | None = None,
+        model_type: str = "deepseek_v41",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self.model_type = model_type
         text_config = text_config or {}
         vision_config = vision_config or {}
         text_field_names = set(text_config) if isinstance(text_config, dict) else set(vars(text_config))
@@ -97,7 +99,7 @@ class DeepseekV41Config(PretrainedConfig):
             "vision_patch_size": "patch_size",
             "vision_rope_theta": "rope_theta",
             "vision_downsample_ratio": "downsample_ratio",
-            "vision_max_n_token": "max_num_tokens",
+            "vision_max_n_token": "max_image_tokens",
             "vision_min_pixels": "min_pixels",
             "vision_max_wh_ratio": "max_wh_ratio",
         }
