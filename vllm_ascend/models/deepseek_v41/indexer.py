@@ -106,15 +106,24 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        slot_mapping = (slots[:, 0]) * k_cache.shape[1] + slots[:, 1]
-        slots = slot_mapping.clamp(min=-1).to(torch.int32)
+        if slots.ndim == 1:
+            # Builder-prepared flat slots; identical to converting the [T, 2]
+            # mapping per call, computed once per cache group per step.
+            slot_mapping = slots
+        elif slots.ndim == 2:
+            slot_mapping = (slots[:, 0]) * k_cache.shape[1] + slots[:, 1]
+            slot_mapping = slot_mapping.clamp(min=-1).to(torch.int32)
+        else:
+            raise ValueError(
+                f"indexer update_keys slot mapping must be [T, 2] or [T], got ndim={slots.ndim}"
+            )
         key = key.squeeze(1)
 
         torch.ops.cann_ops_transformer.indexer_quant_cache(
             cache=k_cache,
             cache_scale=scale_cache,
             x=key,
-            slot_mapping=slots,
+            slot_mapping=slot_mapping,
             quant_mode="mxfp4"
         )
         '''print("zzx update_keys k_cache", k_cache.shape, k_cache.dtype)
@@ -148,7 +157,7 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         weights = self._output(self.weights_proj, hidden_states)
-        weights = weights.float() * self.weights_scale
+        weights = weights * self.weights_scale
 
         return self.select_projected(
             query,
@@ -211,16 +220,9 @@ class DeepseekV41Indexer(nn.Module):
         )
 
         key, key_scale = source_cache
-        key = key.contiguous()
-        key_scale = key_scale.view(*key_scale.shape[:-1], 2, 2).contiguous()
+        key_scale = key_scale.view(*key_scale.shape[:-1], 2, 2)
 
-        weights = weights.reshape(-1, self.n_heads).float().contiguous()
-
-        '''print("zzx select_projected quantized_query", quantized_query.shape, quantized_query.dtype)
-        print("zzx select_projected query_scale", query_scale.shape, query_scale.dtype)
-        print("zzx select_projected key", key.shape, key.dtype)
-        print("zzx select_projected key_scale", key_scale.shape, key_scale.dtype)
-        print("zzx select_projected weights", weights.shape, weights.dtype)'''
+        weights = weights.reshape(-1, self.n_heads).float()
 
         common = dict(
             cu_seqlens_q=source_metadata.query_start_loc,
@@ -266,5 +268,5 @@ class DeepseekV41Indexer(nn.Module):
                 candidate_indices = cand_indices
                 candidate_lengths = cand_lengths
 
-        selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
-        return selected, candidate_indices, candidate_lengths
+        # selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
+        return selected.view(-1, topk), candidate_indices, candidate_lengths

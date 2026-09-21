@@ -190,16 +190,11 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         use_a5_quantized_cache = get_ascend_device_type() == AscendDeviceType.A5
         if use_a5_quantized_cache:
             if slot_mapping.ndim == 1:
-                # The proposer's context slot buffers hold flat row indices,
-                # while the packed writer below requires [block, offset]
-                # pairs. Split with the cache tensor's own row count so the
-                # writer's recomposition (block * shape[1] + offset) is
-                # exact; -1 masks recompose to -1 and are skipped.
-                block_size = cache.kv_cache[0].shape[1]
-                block_idx = torch.div(slot_mapping, block_size, rounding_mode="floor")
-                slot_mapping = torch.stack(
-                    [block_idx, slot_mapping % block_size], dim=-1
-                ).to(torch.int32)
+                # The proposer's context slot buffers hold flat row indices and
+                # the packed writer consumes them directly. Clamping keeps the
+                # legacy round-trip semantics where every negative mask ends up
+                # as the -1 skip sentinel.
+                slot_mapping = slot_mapping.clamp(min=-1).to(torch.int32)
             # Use the A5 native packed cache writer from DeepseekV41CacheBackend.
             # The _write_attention_cache method packs BF16 values into FP8/32
             # rows with embedded BF16 group scales and scatters them into the
