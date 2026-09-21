@@ -315,6 +315,10 @@ def _prepare_private_circle_plan(
         "prefill_slots": _format_private_circle_slots(
             torch.tensor(current_dst, dtype=torch.int64, device=device), block_size
         ),
+        # Flat twin of ``prefill_slots`` for the A5 quantized writers: the
+        # per-call reconstruction of the 2D coordinates reproduces these
+        # workspace slot values exactly.
+        "prefill_slots_flat": torch.tensor(current_dst, dtype=torch.int32, device=device),
         "ws_block_table": workspace_block_table,
         "ws_seq_lens": torch.tensor(workspace_seq_lens, dtype=common.seq_lens.dtype, device=device),
         "prefill_query_start_loc": (qsl[num_decodes:] - int(qsl_values[num_decodes])).contiguous(),
@@ -388,6 +392,10 @@ class DeepseekV41Metadata(AttentionMetadata):
     is_compressor_state: bool
     cache_kind: str = "unknown"
     positions: torch.Tensor | None = None
+    # Builder-prepared 1-D flat slots (page * storage_block_size + offset,
+    # -1 for skipped rows) for the A5 quantized cache writers. ``None`` keeps
+    # the legacy [T, 2] contract and per-call 2D->1D conversion.
+    slot_mapping_flat: torch.Tensor | None = None
     cos: Any = None
     sin: Any = None
     num_actual_tokens: int = 0
@@ -618,6 +626,26 @@ def scatter_cache_v2(
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
 
 
+def _slots_for_cache_write(metadata: "DeepseekV41Metadata", cache: torch.Tensor) -> torch.Tensor:
+    """Pick the slot mapping form the A5 quantized cache writers consume.
+
+    Prefers the builder-prepared 1-D flat slots (one build per cache group per
+    step instead of one conversion per layer) and validates that the flat
+    values were produced with the target cache's page size. Falls back to the
+    legacy [T, 2] mapping, which the writers convert per call, for
+    non-quantized cache planes.
+    """
+    flat = metadata.slot_mapping_flat
+    if flat is not None:
+        if metadata.storage_block_size != cache.shape[1]:
+            raise ValueError(
+                "V4.1 flat slot mapping was built for a different page size: "
+                f"{metadata.storage_block_size} != {cache.shape[1]}"
+            )
+        return flat
+    return metadata.slot_mapping
+
+
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
     if indices.ndim != 2:
@@ -822,8 +850,14 @@ class DeepseekV41EagerAttentionImpl:
                 # rows = self._native_pack_rows(values, kind)
                 # self._scatter_rows(cache, slot_mapping, rows)
                 # 融合算子实现
-                slot = (slot_mapping[:, 0]) * cache.shape[1] + slot_mapping[:, 1]
-                slot_mapping = slot.clamp(min=-1).to(torch.int32)
+                if slot_mapping.ndim == 2:
+                    slot = (slot_mapping[:, 0]) * cache.shape[1] + slot_mapping[:, 1]
+                    slot_mapping = slot.clamp(min=-1).to(torch.int32)
+                elif slot_mapping.ndim != 1:
+                    raise ValueError(
+                        f"A5 cache-writer slot mapping must be [T, 2] or [T], got ndim={slot_mapping.ndim}"
+                    )
+                # 1-D builder-prepared flat slots are consumed as-is.
                 if kind == "cmp":
                     group_size, quant_mode = (16, "mxfp4_bf16",)
                 elif kind == "win":
@@ -866,7 +900,11 @@ class DeepseekV41EagerAttentionImpl:
         plan = getattr(swa_metadata, "private_circle_plan", None)
         if plan is None:
             self._write_attention_cache(
-                cache, swa_metadata.slot_mapping, kv, kind="win", backend="native"
+                cache,
+                _slots_for_cache_write(swa_metadata, cache),
+                kv,
+                kind="win",
+                backend="native",
             )
             return
         workspace = self._get_private_circle_workspace(plan, cache)
@@ -882,7 +920,7 @@ class DeepseekV41EagerAttentionImpl:
         if num_decode_tokens:
             self._write_attention_cache(
                 cache,
-                swa_metadata.slot_mapping[:num_decode_tokens],
+                _slots_for_cache_write(swa_metadata, cache)[:num_decode_tokens],
                 kv[:num_decode_tokens],
                 kind="win",
                 backend="native",
@@ -890,7 +928,7 @@ class DeepseekV41EagerAttentionImpl:
         if kv.shape[0] > num_decode_tokens:
             self._write_attention_cache(
                 workspace,
-                swa_metadata.slot_mapping[num_decode_tokens:],
+                _slots_for_cache_write(swa_metadata, workspace)[num_decode_tokens:],
                 kv[num_decode_tokens:],
                 kind="win",
                 backend="native",
@@ -990,8 +1028,16 @@ class DeepseekV41EagerAttentionImpl:
         compressor = attn.compressor
         if compressor is None or metadata.compressor is None or metadata.indexer is None:
             raise RuntimeError("V4.1 KV source is missing compressor or source metadata")
+        if attn.indexer is None:
+            raise RuntimeError("V4.1 KV source is missing its indexer")
         compressor_metadata = metadata.compressor
         indexer_metadata = metadata.indexer
+        # A5 quantized writers take the builder-prepared flat slots; other
+        # planes keep the [T, 2] mapping. Both forms carry identical values.
+        indexer_k_cache = attn.indexer.k_cache.kv_cache[0][0]
+        long_kv_cache = attn.long_kv_cache.kv_cache[0]
+        index_slots = _slots_for_cache_write(indexer_metadata.cache, indexer_k_cache)[: positions.shape[0]]
+        long_slots = _slots_for_cache_write(compressor_metadata.cache, long_kv_cache)[: positions.shape[0]]
         ratio = self.role.compress_ratio
         if ratio == 1:
             latent = compressor(hidden_states)
@@ -1000,8 +1046,6 @@ class DeepseekV41EagerAttentionImpl:
             # indexing the global table a second time.
             source_cos = cos
             source_sin = sin
-            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
-            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
         else:
             if compressor_metadata.state is None:
                 raise RuntimeError("V4.1 ratio-2 source is missing compressor-state metadata")
@@ -1018,11 +1062,7 @@ class DeepseekV41EagerAttentionImpl:
                 source_sin = fallback_sin[attn.rotary_emb.layername]
             source_cos = source_cos[: positions.shape[0]]
             source_sin = source_sin[: positions.shape[0]]
-            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
-            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
 
-        if attn.indexer is None:
-            raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
             latent,
             index_slots,
@@ -1037,7 +1077,7 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        if attn.long_kv_cache.kv_cache[0].dtype == torch.uint8:
+        if long_kv_cache.dtype == torch.uint8:
             # A5 quantized path: the epilog op packs mxfp4 rows into the
             # flat uint8 view and expects the RoPE dims first.
             try:
@@ -1047,16 +1087,16 @@ class DeepseekV41EagerAttentionImpl:
                     "DeepSeek V4.1 compressed-KV store requires the custom_ops module "
                     "registering torch.ops.custom.kv_compress_epilog_v2."
                 ) from exc
-            cache_4d = attn.long_kv_cache.kv_cache[0]
-            self._write_attention_cache(cache_4d,
+            self._write_attention_cache(
+                long_kv_cache,
                 long_slots,
                 latent.squeeze(1),
                 kind="cmp",
-                backend="native"
+                backend="native",
             )
         else:
             scatter_cache_v2(
-                attn.long_kv_cache.kv_cache[0],
+                long_kv_cache,
                 long_slots,
                 latent.squeeze(1),
             )
@@ -1591,6 +1631,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
+        self._slot_mapping_flat = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
         self._block_table: torch.Tensor | None = None
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._start_pos = torch.zeros(max_reqs, dtype=torch.int32, device=device)
@@ -1859,6 +1900,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
         if is_compressor_state:
+            slot_mapping_flat = None
             if self._supports_device_ops:
                 self._slot_mapping[:num_input_tokens].copy_(raw_slots[:num_input_tokens])
                 slots = self._slot_mapping[:num_input_tokens]
@@ -1873,7 +1915,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             mapping_scope = "swa" if cache_kind == "swa" else "compressed"
             slot_key = f"slot:{mapping_scope}:c{ratio}:b{spec.storage_block_size}"
             prepared_slots = shared.get(slot_key)
-            if prepared_slots is None:
+            # A5 quantized writers consume 1-D flat slots. Preparing the flat
+            # twin here lets every layer skip its per-call 2D->1D conversion;
+            # non-quantized planes keep the [T, 2] contract unchanged.
+            needs_flat = spec.dtype == torch.uint8
+            flat_key = f"{slot_key}:flat"
+            prepared_flat = shared.get(flat_key) if needs_flat else None
+            if prepared_slots is None or (needs_flat and prepared_flat is None):
                 active_slots = raw_slots[:num_input_tokens]
                 valid = active_slots >= 0
                 if compressed and ratio == 2:
@@ -1887,27 +1935,36 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                         if common.positions is not None:
                             valid &= common.positions[:num_input_tokens].remainder(2) == 1
                 physical = active_slots.clamp_min(0)
-                self._slot_mapping_2d[:num_input_tokens, 0].copy_(
-                    torch.where(
-                        valid,
-                        torch.div(
-                            physical,
-                            spec.storage_block_size,
-                            rounding_mode="floor",
-                        ),
-                        -1,
+                if prepared_slots is None:
+                    self._slot_mapping_2d[:num_input_tokens, 0].copy_(
+                        torch.where(
+                            valid,
+                            torch.div(
+                                physical,
+                                spec.storage_block_size,
+                                rounding_mode="floor",
+                            ),
+                            -1,
+                        )
                     )
-                )
-                self._slot_mapping_2d[:num_input_tokens, 1].copy_(
-                    torch.where(
-                        valid,
-                        physical.remainder(spec.storage_block_size),
-                        -1,
+                    self._slot_mapping_2d[:num_input_tokens, 1].copy_(
+                        torch.where(
+                            valid,
+                            physical.remainder(spec.storage_block_size),
+                            -1,
+                        )
                     )
-                )
-                prepared_slots = self._slot_mapping_2d[:num_input_tokens]
-                shared[slot_key] = prepared_slots
+                    prepared_slots = self._slot_mapping_2d[:num_input_tokens]
+                    shared[slot_key] = prepared_slots
+                if needs_flat and prepared_flat is None:
+                    # ``where(valid, physical, -1)`` is bitwise equal to the
+                    # per-call reconstruction ``page * bs + offset`` clamped
+                    # to -1 that the quantized writers used to run per layer.
+                    self._slot_mapping_flat[:num_input_tokens].copy_(torch.where(valid, physical, -1).to(torch.int32))
+                    prepared_flat = self._slot_mapping_flat[:num_input_tokens]
+                    shared[flat_key] = prepared_flat
             slots = prepared_slots
+            slot_mapping_flat = prepared_flat
         coordinates = _cache_coordinates(common, ratio, compressed)
         self._seq_lens[:num_reqs].copy_(coordinates["seq_lens"])
         if num_actual_reqs < num_reqs:
@@ -2030,6 +2087,23 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 )
                 self._private_circle_slots_2d[prefill_end:].fill_(-1)
                 slots = self._private_circle_slots_2d[:num_input_tokens]
+                if spec.dtype == torch.uint8:
+                    # Flat twin of the ring/workspace mapping for the A5
+                    # quantized writers: decode rows keep their ring slots,
+                    # prefill rows take the plan's flat workspace slots, and
+                    # padding stays -1 exactly like the 2D mapping.
+                    self._private_circle_slots_flat = torch.empty(
+                        num_input_tokens, dtype=torch.int32, device=self.device
+                    )
+                    if num_decode_tokens:
+                        self._private_circle_slots_flat[:num_decode_tokens].copy_(
+                            common.slot_mapping[:num_decode_tokens].clamp(min=-1).to(torch.int32)
+                        )
+                    self._private_circle_slots_flat[num_decode_tokens:prefill_end].copy_(
+                        private_circle_plan["prefill_slots_flat"]
+                    )
+                    self._private_circle_slots_flat[prefill_end:].fill_(-1)
+                    slot_mapping_flat = self._private_circle_slots_flat[:num_input_tokens]
 # TODO kezong
         # if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
         #     has_compressed = operator_ratio in (1, 2)
@@ -2230,6 +2304,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         return DeepseekV41Metadata(
             block_table=block_table,
             slot_mapping=slots,
+            slot_mapping_flat=slot_mapping_flat,
             compress_ratio=ratio,
             storage_block_size=spec.storage_block_size,
             is_compressor_state=is_compressor_state,
