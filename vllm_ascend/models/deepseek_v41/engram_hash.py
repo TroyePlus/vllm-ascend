@@ -260,7 +260,7 @@ class NgramHashState(nn.Module):
         self.max_ngram_size = layout.max_ngram_size
         self.lookback_depth = layout.max_ngram_size - 1
         self.required_num_embeddings = tuple(sum(size for ngram in layer for size in ngram) for layer in layout.primes)
-        self.pad_id = token_map[config.engram_pad_id]
+        self.pad_id = token_map[config.engram_pad_token_id]
         self.image_token_id = config.image_token_id
         self.image_pad_token_id = getattr(
             config,
