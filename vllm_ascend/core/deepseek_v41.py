@@ -258,10 +258,7 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
             draft_name = draft[slot_idx]
             draft_spec = specs[draft_name]
             draft_bytes = sum(_cache_plane_sizes(draft_spec))
-            if divert:
-                if draft_bytes > capacity:
-                    raise ValueError("Aurora DSpark draft does not fit the private-circle slot capacity")
-            else:
+            if not divert:
                 swa_spec = specs[swa[slot_idx]]
                 # head_size may legally differ: on A5 the target SWA rows are
                 # mxfp8-quantized (uint8, payload + scales) while the DSpark
@@ -273,8 +270,8 @@ def plan_cache_slots(specs, *, divert_swa: bool | None = None):
                 ):
                     raise ValueError("Aurora DSpark block geometry must match target SWA")
             # The draft is a slot member like any other alias, and on A5 its
-            # BF16 plane (validate_cache_runtime pins it) can exceed every
-            # quantized target plane. Size the slot by its largest member,
+            # plane (128 quantized rows) can exceed every target plane of a
+            # ratio-2 source slot. Size the slot by its largest member,
             # draft included, instead of requiring it to fit planes that the
             # A5 quantized layout shrank.
             capacity = max(capacity, draft_bytes)

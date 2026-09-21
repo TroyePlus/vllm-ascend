@@ -189,6 +189,17 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         values = shared_kv.squeeze(1)
         use_a5_quantized_cache = get_ascend_device_type() == AscendDeviceType.A5
         if use_a5_quantized_cache:
+            if slot_mapping.ndim == 1:
+                # The proposer's context slot buffers hold flat row indices,
+                # while the packed writer below requires [block, offset]
+                # pairs. Split with the cache tensor's own row count so the
+                # writer's recomposition (block * shape[1] + offset) is
+                # exact; -1 masks recompose to -1 and are skipped.
+                block_size = cache.kv_cache[0].shape[1]
+                block_idx = torch.div(slot_mapping, block_size, rounding_mode="floor")
+                slot_mapping = torch.stack(
+                    [block_idx, slot_mapping % block_size], dim=-1
+                ).to(torch.int32)
             # Use the A5 native packed cache writer from DeepseekV41CacheBackend.
             # The _write_attention_cache method packs BF16 values into FP8/32
             # rows with embedded BF16 group scales and scatters them into the
@@ -206,7 +217,9 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
             from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
             plan = get_dsa_attn_kv_plan(self.vllm_config)
             if slot_mapping.ndim == 1:
-                slot_mapping = plan.format_dsa_slot_mapping(slot_mapping, cache.block_size)
+                slot_mapping = plan.format_dsa_slot_mapping(
+                    slot_mapping, cache.block_size
+                )
             plan.dsa_kv_compress_scatter(cache.kv_cache[0], values, slot_mapping)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
