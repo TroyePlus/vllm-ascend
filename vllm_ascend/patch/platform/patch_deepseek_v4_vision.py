@@ -59,9 +59,9 @@ def register_deepseek_v4_vision_config_convertor() -> None:
     ):
         """Route V4.1 vision checkpoints to their multimodal wrapper."""
 
-        architecture = "DeepseekV41ForConditionalGeneration"
+        architecture = "DeepseekV41ForCausalLM"
         mm_prefix_span_leading_pad_modulus = 2
 
     MODEL_ARCH_CONFIG_CONVERTORS["deepseek_v4"] = AscendDeepseekV4ModelArchConfigConvertor
-    MODEL_ARCH_CONFIG_CONVERTORS["deepseek_v4.1"] = AscendDeepseekV41ModelArchConfigConvertor
+    MODEL_ARCH_CONFIG_CONVERTORS["deepseek_v41"] = AscendDeepseekV41ModelArchConfigConvertor
     _REGISTERED = True
