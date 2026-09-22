@@ -79,6 +79,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_FXRT_BACKEND": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_FXRT_BACKEND", "0"))
     ),
+    # Expose only DeepSeek V4.1 DSA on direct-FXRT prefill graphs. Decode,
+    # eager, and MoE retain their original custom-op boundaries.
+    # Valid values: 0 (default) or 1. Not sensitive.
+    "VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA", "0"))
+    ),
     # Whether to enable the experimental DeepSeek-V4 private circle pool.
     # Valid values: 0 (default, original pool/prefix-cache flow) or 1
     # (compact private pool plus prefix-hit bounded replay by configured SWA window).

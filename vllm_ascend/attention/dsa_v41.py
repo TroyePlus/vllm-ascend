@@ -981,6 +981,8 @@ class DeepseekV41EagerAttentionImpl:
         cos,
         sin,
         metadata,
+        *,
+        fxrt_decomposed: bool = False,
     ):
         compressor = attn.compressor
         if compressor is None or metadata.compressor is None or metadata.indexer is None:
@@ -1003,7 +1005,12 @@ class DeepseekV41EagerAttentionImpl:
             state_metadata = compressor_metadata.state
             if state_metadata.c2_ring_metadata is None or state_metadata.c2_metadata_group_id is None:
                 raise RuntimeError("V4.1 ring compressor metadata is missing")
-            wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
+            if fxrt_decomposed:
+                from vllm_ascend.ops.dsv41_prefill import wait_metadata
+
+                wait_metadata(int(DeviceMetadataStage.COMPRESSOR), state_metadata.c2_metadata_group_id)
+            else:
+                wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
             latent = compressor.pool_projected(hidden_states, state_metadata)
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
@@ -1388,7 +1395,7 @@ class DeepseekV41EagerAttentionImpl:
         attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
         return projected
 
-    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None):
+    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None, *, fxrt_decomposed=False):
         if output is None:
             output = torch.empty_like(hidden_states)
         forward_context = get_forward_context()
@@ -1399,8 +1406,38 @@ class DeepseekV41EagerAttentionImpl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         v1_impl = attn.dsa_attn.dsa_attn.impl
-        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
-        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
+        if fxrt_decomposed and v1_impl.multistream_dsv4_dsa_overlap:
+            from vllm_ascend.ops.dsv41_prefill import (
+                prolog_q_a,
+                prolog_q_b,
+                prolog_q_norm,
+            )
+
+            q_a, kv_quant, kv_scale = prolog_q_a(
+                hidden_states, attn.v41_layer_name
+            )
+            qr, q_b_quant, q_b_scale, kv = prolog_q_norm(
+                hidden_states,
+                q_a,
+                kv_quant,
+                kv_scale,
+                attn.v41_layer_name,
+            )
+            cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            q = prolog_q_b(
+                hidden_states,
+                qr,
+                q_b_quant,
+                q_b_scale,
+                kv,
+                cos,
+                sin,
+                [cache],
+                attn.v41_layer_name,
+            )
+        else:
+            preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
+            q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
         if self.role.is_kv_source:
             self._write_compressed_source(
                 attn,
@@ -1409,6 +1446,7 @@ class DeepseekV41EagerAttentionImpl:
                 cos,
                 sin,
                 metadata,
+                fxrt_decomposed=fxrt_decomposed,
             )
         compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
         attention_output = self._attention(attn, q, metadata, compressed_indices)
