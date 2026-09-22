@@ -130,6 +130,51 @@ def _fxrt_wait_stream_fake(
 
 
 @torch.library.custom_op(
+    "vllm_ascend::fxrt_dsa_v41_stage_begin", mutates_args=()
+)
+def fxrt_dsa_v41_stage_begin(main_event_index: int, aux_stream_index: int) -> None:
+    """Start a V4.1 DSA overlap stage using graph-safe integer handles."""
+    event = _npu_events[main_event_index]
+    event.record(torch.npu.current_stream())
+    _stream_from_index(aux_stream_index).wait_event(event)
+
+
+@fxrt_dsa_v41_stage_begin.register_fake
+def _fxrt_dsa_v41_stage_begin_fake(
+    main_event_index: int, aux_stream_index: int
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "vllm_ascend::fxrt_dsa_v41_stage_ready", mutates_args=()
+)
+def fxrt_dsa_v41_stage_ready(aux_event_index: int, aux_stream_index: int) -> None:
+    """Publish completion of work scheduled on the V4.1 auxiliary stream."""
+    _npu_events[aux_event_index].record(_stream_from_index(aux_stream_index))
+
+
+@fxrt_dsa_v41_stage_ready.register_fake
+def _fxrt_dsa_v41_stage_ready_fake(
+    aux_event_index: int, aux_stream_index: int
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "vllm_ascend::fxrt_dsa_v41_stage_join", mutates_args=()
+)
+def fxrt_dsa_v41_stage_join(aux_event_index: int) -> None:
+    """Make auxiliary-stream DSA work visible to the calling stream."""
+    torch.npu.current_stream().wait_event(_npu_events[aux_event_index])
+
+
+@fxrt_dsa_v41_stage_join.register_fake
+def _fxrt_dsa_v41_stage_join_fake(aux_event_index: int) -> None:
+    return None
+
+
+@torch.library.custom_op(
     "vllm_ascend::fxrt_wait_for_kv_layer", mutates_args=()
 )
 def fxrt_wait_for_kv_layer(layer_name: str) -> None:

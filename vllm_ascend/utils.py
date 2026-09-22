@@ -75,6 +75,7 @@ _MIN_DP_BUFFER_SIZE = 50
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
 _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE: bool | None = None
 _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE: bool | None = None
+_FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE: bool | None = None
 _FXRT_DUMMY_QUANT_ACTIVE = False
 
 
@@ -91,7 +92,8 @@ def configure_fxrt_prefill_decompose(vllm_config: VllmConfig) -> bool:
     implementation; Decode and combined P/D engines must retain the opaque
     custom operators used by ACL graph capture.
     """
-    global _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE, _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE, _FXRT_DUMMY_QUANT_ACTIVE
+    global _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE, _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE
+    global _FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE, _FXRT_DUMMY_QUANT_ACTIVE
 
     _FXRT_DUMMY_QUANT_ACTIVE = (
         envs_ascend.VLLM_ASCEND_FXRT_DUMMY_QUANT
@@ -100,6 +102,7 @@ def configure_fxrt_prefill_decompose(vllm_config: VllmConfig) -> bool:
 
     requested = envs_ascend.VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_DSA
     moe_requested = envs_ascend.VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_MOE
+    v41_requested = envs_ascend.VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA
     kv_config = vllm_config.kv_transfer_config
     is_prefill_only = kv_config is None or (
         kv_config.is_kv_producer and not kv_config.is_kv_consumer
@@ -118,6 +121,16 @@ def configure_fxrt_prefill_decompose(vllm_config: VllmConfig) -> bool:
     allowed = is_prefill_only and is_direct_fx_mode and has_no_cudagraph
     _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE = requested and allowed
     _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE = moe_requested and allowed
+    # V4.1 is deliberately stricter than the legacy V4 fallback: an absent
+    # KV-transfer role can describe colocated execution, so require an
+    # explicit producer-only P engine before replacing its opaque DSA op.
+    is_v41_prefill_only = kv_config is not None and (
+        kv_config.is_kv_producer and not kv_config.is_kv_consumer
+    )
+    _FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE = (
+        v41_requested and is_v41_prefill_only and is_direct_fx_mode and has_no_cudagraph
+    )
+    v41_active = _FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE
     if requested and not _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE:
         logger.info(
             "Ignoring VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_DSA because this "
@@ -128,11 +141,17 @@ def configure_fxrt_prefill_decompose(vllm_config: VllmConfig) -> bool:
             "Ignoring VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_MOE because this "
             "engine is not a prefill-only direct-FX process"
         )
+    if v41_requested and not v41_active:
+        logger.info(
+            "Ignoring VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA because this "
+            "engine is not a V4.1 prefill-only direct-FX process"
+        )
     # Emit the resolved paths once per model-runner initialization, outside
     # forward/Dynamo tracing. Requested=1 can still resolve to opaque ops.
     logger.info(
         "[DSV4_PREFILL_PATH] DSA(requested=%d active=%d path=%s) | "
         "MOE(requested=%d active=%d path=%s) | "
+        "DSV41_DSA(requested=%d active=%d path=%s) | "
         "(prefill_only=%s direct_fx=%s no_acl_graph=%s)",
         requested,
         _FXRT_DSA_PREFILL_DECOMPOSE_ACTIVE,
@@ -140,6 +159,9 @@ def configure_fxrt_prefill_decompose(vllm_config: VllmConfig) -> bool:
         moe_requested,
         _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE,
         "decomposed" if _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE else "vllm::moe_forward_shared",
+        v41_requested,
+        v41_active,
+        "decomposed" if v41_active else "vllm::dsa_v41_forward",
         is_prefill_only,
         is_direct_fx_mode,
         has_no_cudagraph,
@@ -164,6 +186,13 @@ def fxrt_moe_prefill_decompose_enabled() -> bool:
     if _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE is not None:
         return _FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE
     return envs_ascend.VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_MOE
+
+
+def fxrt_dsv41_prefill_decompose_enabled() -> bool:
+    """Whether a V4.1 prefill worker may expose DSA to direct FX."""
+    if _FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE is not None:
+        return _FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE
+    return envs_ascend.VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA
 
 
 _IS_MOE_MODEL = None

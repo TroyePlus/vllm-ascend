@@ -38,6 +38,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_DSA": lambda: os.getenv(
         "VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_DSA", "0"
     ) == "1",
+    # Expose DeepSeek V4.1 prefill DSA to direct FX tracing. This is
+    # separate from the V4 switch because V4.1 owns a different cache,
+    # indexer, and sparse-attention implementation.
+    "VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA": lambda: os.getenv(
+        "VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA", "0"
+    ) == "1",
     # Expose DSV4 prefill MoE to direct FX tracing, independently of DSA.
     # Disabled by default; only the exact value "1" enables it. Not sensitive.
     "VLLM_ASCEND_FXRT_DECOMPOSE_DSV4_PREFILL_MOE": lambda: os.getenv(
@@ -94,7 +100,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Valid values: 0 (default, original pool/prefix-cache flow) or 1
     # (compact private pool plus prefix-hit bounded replay by configured SWA window).
     # Non-sensitive; read on scheduler/runner initialization and hot paths.
-    "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "1"))),
     "VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL", "0"))
     ),

@@ -30,6 +30,13 @@ from vllm.v1.attention.backend import (
 )
 
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
+from vllm_ascend.ops.fxrt_side_effects import (
+    fxrt_dsa_v41_stage_begin,
+    fxrt_dsa_v41_stage_join,
+    fxrt_dsa_v41_stage_ready,
+    get_fxrt_event_index,
+    get_npu_stream_index,
+)
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41A5DraftSWASpec,
     DeepseekV41CompressorStateSpec,
@@ -672,6 +679,8 @@ class DeepseekV41EagerAttentionImpl:
         self.compressor_state_prefix = (
             f"{prefix}.compressor.state_cache" if role.is_kv_source and role.compress_ratio == 2 else None
         )
+        self._fxrt_main_event_index = get_fxrt_event_index(f"{self.layer_name}.v41.main")
+        self._fxrt_aux_event_index = get_fxrt_event_index(f"{self.layer_name}.v41.aux")
 
     def _get_layer_metadata(self, metadata) -> DeepseekV41LayerMetadata:
         try:
@@ -946,7 +955,9 @@ class DeepseekV41EagerAttentionImpl:
         self._scatter_swa_kv(attn, kv, swa_metadata)
         return q, qr
 
-    def multistream_preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
+    def multistream_preprocess(
+        self, attn, hidden_states, cos, sin, swa_metadata, *, graph_safe: bool = False
+    ):
         """Overlap Q Vector work with KV Cube work, then reverse their roles.
 
         Reuse V1's stream and projection wrappers. V4.1 keeps floating-point
@@ -955,6 +966,23 @@ class DeepseekV41EagerAttentionImpl:
         """
         main_stream = torch.npu.current_stream()
         aux_stream = dsv4_dsa_overlap_stream()
+        aux_stream_index = get_npu_stream_index(aux_stream)
+
+        def stage_begin() -> None:
+            if graph_safe:
+                fxrt_dsa_v41_stage_begin(
+                    self._fxrt_main_event_index, aux_stream_index
+                )
+
+        def stage_ready() -> None:
+            if graph_safe:
+                fxrt_dsa_v41_stage_ready(
+                    self._fxrt_aux_event_index, aux_stream_index
+                )
+
+        def stage_join() -> None:
+            if graph_safe:
+                fxrt_dsa_v41_stage_join(self._fxrt_aux_event_index)
         v1_impl = attn.dsa_attn.dsa_attn.impl
         wq_a, wkv, wq_b = v1_impl.cv_wq_a, v1_impl.cv_wkv, v1_impl.cv_wq_b
         share_quant = (
@@ -967,29 +995,42 @@ class DeepseekV41EagerAttentionImpl:
         if share_quant:
             kv_quant, kv_scale = q_quant, q_scale
         else:
-            q_quant_done = main_stream.record_event()
+            q_quant_done = None if graph_safe else main_stream.record_event()
+            stage_begin()
             with npu_stream_switch(aux_stream, enabled=True):
-                aux_stream.wait_event(q_quant_done)
+                if q_quant_done is not None:
+                    aux_stream.wait_event(q_quant_done)
                 kv_quant, kv_scale = wkv.quantize(hidden_states)
-                kv_quant_done = aux_stream.record_event()
+                kv_quant_done = None if graph_safe else aux_stream.record_event()
+                stage_ready()
         q_a = wq_a.matmul(q_quant, q_scale, bias=attn.wq_a.bias)
 
         # Part 2: Q normalization/quantization (Vector) overlaps KV matmul (Cube).
-        part2_start = main_stream.record_event()
+        part2_start = None if graph_safe else main_stream.record_event()
         if kv_quant_done is not None:
             main_stream.wait_event(kv_quant_done)
+        elif graph_safe and not share_quant:
+            stage_join()
+        stage_begin()
         with npu_stream_switch(aux_stream, enabled=True):
-            aux_stream.wait_event(part2_start)
+            if part2_start is not None:
+                aux_stream.wait_event(part2_start)
             kv = wkv.matmul(kv_quant, kv_scale, bias=attn.wkv.bias)
-            kv_matmul_done = aux_stream.record_event()
+            kv_matmul_done = None if graph_safe else aux_stream.record_event()
+            stage_ready()
         qr = attn.q_norm(q_a)
         q_b_quant, q_b_scale = wq_b.quantize(qr)
 
         # Part 3: Q_b matmul (Cube) overlaps KV norm, RoPE and cache store (Vector).
-        part3_start = main_stream.record_event()
-        main_stream.wait_event(kv_matmul_done)
+        part3_start = None if graph_safe else main_stream.record_event()
+        if kv_matmul_done is not None:
+            main_stream.wait_event(kv_matmul_done)
+        elif graph_safe:
+            stage_join()
+        stage_begin()
         with npu_stream_switch(aux_stream, enabled=True):
-            aux_stream.wait_event(part3_start)
+            if part3_start is not None:
+                aux_stream.wait_event(part3_start)
             kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 kv.unsqueeze(1),
@@ -1001,7 +1042,11 @@ class DeepseekV41EagerAttentionImpl:
             self._scatter_swa_kv(attn, kv.squeeze(1), swa_metadata)
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias)
         q = self._reshape_query_heads(q, attn.head_dim)
-        main_stream.wait_stream(aux_stream)
+        if graph_safe:
+            stage_ready()
+            stage_join()
+        else:
+            main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
             cos,
@@ -1584,7 +1629,15 @@ class DeepseekV41EagerAttentionImpl:
         attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
         return projected
 
-    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None):
+    def forward(
+        self,
+        attn,
+        positions,
+        hidden_states,
+        output: torch.Tensor | None = None,
+        *,
+        fxrt_decomposed: bool = False,
+    ):
         if output is None:
             output = torch.empty_like(hidden_states)
         forward_context = get_forward_context()
@@ -1595,8 +1648,18 @@ class DeepseekV41EagerAttentionImpl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         v1_impl = attn.dsa_attn.dsa_attn.impl
-        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
-        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
+        # Stream handles and events are runtime objects, not valid fullgraph
+        # inputs. The direct-FX prefill path keeps identical tensor operators
+        # and ordering on the current stream; the opaque path retains the
+        # production overlap implementation.
+        if fxrt_decomposed and v1_impl.multistream_dsv4_dsa_overlap:
+            q, qr = self.multistream_preprocess(
+                attn, hidden_states, cos, sin, metadata.swa, graph_safe=True
+            )
+        elif v1_impl.multistream_dsv4_dsa_overlap:
+            q, qr = self.multistream_preprocess(attn, hidden_states, cos, sin, metadata.swa)
+        else:
+            q, qr = self.preprocess(attn, hidden_states, cos, sin, metadata.swa)
         if self.role.is_kv_source:
             self._write_compressed_source(
                 attn,

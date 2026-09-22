@@ -31,6 +31,7 @@ from vllm_ascend.core.deepseek_v41 import (
 )
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.utils import fxrt_dsv41_prefill_decompose_enabled
 from vllm_ascend.models.deepseek_v4.model import (
     AscendDeepseekV4ForCausalLM,
     AscendDeepseekV4SWACache,
@@ -383,6 +384,7 @@ class DeepseekV41Attention(DeepseekV4Attention):
             index_k_source_prefix=self.index_k_source_prefix,
         )
         self.v41_layer_name = f"{prefix}.v41_attn"
+        self._fxrt_prefill_decompose = fxrt_dsv41_prefill_decompose_enabled()
         context = vllm_config.compilation_config.static_forward_context
         if self.v41_layer_name in context:
             raise ValueError(f"Duplicate V4.1 attention layer: {self.v41_layer_name}")
@@ -390,7 +392,16 @@ class DeepseekV41Attention(DeepseekV4Attention):
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         output = torch.empty_like(hidden_states)
-        torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
+        if self._fxrt_prefill_decompose:
+            self.v41_impl.forward(
+                self,
+                None,
+                hidden_states,
+                output,
+                fxrt_decomposed=True,
+            )
+        else:
+            torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
         return output
 
 

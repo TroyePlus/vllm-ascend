@@ -520,6 +520,37 @@ def test_configure_fxrt_prefill_decompose_rejects_acl_decode(monkeypatch):
         utils._FXRT_MOE_PREFILL_DECOMPOSE_ACTIVE = None
 
 
+@pytest.mark.parametrize(
+    ("is_producer", "is_consumer", "mode", "cudagraph_mode", "expected"),
+    [
+        (True, False, 1, 0, True),
+        (False, True, 1, 0, False),
+        (True, True, 1, 0, False),
+        (True, False, 3, "FULL_DECODE_ONLY", False),
+    ],
+)
+def test_configure_fxrt_dsv41_prefill_decompose_by_engine_role(
+    monkeypatch, is_producer, is_consumer, mode, cudagraph_mode, expected
+):
+    monkeypatch.setenv("VLLM_ASCEND_FXRT_DECOMPOSE_DSV41_PREFILL_DSA", "1")
+    monkeypatch.setattr(utils, "_FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE", None)
+    config = mock.MagicMock(
+        kv_transfer_config=mock.MagicMock(
+            is_kv_producer=is_producer,
+            is_kv_consumer=is_consumer,
+        ),
+        compilation_config=mock.MagicMock(
+            mode=mode,
+            cudagraph_mode=cudagraph_mode,
+        ),
+    )
+    try:
+        utils.configure_fxrt_prefill_decompose(config)
+        assert utils.fxrt_dsv41_prefill_decompose_enabled() is expected
+    finally:
+        utils._FXRT_DSV41_DSA_PREFILL_DECOMPOSE_ACTIVE = None
+
+
 @pytest.mark.parametrize("dsa", ["0", "1"])
 @pytest.mark.parametrize("moe", ["0", "1"])
 @pytest.mark.parametrize("eligible", [False, True])
