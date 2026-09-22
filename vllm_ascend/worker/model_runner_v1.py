@@ -2866,7 +2866,13 @@ class NPUModelRunner(GPUModelRunner):
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                use_stock_compile=with_prefill and not has_encoder_input,
+                **model_kwargs,
             )
             # Verify every scheduled layer executed its deferred copy.
             if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
@@ -3378,6 +3384,7 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        use_stock_compile: bool = False,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
@@ -3417,7 +3424,10 @@ class NPUModelRunner(GPUModelRunner):
                     **engram_kwargs,
                 )
             )
-        run_model = partial(self.model, **model_inputs)
+        if use_stock_compile and self._stock_compiled_call is not None:
+            run_model = partial(self._stock_compiled_call, **model_inputs)
+        else:
+            run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
@@ -4381,7 +4391,12 @@ class NPUModelRunner(GPUModelRunner):
                     and self.vllm_config.model_config.is_moe:
                     build_force_eplb_topk(self.device, self.max_num_tokens)
                 outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    use_stock_compile=with_prefill,
                 )
             if active_device_metadata_executor is not None:
                 active_device_metadata_executor.release()
@@ -4595,6 +4610,36 @@ class NPUModelRunner(GPUModelRunner):
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         ) # type: bool
+
+        self._stock_compiled_call = None
+        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+            from vllm.compilation.counter import compilation_counter
+            from vllm.env_override import _apply_constrain_to_fx_strides_patch
+
+            _apply_constrain_to_fx_strides_patch()
+            backend = self.compilation_config.init_backend(self.vllm_config)
+            from vllm_ascend import envs as ascend_envs
+
+            if ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND:
+                from vllm_ascend.compilation.fxrt_backend import (
+                    wrap_backend_with_fxrt,
+                )
+
+                logger.info(
+                    "Routing STOCK_TORCH_COMPILE prefill to the external "
+                    "fxrt backend (Triton Inductor is bypassed)"
+                )
+                debug_dump_path = self.vllm_config.compile_debug_dump_path()
+                dump_dir = debug_dump_path / "fx_graphs" if debug_dump_path is not None else None
+                backend = wrap_backend_with_fxrt(backend, dump_dir, "model")
+
+            self._stock_compiled_call = torch.compile(
+                self.model._call_impl,
+                fullgraph=True,
+                backend=backend,
+            )
+            compilation_counter.stock_torch_compile_count += 1
+            logger.info("Using stock torch.compile for prefill; decode remains eager")
 
         # wrap the model with full graph wrapper if needed.
         cudagraph_mode = self.compilation_config.cudagraph_mode

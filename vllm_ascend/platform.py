@@ -1027,6 +1027,22 @@ def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
             raise AssertionError("Hybrid models do not support recompute mode kv load failure policy now.")
 
 
+def _is_fxrt_backend_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether the current config selects the direct external fxrt backend."""
+    from vllm.config import CompilationMode
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_ascend import envs as ascend_envs
+
+    compilation_config = vllm_config.compilation_config
+    return (
+        compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+        and compilation_config.backend == "inductor"
+        and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        and ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND
+    )
+
+
 def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
     """Update compilation / cudagraph modes.
 
@@ -1069,7 +1085,10 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config) -> None:
         if compilation_config.splitting_ops is None:
             compilation_config.splitting_ops = []
 
-    if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
+    if not _is_fxrt_backend_enabled(vllm_config) and compilation_config.mode not in [
+        CompilationMode.NONE,
+        CompilationMode.VLLM_COMPILE,
+    ]:
         logger.warning(
             "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
             compilation_config.mode,
@@ -1168,8 +1187,10 @@ def _setup_compile_backend(
     # Get custom compile backend for graph fusion
     compilation_config.oot_compiler = compile_backend
     compilation_config.use_inductor = False
+    fxrt_backend_enabled = _is_fxrt_backend_enabled(vllm_config)
     if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-        compilation_config.mode = CompilationMode.NONE
+        if not fxrt_backend_enabled:
+            compilation_config.mode = CompilationMode.NONE
         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
         additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
     elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
