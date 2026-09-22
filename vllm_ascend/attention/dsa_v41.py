@@ -1424,6 +1424,10 @@ class DeepseekV41EagerAttentionImpl:
                 attn.v41_layer_name,
             )
             cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            caches = [cache]
+            private_circle_plan = getattr(metadata.swa, "private_circle_plan", None)
+            if private_circle_plan is not None:
+                caches.append(self._get_private_circle_workspace(private_circle_plan, cache))
             q = prolog_q_b(
                 hidden_states,
                 qr,
@@ -1432,7 +1436,7 @@ class DeepseekV41EagerAttentionImpl:
                 kv,
                 cos,
                 sin,
-                [cache],
+                caches,
                 attn.v41_layer_name,
             )
         else:

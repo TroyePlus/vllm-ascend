@@ -43,6 +43,21 @@ def _quant_meta(wrapper, x):
     return None, None
 
 
+def _quant_meta_tensors(wrapper, x):
+    """Return tensor-only fake outputs for an optional quantization stage.
+
+    FX custom-op fake implementations cannot return ``None`` for a tensor
+    result.  An empty scale is the runtime sentinel used by the implementation
+    below, while an empty-shaped quant tensor preserves the input dtype/shape
+    contract without introducing an alias.
+    """
+    quant, scale = _quant_meta(wrapper, x)
+    if quant is None:
+        quant = torch.empty_like(x)
+        scale = x.new_empty(0, dtype=torch.float32)
+    return quant, scale
+
+
 def _output_dtype(wrapper, input_dtype):
     if wrapper._is_w8a8_dynamic and not wrapper._has_communication:
         return wrapper.linear.weight_scale.dtype
@@ -124,7 +139,7 @@ def _prolog_q_norm_fake(x, q_a, kv_quant, kv_scale, layer_name):
     attn = _layer(layer_name)
     _, wkv, wq_b = _wrappers(attn)
     qr = torch.empty_like(q_a)
-    q_b_quant, q_b_scale = _quant_meta(wq_b, qr)
+    q_b_quant, q_b_scale = _quant_meta_tensors(wq_b, qr)
     kv = x.new_empty((*x.shape[:-1], attn.head_dim), dtype=_output_dtype(wkv, x.dtype))
     return qr, q_b_quant, q_b_scale, kv
 
