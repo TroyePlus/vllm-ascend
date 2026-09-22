@@ -25,6 +25,8 @@ def test_a2_override_capacity_and_ep_guards():
         get_ascend_device_type=lambda: state.platform,
         get_mc2_tokens_capacity=lambda: state.capacity,
         get_ascend_config=lambda: NS(enable_fused_mc2=state.fused),
+        use_cann_megamoe=lambda config: False,
+        torch=NS(nn=NS(Module=object)),
         is_moe_model=lambda config: state.moe,
     )
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)

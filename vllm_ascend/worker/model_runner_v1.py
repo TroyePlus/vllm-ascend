@@ -4915,6 +4915,10 @@ class NPUModelRunner(GPUModelRunner):
         return layer_kv_cache_spec
 
     def _is_glm5_next_kpool_layer(self, layer_name: str, spec=None) -> bool:
+        # DeepSeek V4 has its own SWA/compressor cache plan, not GLM kpool.
+        # Avoid requiring GLM-only integration helpers for this model.
+        if self.model_config.hf_text_config.model_type == "deepseek_v4":
+            return False
         compilation_config = getattr(self, "compilation_config", None)
         if compilation_config is None:
             compilation_config = getattr(self.vllm_config, "compilation_config", None)

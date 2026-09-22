@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import patch
 
 import torch
@@ -66,6 +67,11 @@ def test_dummy_isolation():
 def layout_code(cp):
     path = "context_parallel/dsa_cp.py" if cp else "dsa_v1.py"
     tree = ast.parse((ROOT / "vllm_ascend/attention" / path).read_text())
+    if cp:
+        helper = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == "_get_batched_wo_a_weight")
+        call = ast.parse("wo_a_weight = _get_batched_wo_a_weight(self, o_proj_groups)").body
+        return compile(ast.Module(body=[helper, *call], type_ignores=[]), path, "exec")
     # Find the actual block immediately preceding the batchmatmul call.
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
@@ -81,6 +87,9 @@ def layout_code(cp):
 
 
 def test_layouts():
+    class Unquantized:
+        pass
+
     torch.manual_seed(1024)
     for cp in (False, True):
         code = layout_code(cp)
@@ -104,7 +113,10 @@ def test_layouts():
             expected = op(loaded)
             for weight in (raw, loaded):
                 ns = dict(
-                    self=SimpleNamespace(wo_a=SimpleNamespace(weight=weight), n_local_groups=groups),
+                    torch=torch,
+                    AscendUnquantizedLinearMethod=Unquantized,
+                    self=SimpleNamespace(wo_a=SimpleNamespace(weight=weight, quant_method=Unquantized()),
+                                         n_local_groups=groups),
                     o_proj_input=x,
                     o_proj_groups=groups,
                     group_hidden_dim=64,
@@ -123,35 +135,40 @@ def test_prefill_padding():
     tree = ast.parse((ROOT / "vllm_ascend/attention/dsa_v1.py").read_text())
     owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendDSAImpl")
     forward = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
-    branch = next(
-        n
-        for n in forward.body
-        if isinstance(n, ast.If)
-        and any(
-            isinstance(s, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "actual_tokens" for t in s.targets)
-            for s in n.body
-        )
-    )
-    code = compile(ast.Module(body=branch.body, type_ignores=[]), "prefill_token_count", "exec")
+    # Execute the full production forward body against tensor-valued sinks.
+    # 0.27 uses layer metadata, not the old list/prefill metadata representation.
+    code = compile(ast.Module(body=[forward], type_ignores=[]), "prefill_token_count", "exec")
     for actual, padded, local in ((305, 306, 153), (737, 738, 369), (256, 256, 128), (1, 32, 16)):
         hidden = torch.randn(padded, 16)
-        ns = dict(
-            hidden_states=hidden,
-            num_actual_tokens=local,
-            self=SimpleNamespace(n_local_heads=4, head_dim=64),
-            layer_name="attn",
-            attn_metadata=[
-                SimpleNamespace(
-                    cos={"attn": torch.empty(padded, 1, 1, 64)},
-                    prefill=SimpleNamespace(cos={"attn": torch.empty(actual, 1, 1, 64)}),
-                )
-            ],
-            _require_prefill_metadata=lambda m: m.prefill,
-        )
+        req = SimpleNamespace(cos={"attn": torch.zeros(actual, 1, 1, 64)},
+                              sin={"attn": torch.zeros(actual, 1, 1, 64)})
+        common = SimpleNamespace(num_actual_tokens=local, req=req)
+        layer = SimpleNamespace(attention=common, swa=common)
+        seen = []
+        def attention(name, value, *args):
+            seen.append(value)
+            return torch.ones(value.shape[0], 4, 64)
+        def project(value, output):
+            assert value.shape == (padded, 4, 64)
+            assert torch.count_nonzero(value[actual:]) == 0
+            output.copy_(value.flatten(1))
+        state = SimpleNamespace(
+            _fxrt_prefill_decompose=True, nope_head_dim=48, head_dim=64,
+            _get_o_proj_input_shape=lambda _: (padded, 4, 64),
+            _get_layer_metadata=lambda *args: layer,
+            _prepare_caches_before_attention=lambda *args: False,
+            _forward_attention=attention, _forward_o_proj=project)
+        ns = dict(torch=torch, DSAMetadataDict=dict,
+                  _require_req_metadata=lambda m: m.req,
+                  fxrt_wait_for_kv_layer=lambda *args: None,
+                  fxrt_save_kv_layer=lambda *args: None)
         exec(code, ns)
-        assert ns["actual_tokens"] == actual
-        assert ns["o_proj_input_shape"] == (padded, 4, 64)
-        assert torch.equal(ns["hidden_states"], hidden[:actual])
+        output = torch.empty(padded, 256)
+        with patch.object(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *a, **k: None,
+                          create=True):
+            result = ns["forward"](state, "attn", hidden, (None,), {"attn": layer}, output, local)
+        assert result is output
+        assert len(seen) == 1 and torch.equal(seen[0], hidden[:actual])
     print(json.dumps({"check": "nonCP real token count excludes model-input padding", "pass": True}))
 
 
@@ -163,32 +180,33 @@ def test_dummy_dp_isolation():
         flash_comm_v1_enabled=True,
         is_draft_model=False,
     )
-    extra = SimpleNamespace(flash_comm_v1_enabled=True, pad_size=0, padded_length=2)
+    extra = SimpleNamespace(is_draft_model=False, flash_comm_v1_enabled=True, pad_size=0, padded_length=2)
+    local_sizes = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_get_ep_local_sizes")
     ns = dict(
         torch=torch,
         get_forward_context=lambda: ctx,
         _EXTRA_CTX=extra,
         enable_sp_by_pass=lambda: False,
         get_dp_group=lambda: SimpleNamespace(world_size=2, rank_in_group=1),
-        get_ep_group=lambda: SimpleNamespace(reduce_scatter=lambda x, dim: x),
+        get_ep_group=lambda: SimpleNamespace(world_size=2, rank_in_group=1, reduce_scatter=lambda x, dim: x),
         fxrt_dummy_quant_enabled=utils.fxrt_dummy_quant_enabled,
     )
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "pad_reduce", "exec"), ns)
+    exec(compile(ast.Module(body=[local_sizes, fn], type_ignores=[]), "pad_reduce", "exec"), ns)
     from vllm_ascend.ops.fxrt_moe import fxrt_moe_gating_top_k_hash
 
     with patch.dict(os.environ, {"VLLM_ASCEND_FXRT_DUMMY_QUANT": "1"}):
         for load_format in ("auto", "safetensors", "dummy"):
             utils.configure_fxrt_prefill_decompose(config(load_format))
             complete = torch.arange(8).view(4, 2)
-            assert torch.equal(ns[fn.name](complete, True), complete)
+            assert torch.equal(ns[fn.name](complete), complete)
             local = complete[:2]
             if load_format == "dummy":
-                result = ns[fn.name](local, True)
+                result = ns[fn.name](local)
                 assert torch.equal(result[:2], torch.zeros_like(local))
                 assert torch.equal(result[2:], local)
             else:
                 try:
-                    ns[fn.name](local, True)
+                    ns[fn.name](local)
                 except RuntimeError:
                     pass  # Real mis-sized tensors must not be silently repaired.
                 else:
@@ -289,6 +307,9 @@ def test_serialized_cv_prolog():
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_mla_prolog_multistream")
 
     class Linear:
+        _quant_method = None
+        _has_communication = False
+
         def quantize(self, x):
             return torch_npu.npu_dynamic_quant(x)
 
@@ -312,11 +333,18 @@ def test_serialized_cv_prolog():
         rope_head_dim=64,
         eps=1e-6,
         q_norm_without_weight=None,
+        apply_q_norm=True,
+        vllm_config=None,
     )
     aux = torch.npu.Stream()
+    kv_plan = SimpleNamespace(dsa_kv_compress_scatter=lambda cache, kv, mapping: cache.copy_(kv))
     scope = dict(
         torch=torch,
         torch_npu=torch_npu,
+        Callable=Callable,
+        CompressorForwardOutput=tuple,
+        CompressorOverlapOutput=tuple,
+        get_dsa_attn_kv_plan=lambda _: kv_plan,
         _is_w8a8_dynamic=lambda _: True,
         dsv4_dsa_overlap_stream=lambda: aux,
         npu_stream_switch=lambda stream, enabled: torch.npu.stream(stream) if enabled else contextlib.nullcontext(),

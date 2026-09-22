@@ -134,8 +134,30 @@ class DeviceMetadataExecutor:
 
 
 def wait_for_device_metadata(stage: DeviceMetadataStage, group_id: int) -> None:
+    if torch.compiler.is_compiling():
+        _fxrt_wait_device_metadata(int(stage), group_id)
+        return
+    _wait_for_device_metadata(stage, group_id)
+
+
+def _wait_for_device_metadata(stage: DeviceMetadataStage, group_id: int) -> None:
     if not is_forward_context_available():
         return
     executor = getattr(get_forward_context(), "device_metadata_executor", None)
     if executor is not None:
         executor.wait(stage, group_id)
+
+
+@torch.library.custom_op("vllm_ascend::fxrt_wait_device_metadata", mutates_args=())
+def _fxrt_wait_device_metadata(stage: int, group_id: int) -> None:
+    """Resolve the current batch executor at runtime, preserving its event wait."""
+    _wait_for_device_metadata(DeviceMetadataStage(stage), group_id)
+
+
+@_fxrt_wait_device_metadata.register_fake
+def _fxrt_wait_device_metadata_fake(stage: int, group_id: int) -> None:
+    return None
+
+
+# The wait has no tensor result, but must survive FX dead-code elimination.
+torch.fx.node.has_side_effect(torch.ops.vllm_ascend.fxrt_wait_device_metadata.default)

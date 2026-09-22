@@ -56,3 +56,11 @@ class NPUCommunicator(DeviceCommunicatorBase):
         self.device = torch.npu.current_device()
         self.ca_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # vllm::all_reduce is a functional custom op: its result must not
+        # alias an input. DeviceCommunicatorBase performs the collective
+        # in-place and returns input_, violating that graph-level contract.
+        output = input_.clone()
+        dist.all_reduce(output, group=self.device_group)
+        return output

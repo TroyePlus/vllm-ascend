@@ -731,6 +731,15 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
+        if not hasattr(torch.ops._C_ascend, "npu_rms_norm_cast"):
+            # Some extension builds do not provide the fused dual-output op.
+            # Keep routing values in FP32 before casting the expert input;
+            # promoting an already rounded BF16 result would lose precision.
+            x = hidden_states.float()
+            variance = x.square().mean(dim=-1, keepdim=True)
+            normalized = x * torch.rsqrt(variance + self.post_attention_layernorm.variance_epsilon)
+            normalized = normalized * self.post_attention_layernorm.weight.float()
+            return normalized.to(hidden_states.dtype), normalized
         return torch.ops._C_ascend.npu_rms_norm_cast(
             hidden_states,
             self.post_attention_layernorm.weight,

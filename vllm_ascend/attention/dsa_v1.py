@@ -1653,6 +1653,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         else:
             # A5 BF16 wo_a is reshaped to [groups, hidden, rank] at load time,
             # matching the A3 layout expected by npu_transpose_batchmatmul.
+            wo_a_weight = self.wo_a.weight
+            if wo_a_weight.ndim == 2:
+                wo_a_weight = wo_a_weight.view(self.n_local_groups, -1, group_hidden_dim).transpose(1, 2)
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
                 wo_a_weight,

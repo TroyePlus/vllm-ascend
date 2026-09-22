@@ -66,14 +66,12 @@ def main():
             None,
             None,
             None,
-            None,
             0,
             False,
             "silu",
             False,
             None,
             False,
-            10.0,
             1,
         )
         return output.reshape(x.shape[0], -1) + 1, counts

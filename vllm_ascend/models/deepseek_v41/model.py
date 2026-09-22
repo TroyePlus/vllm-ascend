@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import custom_ops
 import cann_ops_transformer
 from safetensors import safe_open
 import torch.nn.functional as F

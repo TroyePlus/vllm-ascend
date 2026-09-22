@@ -31,10 +31,13 @@ from vllm.v1.attention.backend import (
 
 from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41A5DraftSWASpec,
     DeepseekV41CompressorStateSpec,
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
+    is_v41_draft_swa_spec,
 )
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
@@ -307,6 +310,10 @@ def _prepare_private_circle_plan(
         "prefill_slots": _format_private_circle_slots(
             torch.tensor(current_dst, dtype=torch.int64, device=device), block_size
         ),
+        # Flat twin of ``prefill_slots`` for the A5 quantized writers: the
+        # per-call reconstruction of the 2D coordinates reproduces these
+        # workspace slot values exactly.
+        "prefill_slots_flat": torch.tensor(current_dst, dtype=torch.int32, device=device),
         "ws_block_table": workspace_block_table,
         "ws_seq_lens": torch.tensor(workspace_seq_lens, dtype=common.seq_lens.dtype, device=device),
         "prefill_query_start_loc": (qsl[num_decodes:] - int(qsl_values[num_decodes])).contiguous(),
@@ -380,6 +387,10 @@ class DeepseekV41Metadata(AttentionMetadata):
     is_compressor_state: bool
     cache_kind: str = "unknown"
     positions: torch.Tensor | None = None
+    # Builder-prepared 1-D flat slots (page * storage_block_size + offset,
+    # -1 for skipped rows) for the A5 quantized cache writers. ``None`` keeps
+    # the legacy [T, 2] contract and per-call 2D->1D conversion.
+    slot_mapping_flat: torch.Tensor | None = None
     cos: Any = None
     sin: Any = None
     num_actual_tokens: int = 0
@@ -413,6 +424,11 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_metadata_group_id: int | None = None
     block_stride_rows: int = 0
     private_circle_plan: dict | None = None
+    win_indices: torch.Tensor | None = None
+    win_topk_length: torch.Tensor | None = None
+    cmp_topk_lengths: dict[int, torch.Tensor] | None = None
+    fa_metadata: dict[str, torch.Tensor] | None = None
+    fa_metadata_group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -511,6 +527,34 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
+def _prefill_rows_fit_ring_capacity(
+    common: Any,
+    num_reqs: int,
+    max_query_len: int,
+) -> bool:
+    """Whether every prefill row's query fits the ring's in-flight capacity.
+
+    Rows within the per-step in-flight capacity (a PD request's
+    last-token recompute, optionally fused with the first speculative
+    draft block) write ring slots directly and need no shared prefill
+    workspace, so their position in the batch does not matter.
+    """
+    is_prefilling = getattr(common, "is_prefilling", None)
+    query_start_loc_cpu = getattr(common, "query_start_loc_cpu", None)
+    if (
+        is_prefilling is None
+        or query_start_loc_cpu is None
+        or getattr(is_prefilling, "device", None) is None
+        or is_prefilling.device.type != "cpu"
+    ):
+        return False
+    flags = is_prefilling[:num_reqs].bool()
+    starts = query_start_loc_cpu[: num_reqs + 1]
+    query_lens = starts[1:] - starts[:-1]
+    prefill_query_lens = query_lens[flags]
+    return bool((prefill_query_lens <= max_query_len).all())
+
+
 def _validate_batch_layout(
     common: Any,
     *,
@@ -575,6 +619,26 @@ def scatter_cache_v2(
     indices = slot_mapping[: values.shape[0]]
     updates = values.to(cache.dtype).contiguous()
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
+
+
+def _slots_for_cache_write(metadata: "DeepseekV41Metadata", cache: torch.Tensor) -> torch.Tensor:
+    """Pick the slot mapping form the A5 quantized cache writers consume.
+
+    Prefers the builder-prepared 1-D flat slots (one build per cache group per
+    step instead of one conversion per layer) and validates that the flat
+    values were produced with the target cache's page size. Falls back to the
+    legacy [T, 2] mapping, which the writers convert per call, for
+    non-quantized cache planes.
+    """
+    flat = metadata.slot_mapping_flat
+    if flat is not None:
+        if metadata.storage_block_size != cache.shape[1]:
+            raise ValueError(
+                "V4.1 flat slot mapping was built for a different page size: "
+                f"{metadata.storage_block_size} != {cache.shape[1]}"
+            )
+        return flat
+    return metadata.slot_mapping
 
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
@@ -781,8 +845,14 @@ class DeepseekV41EagerAttentionImpl:
                 # rows = self._native_pack_rows(values, kind)
                 # self._scatter_rows(cache, slot_mapping, rows)
                 # 融合算子实现
-                slot = (slot_mapping[:, 0]) * cache.shape[1] + slot_mapping[:, 1]
-                slot_mapping = slot.clamp(min=-1).to(torch.int32)
+                if slot_mapping.ndim == 2:
+                    slot = (slot_mapping[:, 0]) * cache.shape[1] + slot_mapping[:, 1]
+                    slot_mapping = slot.clamp(min=-1).to(torch.int32)
+                elif slot_mapping.ndim != 1:
+                    raise ValueError(
+                        f"A5 cache-writer slot mapping must be [T, 2] or [T], got ndim={slot_mapping.ndim}"
+                    )
+                # 1-D builder-prepared flat slots are consumed as-is.
                 if kind == "cmp":
                     group_size, quant_mode = (16, "mxfp4_bf16",)
                 elif kind == "win":
@@ -825,7 +895,11 @@ class DeepseekV41EagerAttentionImpl:
         plan = getattr(swa_metadata, "private_circle_plan", None)
         if plan is None:
             self._write_attention_cache(
-                cache, swa_metadata.slot_mapping, kv, kind="win", backend="native"
+                cache,
+                _slots_for_cache_write(swa_metadata, cache),
+                kv,
+                kind="win",
+                backend="native",
             )
             return
         workspace = self._get_private_circle_workspace(plan, cache)
@@ -841,7 +915,7 @@ class DeepseekV41EagerAttentionImpl:
         if num_decode_tokens:
             self._write_attention_cache(
                 cache,
-                swa_metadata.slot_mapping[:num_decode_tokens],
+                _slots_for_cache_write(swa_metadata, cache)[:num_decode_tokens],
                 kv[:num_decode_tokens],
                 kind="win",
                 backend="native",
@@ -849,7 +923,7 @@ class DeepseekV41EagerAttentionImpl:
         if kv.shape[0] > num_decode_tokens:
             self._write_attention_cache(
                 workspace,
-                swa_metadata.slot_mapping[num_decode_tokens:],
+                _slots_for_cache_write(swa_metadata, workspace)[num_decode_tokens:],
                 kv[num_decode_tokens:],
                 kind="win",
                 backend="native",
@@ -949,8 +1023,16 @@ class DeepseekV41EagerAttentionImpl:
         compressor = attn.compressor
         if compressor is None or metadata.compressor is None or metadata.indexer is None:
             raise RuntimeError("V4.1 KV source is missing compressor or source metadata")
+        if attn.indexer is None:
+            raise RuntimeError("V4.1 KV source is missing its indexer")
         compressor_metadata = metadata.compressor
         indexer_metadata = metadata.indexer
+        # A5 quantized writers take the builder-prepared flat slots; other
+        # planes keep the [T, 2] mapping. Both forms carry identical values.
+        indexer_k_cache = attn.indexer.k_cache.kv_cache[0][0]
+        long_kv_cache = attn.long_kv_cache.kv_cache[0]
+        index_slots = _slots_for_cache_write(indexer_metadata.cache, indexer_k_cache)[: positions.shape[0]]
+        long_slots = _slots_for_cache_write(compressor_metadata.cache, long_kv_cache)[: positions.shape[0]]
         ratio = self.role.compress_ratio
         if ratio == 1:
             latent = compressor(hidden_states)
@@ -959,8 +1041,6 @@ class DeepseekV41EagerAttentionImpl:
             # indexing the global table a second time.
             source_cos = cos
             source_sin = sin
-            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
-            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
         else:
             if compressor_metadata.state is None:
                 raise RuntimeError("V4.1 ratio-2 source is missing compressor-state metadata")
@@ -977,11 +1057,7 @@ class DeepseekV41EagerAttentionImpl:
                 source_sin = fallback_sin[attn.rotary_emb.layername]
             source_cos = source_cos[: positions.shape[0]]
             source_sin = source_sin[: positions.shape[0]]
-            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
-            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
 
-        if attn.indexer is None:
-            raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
             latent,
             index_slots,
@@ -996,7 +1072,7 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        if attn.long_kv_cache.kv_cache[0].dtype == torch.uint8:
+        if long_kv_cache.dtype == torch.uint8:
             # A5 quantized path: the epilog op packs mxfp4 rows into the
             # flat uint8 view and expects the RoPE dims first.
             try:
@@ -1006,16 +1082,16 @@ class DeepseekV41EagerAttentionImpl:
                     "DeepSeek V4.1 compressed-KV store requires the custom_ops module "
                     "registering torch.ops.custom.kv_compress_epilog_v2."
                 ) from exc
-            cache_4d = attn.long_kv_cache.kv_cache[0]
-            self._write_attention_cache(cache_4d,
+            self._write_attention_cache(
+                long_kv_cache,
                 long_slots,
                 latent.squeeze(1),
                 kind="cmp",
-                backend="native"
+                backend="native",
             )
         else:
             scatter_cache_v2(
-                attn.long_kv_cache.kv_cache[0],
+                long_kv_cache,
                 long_slots,
                 latent.squeeze(1),
             )
@@ -1073,25 +1149,48 @@ class DeepseekV41EagerAttentionImpl:
             self,
             attn,
             q: torch.Tensor,
-            swa_metadata: DeepseekV41Metadata,
+            swa_metadata,
             num_reqs: int,
             query_start_loc: torch.Tensor,
+            *,
+            positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute sliding-window KV slot indices in TNK format.
 
-        Fully vectorised on-device implementation — no per-request Python
-        loop, no CPU-side tensor creation, no D2H/H2D copy.
+        When ``positions`` is provided (absolute token positions), a direct
+        vectorised path mirroring the reference recipe's
+        ``generate_win_topk_ids`` is used — no ``searchsorted``, no
+        per-request index reconstruction.  When ``positions`` is ``None``
+        (private-circle prefill with workspace-local coordinates), the
+        original reconstruction from ``start_pos`` + ``query_start_loc`` is
+        used instead.
 
         Returns a ``[total_tokens, 1, window_size]`` int32 tensor
-        where rows are concatenated across requests (TNK layout).  ``-1`` marks
-        a slot that holds nothing or padding.  Returns all ``-1`` when
-        ``start_pos`` is unavailable (e.g. drafting metadata).
+        where rows are concatenated across requests (TNK layout).  ``-1``
+        marks a slot that holds nothing or padding.
         """
         window_size = attn.window_size
         total_tokens = q.shape[0]
         device = q.device
+        if total_tokens == 0:
+            return torch.full(
+                (total_tokens, 1, window_size),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        if positions is not None:
+            positions = positions.to(torch.int32)
+            cols = torch.arange(window_size, device=device, dtype=torch.int32)
+            valid_len = torch.clamp(positions + 1, max=window_size)
+            window_start = positions - valid_len + 1
+            win_indices = window_start.unsqueeze(1) + cols.unsqueeze(0)
+            valid_mask = cols.unsqueeze(0) < valid_len.unsqueeze(1)
+            return torch.where(
+                valid_mask, win_indices, torch.full_like(win_indices, -1)
+            ).unsqueeze(1)
         start_pos = swa_metadata.start_pos
-        if start_pos is None or total_tokens == 0:
+        if start_pos is None:
             return torch.full(
                 (total_tokens, 1, window_size),
                 -1,
@@ -1112,6 +1211,41 @@ class DeepseekV41EagerAttentionImpl:
             win_indices > token_abs_pos.unsqueeze(1), -1
         )
         return win_indices.unsqueeze(1).to(torch.int32)
+
+    def _get_cached_win_indices(
+            self,
+            attn,
+            q: torch.Tensor,
+            swa_metadata,
+            num_reqs: int,
+            query_start_loc: torch.Tensor,
+            *,
+            positions: torch.Tensor | None = None,
+            sub_batch: str = "full",
+    ) -> torch.Tensor:
+        """Resolve window indices through the step-local cache.
+
+        The window indices depend only on step-level quantities
+        (``positions``, ``start_pos``, ``query_start_loc``,
+        ``window_size``), so — like the FA scheduling metadata — they are
+        built once per ``(step, sub_batch)`` and reused by every layer
+        instead of being recomputed per attention layer.
+        """
+        cache_lookup = getattr(getattr(attn, "shared_state", None),
+                               "fa_metadata", None)
+        if cache_lookup is None:
+            return self._get_window_topk_idxs(
+                attn, q, swa_metadata, num_reqs, query_start_loc,
+                positions=positions,
+            )
+        return cache_lookup(
+            get_forward_context(),
+            ("win_indices", sub_batch),
+            lambda: self._get_window_topk_idxs(
+                attn, q, swa_metadata, num_reqs, query_start_loc,
+                positions=positions,
+            ),
+        )
 
     def _prepare_cmp_attention(
         self,
@@ -1181,18 +1315,22 @@ class DeepseekV41EagerAttentionImpl:
                     win_block_table=metadata.swa.block_table[:num_decodes],
                     cu_seqlens_q=decode_qsl,
                     seqused_win_kv=metadata.swa.seq_lens[:num_decodes],
-                    win_indices=self._get_window_topk_idxs(
+                    win_indices=self._get_cached_win_indices(
                         attn,
                         q[:num_decode_tokens],
                         SimpleNamespace(start_pos=decode_start_pos),
                         num_decodes,
                         decode_qsl,
+                        positions=metadata.swa.positions[:num_decode_tokens]
+                        if metadata.swa.positions is not None else None,
+                        sub_batch="decode",
                     ),
                     cmp_indices=decode_cmp_indices,
                     cmp_block_table=decode_cmp_block_table,
                     seqused_cmp_kv=decode_cmp_seq_lens,
                     source_cache=source_cache,
                     has_compressed=has_compressed,
+                    sub_batch="decode",
                 )
             )
         if q.shape[0] > num_decode_tokens:
@@ -1205,23 +1343,86 @@ class DeepseekV41EagerAttentionImpl:
                     win_block_table=plan["ws_block_table"],
                     cu_seqlens_q=plan["prefill_query_start_loc"],
                     seqused_win_kv=plan["ws_seq_lens"],
-                    win_indices=self._get_window_topk_idxs(
+                    win_indices=self._get_cached_win_indices(
                         attn,
                         prefill_q,
                         SimpleNamespace(start_pos=plan["ws_local_start_pos"]),
                         num_reqs - num_decodes,
                         plan["prefill_query_start_loc"],
-                    ),
+                        sub_batch="prefill",
+                        ),
                     cmp_indices=prefill_cmp_indices,
                     cmp_block_table=prefill_cmp_block_table,
                     seqused_cmp_kv=prefill_cmp_seq_lens,
                     source_cache=source_cache,
                     has_compressed=has_compressed,
+                    sub_batch="prefill",
                 )
             )
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         self._commit_private_circle_prefill(plan, cache, workspace)
         return output
+
+    def _build_fa_op_metadata(
+            self,
+            attn,
+            q: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            win_topk_length: torch.Tensor,
+            cmp_topk_length: torch.Tensor,
+            has_compressed: bool,
+    ):
+        """Invoke the FA scheduling-metadata operator once."""
+        from cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla import (
+            mixed_quant_sparse_flash_mla_metadata,
+        )
+        return mixed_quant_sparse_flash_mla_metadata(
+            win_topk_length,
+            cmp_topk_length,
+            cu_seqlens_q=cu_seqlens_q,
+            num_heads_q=q.shape[1],
+            num_heads_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0].shape[2],
+            head_dim=q.shape[-1],
+            quant_mode=1,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            has_win_kv=True,
+            has_cmp_kv=has_compressed,
+        )
+
+    def _fa_op_metadata(
+            self,
+            attn,
+            q: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            win_topk_length: torch.Tensor,
+            cmp_topk_length: torch.Tensor,
+            has_compressed: bool,
+            sub_batch: str,
+    ):
+        """Resolve the step-local FA scheduling metadata for one attention type.
+
+        The metadata operator only consumes step-level quantities: the
+        window/compressed topk lengths, ``cu_seqlens_q`` and the head layout
+        shared by every layer.  Following the reference recipe's
+        ``generate_kernel_metadata``, it is therefore invoked once per
+        attention type per sub-batch each step -- a fixed three calls (win,
+        c2a, c1a) on full-batch steps -- and every layer reuses the cached
+        result instead of re-deriving it per attention layer.
+        """
+        cache_lookup = getattr(getattr(attn, "shared_state", None), "fa_metadata", None)
+        if cache_lookup is None:
+            return self._build_fa_op_metadata(
+                attn, q, cu_seqlens_q, win_topk_length, cmp_topk_length, has_compressed
+            )
+        attention_type = "win" if not has_compressed else f"c{self.role.compress_ratio}a"
+        return cache_lookup(
+            get_forward_context(),
+            (attention_type, sub_batch),
+            lambda: self._build_fa_op_metadata(
+                attn, q, cu_seqlens_q, win_topk_length, cmp_topk_length, has_compressed
+            ),
+        )
 
     def _sparse_mla_attention(
         self,
@@ -1238,35 +1439,47 @@ class DeepseekV41EagerAttentionImpl:
         seqused_cmp_kv: torch.Tensor | None,
         source_cache,
         has_compressed: bool,
+        sub_batch: str = "full",
+        precomputed_swa: DeepseekV41Metadata | None = None,
     ) -> torch.Tensor:
         """One mixed_quant_sparse_flash_mla call: shared by the base full-batch
-        path and the private-circle decode/prefill sub-batches."""
-        # DSV4 workers also import this module for metadata type checks. Load
-        # the V4.1-only operator package when its execution path is requested.
+        path and the private-circle decode/prefill sub-batches.  The FA
+        scheduling metadata comes from the step-local cache keyed by
+        ``(attention type, sub_batch)``, or from the builder-pre-computed
+        metadata when available (full-batch path only)."""
+        if (
+                precomputed_swa is not None
+                and sub_batch == "full"
+                and precomputed_swa.fa_metadata is not None
+                and precomputed_swa.win_topk_length is not None
+        ):
+            n = q.shape[0]
+            win_topk_length = precomputed_swa.win_topk_length[:n]
+            ratio = self.role.compress_ratio
+            if has_compressed and precomputed_swa.cmp_topk_lengths is not None:
+                cmp_topk_length = precomputed_swa.cmp_topk_lengths[ratio][:n]
+            else:
+                cmp_topk_length = torch.zeros_like(win_topk_length)
+            attention_type = "win" if ratio == 0 else f"c{ratio}a"
+            op_metadata = precomputed_swa.fa_metadata[attention_type]
+        else:
+            win_topk_length = (win_indices >= 0).sum(dim=-1).to(torch.int32)
+            cmp_topk_length = (
+                torch.zeros_like(win_topk_length)
+                if cmp_indices is None
+                else (cmp_indices >= 0).sum(dim=-1).to(torch.int32)
+            )
+            op_metadata = self._fa_op_metadata(
+                attn,
+                q,
+                cu_seqlens_q,
+                win_topk_length,
+                cmp_topk_length,
+                has_compressed,
+                sub_batch,
+            )
         import cann_ops_transformer
-        from cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla import (
-            mixed_quant_sparse_flash_mla_metadata,
-        )
 
-        win_topk_length = (win_indices >= 0).sum(dim=-1).to(torch.int32)
-        cmp_topk_length = (
-            torch.zeros_like(win_topk_length)
-            if cmp_indices is None
-            else (cmp_indices >= 0).sum(dim=-1).to(torch.int32)
-        )
-        op_metadata = mixed_quant_sparse_flash_mla_metadata(
-            win_topk_length,
-            cmp_topk_length,
-            cu_seqlens_q=cu_seqlens_q,
-            num_heads_q=q.shape[1],
-            num_heads_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0].shape[2],
-            head_dim=q.shape[-1],
-            quant_mode=1,
-            layout_q="TND",
-            layout_kv="PA_BBND",
-            has_win_kv=True,
-            has_cmp_kv=has_compressed,
-        )
         cmp_topk_length = None if cmp_indices is None else cmp_topk_length
         output, _ = cann_ops_transformer.ops.ds41.mixed_quant_sparse_flash_mla(
             q,
@@ -1321,6 +1534,19 @@ class DeepseekV41EagerAttentionImpl:
         cmp_indices, cmp_block_table, cmp_seq_lens = self._prepare_cmp_attention(
             metadata, source_cache, compressed_indices, num_reqs
         )
+        precomputed_swa = metadata.swa if metadata.swa.fa_metadata is not None else None
+        if precomputed_swa is not None and precomputed_swa.win_indices is not None:
+            if precomputed_swa.fa_metadata_group_id is not None:
+                wait_for_device_metadata(
+                    DeviceMetadataStage.ATTENTION, precomputed_swa.fa_metadata_group_id
+                )
+            win_indices = precomputed_swa.win_indices[:q.shape[0]]
+        else:
+            win_indices = self._get_cached_win_indices(
+                attn, q, metadata.swa, num_reqs, query_start_loc,
+                positions=metadata.swa.positions[:q.shape[0]]
+                if metadata.swa.positions is not None else None,
+            )
         return self._sparse_mla_attention(
             attn,
             q,
@@ -1328,14 +1554,13 @@ class DeepseekV41EagerAttentionImpl:
             win_block_table=metadata.swa.block_table[:num_reqs],
             cu_seqlens_q=query_start_loc,
             seqused_win_kv=metadata.swa.seq_lens[:num_reqs],
-            win_indices=self._get_window_topk_idxs(
-                attn, q, metadata.swa, num_reqs, query_start_loc
-            ),
+            win_indices=win_indices,
             cmp_indices=cmp_indices,
             cmp_block_table=cmp_block_table,
             seqused_cmp_kv=cmp_seq_lens,
             source_cache=source_cache,
             has_compressed=has_compressed,
+            precomputed_swa=precomputed_swa,
         )
 
 
@@ -1406,6 +1631,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
+        self._slot_mapping_flat = torch.full((max_tokens,), -1, dtype=torch.int32, device=device)
         self._block_table: torch.Tensor | None = None
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._start_pos = torch.zeros(max_reqs, dtype=torch.int32, device=device)
@@ -1441,6 +1667,21 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._c2_full_source_rope: tuple[torch.Tensor, torch.Tensor] | None = None
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+        self._fa_precomputed = isinstance(kv_cache_spec, DeepseekV41SWASpec) and self._supports_device_ops
+        if self._fa_precomputed:
+            window_size = int(_config_value(text_config, "sliding_window", 0))
+            self._win_indices_buf = torch.full(
+                (max_tokens, 1, window_size), -1, dtype=torch.int32, device=device,
+            )
+            self._win_topk_length_buf = torch.zeros(
+                (max_tokens, 1), dtype=torch.int32, device=device,
+            )
+            self._cmp_topk_length_bufs: dict[int, torch.Tensor] = {
+                r: torch.zeros((max_tokens, 1), dtype=torch.int32, device=device)
+                for r in (1, 2)
+            }
+            self._fa_metadata_bufs: dict[str, torch.Tensor] = {}
+            self._fa_metadata_sentinel = torch.zeros(1, dtype=torch.int32, device=device)
 
     @classmethod
     def get_cudagraph_support(
@@ -1503,6 +1744,94 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             run()
         return buffer
 
+    def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
+        if not is_v41_draft_swa_spec(self.kv_cache_spec):
+            raise TypeError("V4.1 drafting requires a draft SWA cache")
+        # DSpark issues one eager block per step. Group-local tables and slots
+        # remain independent; the builder owns the operator metadata buffers.
+        # kwargs (shared step caches, spec-decode args) flow through so the
+        # draft reuses the same step-scoped construction as the target.
+        return self.build(0, common_attn_metadata, **kwargs)
+
+    def _build_kernel_metadata(
+            self,
+            positions: torch.Tensor,
+            num_tokens: int,
+            num_reqs: int,
+            cu_seqlens_q: torch.Tensor,
+            window_size: int,
+            num_heads_q: int,
+            head_dim: int,
+            index_topk: int,
+    ) -> None:
+        """Pre-compute win_indices, topk lengths and FA metadata once per step.
+
+        Mirrors the reference recipe's ``build_attn_metadata`` +
+        ``generate_kernel_metadata`` flow: window indices and compressed
+        top-k lengths are derived from positions alone, then the FA
+        scheduling-metadata operator is invoked a fixed three times (win,
+        c2a, c1a).  Results are written into the builder's persistent
+        buffers (``_win_indices_buf``, ``_win_topk_length_buf``,
+        ``_cmp_topk_length_bufs``, ``_fa_metadata_bufs``) so that every
+        attention layer reuses them instead of re-deriving per layer.
+
+        When ``_device_metadata_enabled`` is True the call is deferred via
+        ``_publish_task`` and runs on a separate NPU stream; the layer
+        forward must ``wait_for_device_metadata`` before consuming the
+        buffers.
+        """
+        device = positions.device
+        pos_i32 = positions[:num_tokens].to(torch.int32)
+        cols = torch.arange(window_size, device=device, dtype=torch.int32)
+        valid_len = torch.clamp(pos_i32 + 1, max=window_size)
+        window_start = pos_i32 - valid_len + 1
+        win_ids = window_start.unsqueeze(1) + cols.unsqueeze(0)
+        valid_mask = cols.unsqueeze(0) < valid_len.unsqueeze(1)
+        win_indices = self._win_indices_buf[:num_tokens]
+        win_indices.copy_(
+            torch.where(valid_mask, win_ids, torch.full_like(win_ids, -1)).unsqueeze(1)
+        )
+        win_topk_length = self._win_topk_length_buf[:num_tokens]
+        win_topk_length.copy_((win_indices >= 0).sum(dim=-1).to(torch.int32))
+
+        cmp_topk_lengths: dict[int, torch.Tensor] = {}
+        for r in self._cmp_topk_length_bufs:
+            buf = self._cmp_topk_length_bufs[r][:num_tokens]
+            valid_length = (pos_i32 + 1) // r
+            if index_topk > 0:
+                valid_length = valid_length.clamp_max(index_topk)
+            buf.copy_(valid_length.unsqueeze(1).to(torch.int32))
+            cmp_topk_lengths[r] = buf
+
+        from cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla_dsl.mixed_quant_sparse_flash_mla import (
+            mixed_quant_sparse_flash_mla_metadata,
+        )
+        for ratio, attn_type in ((0, "win"), (2, "c2a"), (1, "c1a")):
+            has_cmp = ratio > 0
+            cmp_tl = (
+                cmp_topk_lengths[ratio] if has_cmp
+                else torch.zeros_like(win_topk_length)
+            )
+            value = mixed_quant_sparse_flash_mla_metadata(
+                win_topk_length,
+                cmp_tl,
+                cu_seqlens_q=cu_seqlens_q,
+                num_heads_q=num_heads_q,
+                num_heads_kv=1,
+                head_dim=head_dim,
+                quant_mode=1,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_win_kv=True,
+                has_cmp_kv=has_cmp,
+            )
+            buf = self._fa_metadata_bufs.get(attn_type)
+            if buf is None or buf.shape != value.shape:
+                buf = value.clone()
+            else:
+                buf.copy_(value)
+            self._fa_metadata_bufs[attn_type] = buf
+
     def build(
         self,
         common_prefix_len,
@@ -1518,7 +1847,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
         ratio = getattr(spec, "compress_ratio", 1)
-        if isinstance(spec, DeepseekV41SWASpec):
+        if isinstance(spec, (DeepseekV41SWASpec, DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec)):
             cache_kind = "swa"
         elif isinstance(spec, DeepseekV41FullSpec):
             cache_kind = "long_kv"
@@ -1576,6 +1905,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
         if is_compressor_state:
+            slot_mapping_flat = None
             if self._supports_device_ops:
                 self._slot_mapping[:num_input_tokens].copy_(raw_slots[:num_input_tokens])
                 slots = self._slot_mapping[:num_input_tokens]
@@ -1590,7 +1920,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             mapping_scope = "swa" if cache_kind == "swa" else "compressed"
             slot_key = f"slot:{mapping_scope}:c{ratio}:b{spec.storage_block_size}"
             prepared_slots = shared.get(slot_key)
-            if prepared_slots is None:
+            # A5 quantized writers consume 1-D flat slots. Preparing the flat
+            # twin here lets every layer skip its per-call 2D->1D conversion;
+            # non-quantized planes keep the [T, 2] contract unchanged.
+            needs_flat = spec.dtype == torch.uint8
+            flat_key = f"{slot_key}:flat"
+            prepared_flat = shared.get(flat_key) if needs_flat else None
+            if prepared_slots is None or (needs_flat and prepared_flat is None):
                 active_slots = raw_slots[:num_input_tokens]
                 valid = active_slots >= 0
                 if compressed and ratio == 2:
@@ -1604,27 +1940,36 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                         if common.positions is not None:
                             valid &= common.positions[:num_input_tokens].remainder(2) == 1
                 physical = active_slots.clamp_min(0)
-                self._slot_mapping_2d[:num_input_tokens, 0].copy_(
-                    torch.where(
-                        valid,
-                        torch.div(
-                            physical,
-                            spec.storage_block_size,
-                            rounding_mode="floor",
-                        ),
-                        -1,
+                if prepared_slots is None:
+                    self._slot_mapping_2d[:num_input_tokens, 0].copy_(
+                        torch.where(
+                            valid,
+                            torch.div(
+                                physical,
+                                spec.storage_block_size,
+                                rounding_mode="floor",
+                            ),
+                            -1,
+                        )
                     )
-                )
-                self._slot_mapping_2d[:num_input_tokens, 1].copy_(
-                    torch.where(
-                        valid,
-                        physical.remainder(spec.storage_block_size),
-                        -1,
+                    self._slot_mapping_2d[:num_input_tokens, 1].copy_(
+                        torch.where(
+                            valid,
+                            physical.remainder(spec.storage_block_size),
+                            -1,
+                        )
                     )
-                )
-                prepared_slots = self._slot_mapping_2d[:num_input_tokens]
-                shared[slot_key] = prepared_slots
+                    prepared_slots = self._slot_mapping_2d[:num_input_tokens]
+                    shared[slot_key] = prepared_slots
+                if needs_flat and prepared_flat is None:
+                    # ``where(valid, physical, -1)`` is bitwise equal to the
+                    # per-call reconstruction ``page * bs + offset`` clamped
+                    # to -1 that the quantized writers used to run per layer.
+                    self._slot_mapping_flat[:num_input_tokens].copy_(torch.where(valid, physical, -1).to(torch.int32))
+                    prepared_flat = self._slot_mapping_flat[:num_input_tokens]
+                    shared[flat_key] = prepared_flat
             slots = prepared_slots
+            slot_mapping_flat = prepared_flat
         coordinates = _cache_coordinates(common, ratio, compressed)
         self._seq_lens[:num_reqs].copy_(coordinates["seq_lens"])
         if num_actual_reqs < num_reqs:
@@ -1661,16 +2006,25 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_prefills,
             num_prefill_tokens,
         ) = _request_counts(common, num_actual_reqs)
+        draft_tokens = (
+            getattr(self.vllm_config.speculative_config, "num_speculative_tokens", 0)
+            if self.vllm_config.speculative_config is not None
+            else 0
+        )
         if (
             cache_kind == "swa"
             and num_prefills > 0
-            and num_prefill_tokens == num_prefills
+            and not is_v41_draft_swa_spec(spec)
             and getattr(common, "private_circle_blocks_per_allocation", None)
+            and _prefill_rows_fit_ring_capacity(
+                common, num_actual_reqs, 1 + draft_tokens
+            )
         ):
-            # Every prefill row schedules exactly one token: a PD request's
-            # last-token recompute, whose window the imported ring already
-            # covers. Run those rows as decodes so the step needs no plan and
-            # stays graph-capturable.
+            # Every prefill row's query fits the ring's in-flight capacity:
+            # a PD request's last-token recompute, optionally fused with the
+            # first speculative draft block. The imported ring already covers
+            # the window, so those rows run as decodes: no plan, and the step
+            # stays graph-capturable regardless of row order.
             num_decodes += num_prefills
             num_decode_tokens += num_prefill_tokens
             num_prefills = 0
@@ -1701,7 +2055,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         smla_metadata = None
         qli_metadata = None
         private_circle_plan = None
-        if cache_kind == "swa" and num_prefills > 0:
+        # Draft SWA layers live in the shared slots, not the request-private
+        # ring: their builds must never construct a pool plan, or the plan's
+        # ring-geometry restore/commit would run against the draft's
+        # shared-slot cache.
+        if (
+            cache_kind == "swa"
+            and num_prefills > 0
+            and not is_v41_draft_swa_spec(spec)
+        ):
             blocks_per_allocation = getattr(common, "private_circle_blocks_per_allocation", None)
             if blocks_per_allocation:
                 private_circle_plan = _prepare_private_circle_plan(
@@ -1730,6 +2092,23 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 )
                 self._private_circle_slots_2d[prefill_end:].fill_(-1)
                 slots = self._private_circle_slots_2d[:num_input_tokens]
+                if spec.dtype == torch.uint8:
+                    # Flat twin of the ring/workspace mapping for the A5
+                    # quantized writers: decode rows keep their ring slots,
+                    # prefill rows take the plan's flat workspace slots, and
+                    # padding stays -1 exactly like the 2D mapping.
+                    self._private_circle_slots_flat = torch.empty(
+                        num_input_tokens, dtype=torch.int32, device=self.device
+                    )
+                    if num_decode_tokens:
+                        self._private_circle_slots_flat[:num_decode_tokens].copy_(
+                            common.slot_mapping[:num_decode_tokens].clamp(min=-1).to(torch.int32)
+                        )
+                    self._private_circle_slots_flat[num_decode_tokens:prefill_end].copy_(
+                        private_circle_plan["prefill_slots_flat"]
+                    )
+                    self._private_circle_slots_flat[prefill_end:].fill_(-1)
+                    slot_mapping_flat = self._private_circle_slots_flat[:num_input_tokens]
 # TODO kezong
         # if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
         #     has_compressed = operator_ratio in (1, 2)
@@ -1861,9 +2240,76 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         block_stride_rows = 0
         if cache_kind == "long_kv" and isinstance(spec, DeepseekV41FullSpec) and spec.dtype == torch.uint8:
             block_stride_rows = (getattr(spec, "page_size_padded", None) or 0) // spec.head_size
+        win_indices_pre = None
+        win_topk_length_pre = None
+        cmp_topk_lengths_pre = None
+        fa_metadata_pre = None
+        fa_metadata_group_id = None
+        if (
+                self._fa_precomputed
+                and positions is not None
+                and private_circle_plan is None
+                and num_actual_tokens > 0
+        ):
+            fa_shared = kwargs.get("fa_metadata_shared")
+            if fa_shared is None:
+                fa_shared = shared
+            fa_key = "fa:kernel_metadata"
+            fa_cache = fa_shared.get(fa_key)
+            if fa_cache is not None:
+                n_tokens = num_input_tokens
+                win_indices_pre = fa_cache["win_indices"][:n_tokens]
+                win_topk_length_pre = fa_cache["win_topk_length"][:n_tokens]
+                cmp_topk_lengths_pre = {
+                    r: buf[:n_tokens] for r, buf in fa_cache["cmp_topk_lengths"].items()
+                }
+                fa_metadata_pre = fa_cache["fa_metadata"]
+                fa_metadata_group_id = fa_cache["group_id"]
+            else:
+                cu_seqlens_q = common.query_start_loc[: num_reqs + 1]
+                pos_for_build = positions
+                n_tokens = num_input_tokens
+                n_reqs = num_reqs
+                ws = window_size
+                nhq = n_local_heads
+                hd = head_dim
+                itk = index_topk
+
+                def build_fa_metadata() -> None:
+                    self._build_kernel_metadata(
+                        pos_for_build, n_tokens, n_reqs, cu_seqlens_q,
+                        ws, nhq, hd, itk,
+                    )
+
+                if self._device_metadata_enabled:
+                    self._device_metadata_tasks = (
+                        *self._device_metadata_tasks,
+                        DeviceMetadataTask(
+                            DeviceMetadataStage.ATTENTION,
+                            build_fa_metadata,
+                            id(self._fa_metadata_sentinel),
+                        ),
+                    )
+                else:
+                    build_fa_metadata()
+                fa_metadata_group_id = id(self._fa_metadata_sentinel)
+                fa_shared[fa_key] = {
+                    "win_indices": self._win_indices_buf,
+                    "win_topk_length": self._win_topk_length_buf,
+                    "cmp_topk_lengths": self._cmp_topk_length_bufs,
+                    "fa_metadata": self._fa_metadata_bufs,
+                    "group_id": fa_metadata_group_id,
+                }
+                win_indices_pre = self._win_indices_buf[:n_tokens]
+                win_topk_length_pre = self._win_topk_length_buf[:n_tokens]
+                cmp_topk_lengths_pre = {
+                    r: buf[:n_tokens] for r, buf in self._cmp_topk_length_bufs.items()
+                }
+                fa_metadata_pre = self._fa_metadata_bufs
         return DeepseekV41Metadata(
             block_table=block_table,
             slot_mapping=slots,
+            slot_mapping_flat=slot_mapping_flat,
             compress_ratio=ratio,
             storage_block_size=spec.storage_block_size,
             is_compressor_state=is_compressor_state,
@@ -1898,6 +2344,11 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             c2_source_sin=c2_source_sin,
             c2_metadata_group_id=c2_metadata_group_id,
             private_circle_plan=private_circle_plan,
+            win_indices=win_indices_pre,
+            win_topk_length=win_topk_length_pre,
+            cmp_topk_lengths=cmp_topk_lengths_pre,
+            fa_metadata=fa_metadata_pre,
+            fa_metadata_group_id=fa_metadata_group_id,
             **coordinates,
         )
 

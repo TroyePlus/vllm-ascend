@@ -610,9 +610,7 @@ def select_moe_comm_method(
         if envs.VLLM_ASCEND_FXRT_TEST_A3_ALLTOALL and num_tokens > mc2_tokens_capacity:
             # A2 validation of A3's unfused high-token path. Do not select A3
             # MC2 kernels on A2 or change the production/default selector.
-            moe_comm_type = _select_a3_moe_comm_method(
-                num_tokens, vllm_config, quant_type, mc2_tokens_capacity, 0
-            )
+            moe_comm_type = MoECommType.ALLTOALL
             logger.info(
                 "FXRT_TEST_A3_ALLTOALL tokens=%d capacity=%d ep=%d method=%s",
                 num_tokens, mc2_tokens_capacity, get_ep_group().world_size, moe_comm_type.name,

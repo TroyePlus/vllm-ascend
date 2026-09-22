@@ -58,20 +58,71 @@ def _record_moe_event(name: str) -> torch.npu.Event | None:
 
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+# Instances per MoE topology, keyed by (num_experts, experts_per_token,
+# ep_size). The flat registry above keeps the FIRST registration per comm
+# type (the target model's, which is constructed first). A model whose MoE
+# topology differs from the target's inside the same process (e.g. a DSpark
+# draft with a different expert count / top-k) must resolve its own
+# instances via get_moe_comm_method(..., topology_key=...), otherwise it
+# would run with comm methods sized for the other topology.
+_MoECommMethodsByTopology: dict[tuple[int, int, int], dict[MoECommType, MoECommMethod]] = {}
 
 
-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
-    return _MoECommMethods.get(moe_comm_type)
+def make_moe_topology_key(num_experts: int, experts_per_token: int, ep_size: int) -> tuple[int, int, int]:
+    return (int(num_experts), int(experts_per_token), int(ep_size))
 
 
-def setup_moe_comm_method(moe_config):
+def _moe_topology_key(moe_config) -> tuple[int, int, int]:
+    return make_moe_topology_key(moe_config.num_experts, moe_config.experts_per_token, moe_config.ep_size)
+
+
+def get_moe_comm_method(
+    moe_comm_type: MoECommType | None,
+    topology_key: tuple[int, int, int] | None = None,
+) -> MoECommMethod | None:
+    if topology_key is None:
+        return _MoECommMethods.get(moe_comm_type)
+    bucket = _MoECommMethodsByTopology.get(topology_key)
+    if bucket is None:
+        raise RuntimeError(
+            f"No MoE comm methods registered for topology {topology_key}; "
+            f"registered topologies: {sorted(_MoECommMethodsByTopology)}. The secondary "
+            "MoE model owning this topology was not registered by setup_moe_comm_method."
+        )
+    # A comm type absent from an existing bucket (e.g. ALLTOALL for an
+    # ep_size == 1 topology) mirrors the flat-registry semantics: None.
+    return bucket.get(moe_comm_type)
+
+
+def setup_moe_comm_method(moe_config) -> tuple[int, int, int]:
+    topology_key = _moe_topology_key(moe_config)
+    bucket = _MoECommMethodsByTopology.get(topology_key)
+    if bucket:
+        return topology_key
     if moe_config.ep_size > 1:
-        _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
-        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
-        _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+        bucket = {
+            MoECommType.ALLTOALL: AlltoAllCommImpl(moe_config),
+            MoECommType.ALLGATHER: AllGatherCommImpl(moe_config),
+            MoECommType.MC2: MC2CommImpl(moe_config),
+            MoECommType.FUSED_MC2: FusedMC2CommImpl(moe_config),
+        }
     else:
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+        bucket = {MoECommType.ALLGATHER: AllGatherCommImpl(moe_config)}
+    _MoECommMethodsByTopology[topology_key] = bucket
+    for comm_type, method in bucket.items():
+        existing = _MoECommMethods.get(comm_type)
+        if existing is None:
+            _MoECommMethods[comm_type] = method
+        elif _moe_topology_key(existing.moe_config) != topology_key:
+            logger.info(
+                "MoE comm method %s stays registered for the primary topology %s; the "
+                "secondary topology %s must resolve its instances via "
+                "get_moe_comm_method(..., topology_key=...).",
+                comm_type,
+                _moe_topology_key(existing.moe_config),
+                topology_key,
+            )
+    return topology_key
 
 
 @dataclass
@@ -86,6 +137,7 @@ class FusedExpertsResult:
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    shared_experts_fused: bool = False
 
 
 class MoECommMethod(ABC):
@@ -304,6 +356,13 @@ class FusedMC2CommImpl(MoECommMethod):
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
+    def supports_fused_shared_experts(self) -> bool:
+        return (
+            self._is_a5_backend
+            and self._mega_moe_backend is not None
+            and self._mega_moe_backend.supports_shared_experts()
+        )
+
     def _get_token_dispatcher(self):
         if get_ascend_device_type() == AscendDeviceType.A5:
             return _MegaMoEBypassTokenDispatcher()
@@ -484,10 +543,11 @@ class FusedMC2CommImpl(MoECommMethod):
     ):
         if self._is_a5_backend:
             assert self._mega_moe_backend is not None
-            out, expert_tokens = self._mega_moe_backend.fused_experts(fused_experts_input)
+            out, expert_tokens, shared_experts_fused = self._mega_moe_backend.fused_experts(fused_experts_input)
             return FusedExpertsResult(
                 routed_out=out,
                 expert_tokens=expert_tokens,
+                shared_experts_fused=shared_experts_fused,
             )
 
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (

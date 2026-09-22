@@ -53,7 +53,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.deepseek_v4.dspark import DSparkDeepseekV4ForCausalLM
-from vllm_ascend.models.deepseek_v41.dspark import DSparkDeepseekV41ForCausalLM
+try:
+    from vllm_ascend.models.deepseek_v41.dspark import DSparkDeepseekV41ForCausalLM
+except (ImportError, ModuleNotFoundError):
+    # DSV4.1 operators are optional for DSV4 workers. Keep the proposer
+    # module importable when the installed CANN bundle does not provide ds41.
+    DSparkDeepseekV41ForCausalLM = None
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -69,7 +74,8 @@ from vllm_ascend.worker.device_metadata import DeviceMetadataTask, DeviceMetadat
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
-_HIDDEN_STATE_DRAFTER_TYPES = (
+_HIDDEN_STATE_DRAFTER_TYPES = tuple(
+    cls for cls in (
     Eagle3LlamaForCausalLM,
     DFlashQwen3ForCausalLM,
     Qwen3DSparkForCausalLM,
@@ -78,6 +84,7 @@ _HIDDEN_STATE_DRAFTER_TYPES = (
     Eagle3DeepseekV2ForCausalLM,
     DSparkDeepseekV4ForCausalLM,
     DSparkDeepseekV41ForCausalLM,
+    ) if cls is not None
 )
 
 

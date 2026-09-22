@@ -107,6 +107,49 @@ def _tasks(calls: list[tuple]) -> tuple[DeviceMetadataTask, ...]:
     )
 
 
+def test_compiled_wait_resolves_current_batch_and_survives_dce(monkeypatch):
+    # This CPU graph test mocks the executor below and exercises no NPU work.
+    # Dynamo otherwise queries the accelerator stream even for CPU inputs,
+    # requiring device initialization on machines with torch_npu installed.
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    calls = []
+    current = SimpleNamespace()
+    monkeypatch.setattr(device_metadata, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(device_metadata, "get_forward_context", lambda: current)
+    graphs = []
+
+    def backend(gm, inputs):
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        waits = [n for n in gm.graph.nodes if n.target ==
+                 torch.ops.vllm_ascend.fxrt_wait_device_metadata.default]
+        assert len(waits) == 1
+        assert not any("current_stream" in str(n.target) for n in gm.graph.nodes)
+        graphs.append(gm)
+        return gm.forward
+
+    def forward(x, metadata):
+        wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(metadata))
+        return x + 1
+
+    compiled = torch.compile(forward, backend=backend, fullgraph=True)
+    metadata_batches = [torch.zeros(1), torch.zeros(1)]
+    for metadata in metadata_batches:
+        for repeat in range(2):
+            expected = id(metadata)
+
+            def wait(stage, group_id):
+                assert stage == DeviceMetadataStage.ATTENTION
+                assert group_id == expected
+                calls.append((group_id, repeat))
+
+            current.device_metadata_executor = SimpleNamespace(wait=wait)
+            torch.testing.assert_close(compiled(torch.ones(2), metadata), torch.full((2,), 2.0))
+    assert len(calls) == 4
+    assert graphs
+    torch._dynamo.reset()
+
+
 def test_stream_lifecycle_and_stage_frontiers(executor_env):
     executor, calls, allocations = executor_env
     assert allocations == [

@@ -49,7 +49,7 @@ def test_activation_roundtrip_and_explicit_tensor_inputs():
     implementation = namespace["alltoall_routed_experts"]
 
     def schema_boundary(*args):
-        assert isinstance(args[15], str), "Torch schema cannot accept MoEActivation Enum"
+        assert isinstance(args[14], str), "Torch schema cannot accept MoEActivation Enum"
         return implementation(*args)
 
     namespace["alltoall_routed_experts"] = schema_boundary
@@ -74,7 +74,6 @@ def test_activation_roundtrip_and_explicit_tensor_inputs():
         quant=NS(quant_type="w8a8", comm_quant_mode=2, is_per_channel_weight=False),
         routing=NS(
             expert_map=None,
-            log2phy=None,
             pertoken_scale=None,
             mc2_mask=None,
             global_redundant_expert_num=0,
@@ -84,7 +83,6 @@ def test_activation_roundtrip_and_explicit_tensor_inputs():
         lora_context=None,
         activation=Activation.SILU,
         need_trans=False,
-        swiglu_limit=10.0,
     )
     for activation in Activation:
         payload.activation = activation
